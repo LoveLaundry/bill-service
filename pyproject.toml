@@ -1,0 +1,23 @@
+[project]
+name = "bill-service"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "DulshanSiriwardhana", email = "dulshansiriwardhanaofficial@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.141.1",
+    "pydantic[email]>=2.13.4",
+    "pydantic-settings>=2.5.2",
+    "motor>=3.5.1",
+    "python-dotenv>=1.2.2",
+]
+
+[project.scripts]
+bill-service = "bill_service:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
