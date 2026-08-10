@@ -45,8 +45,9 @@ def require_role(allowed_roles: list):
     """FastAPI dependency factory class to validate appropriate roles."""
 
     def dependency(current_user: dict = Security(get_current_user)):
-        role = current_user.get("role")
-        if role not in allowed_roles:
+        role = str(current_user.get("role") or "").upper()
+        allowed_upper = [r.upper() for r in allowed_roles]
+        if role not in allowed_upper:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Role '{role}' is not authorized to access this resource",
