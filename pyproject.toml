@@ -13,7 +13,12 @@ dependencies = [
     "pydantic-settings>=2.5.2",
     "motor>=3.5.1",
     "python-dotenv>=1.2.2",
+    "cryptography>=42.0.0",
+    "pyjwt>=2.7.0",
+    "bcrypt>=4.0.0",
+    "python-multipart>=0.0.9",
 ]
+
 
 [project.scripts]
 bill-service = "bill_service:main"
