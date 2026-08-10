@@ -23,6 +23,7 @@ class GatePassCreate(BaseModel):
     received_by: str
     items: List[GatePassItem] = Field(min_length=1)
     notes: Optional[str] = None
+    quotation_id: Optional[str] = None
 
 
 class GatePassAdjustment(BaseModel):
@@ -42,6 +43,7 @@ class GatePassModel(BaseModel):
     items: List[GatePassItem]
     status: str  # RECEIVED, PROCESSING, READY_FOR_DELIVERY, PARTIALLY_DELIVERED, DELIVERED, CANCELLED
     notes: Optional[str] = None
+    quotation_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     adjustments: Optional[List[dict]] = []
