@@ -1,24 +1,14 @@
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .database import client, ensure_indexes
+from .database import ensure_indexes
 from .routers.bills import router as bills_router
 from .routers.gatepasses import router as gatepasses_router
 from .routers.deliveries import router as deliveries_router
 from .routers.dashboard import router as dashboard_router
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await ensure_indexes()
-    yield
-    client.close()
-
-
-app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +22,11 @@ app.include_router(bills_router)
 app.include_router(gatepasses_router)
 app.include_router(deliveries_router)
 app.include_router(dashboard_router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    await ensure_indexes()
 
 
 @app.get("/health")

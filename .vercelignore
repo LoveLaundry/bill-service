@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+.env
+.git
+.python-version
+uv.lock
+README.md
+.gitignore
