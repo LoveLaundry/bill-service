@@ -89,6 +89,7 @@ async def create_gate_pass(
         "items": processed_items,
         "status": "RECEIVED",
         "notes": payload.notes,
+        "quotation_id": payload.quotation_id,
         "created_at": now,
         "updated_at": now,
         "adjustments": [],
