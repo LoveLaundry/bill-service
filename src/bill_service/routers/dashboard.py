@@ -167,12 +167,14 @@ async def get_client_summary(client_name: str = Query(...)):
             "outstanding_amount": round(outstanding_amt, 2),
         },
         "gatepasses": gps,
+        "recent_gate_passes": gps,  # Include both for compatibility
         "deliveries": deliveries,
         "mismatches": mismatches_list,
         "pending_balances": [
             {"item_name": k, **v} for k, v in balances_map.items()
         ],
         "bills": bills,
+        "recent_bills": bills,  # Include both for compatibility
         "payments": payments,
     }
 
@@ -194,17 +196,17 @@ async def get_client_wise_report():
                 continue
             if c_label not in clients_map:
                 clients_map[c_label] = {
-                    "client": c_label,
+                    "client_name": c_label,
                     "total_received": 0,
                     "total_delivered": 0,
                     "total_pending": 0,
                     "total_mismatches": 0,
                     "total_billed": 0.0,
-                    "total_paid": 0.0,
+                    "paid_amount": 0.0,
                     "outstanding": 0.0,
-                    "gate_passes_count": 0,
+                    "gate_pass_count": 0,
                 }
-            clients_map[c_label]["gate_passes_count"] += 1
+            clients_map[c_label]["gate_pass_count"] += 1
             for item in gp.get("items", []):
                 clients_map[c_label]["total_received"] += item.get("received_qty", 0)
                 if item.get("difference", 0) != 0:
@@ -230,7 +232,7 @@ async def get_client_wise_report():
             client = bill["client_name"].strip()
             if client in clients_map:
                 clients_map[client]["total_billed"] += bill.get("grand_total", 0.0)
-                clients_map[client]["total_paid"] += bill.get("paid_amount", 0.0)
+                clients_map[client]["paid_amount"] += bill.get("paid_amount", 0.0)
                 clients_map[client]["outstanding"] += bill.get("outstanding_amount", 0.0)
         except Exception:
             continue
@@ -239,7 +241,7 @@ async def get_client_wise_report():
     for c_label, stats in clients_map.items():
         stats["total_pending"] = max(0, stats["total_received"] - stats["total_delivered"])
         stats["total_billed"] = round(stats["total_billed"], 2)
-        stats["total_paid"] = round(stats["total_paid"], 2)
+        stats["paid_amount"] = round(stats["paid_amount"], 2)
         stats["outstanding"] = round(stats["outstanding"], 2)
         results.append(stats)
 
@@ -261,8 +263,18 @@ async def get_item_wise_report():
             for item in gp.get("items", []):
                 name = item["item_name"]
                 if name not in items_map:
-                    items_map[name] = {"item": name, "received": 0, "delivered": 0, "pending": 0}
-                items_map[name]["received"] += item.get("received_qty", 0)
+                    items_map[name] = {
+                        "item_name": name,
+                        "total_received": 0,
+                        "total_delivered": 0,
+                        "pending": 0,
+                        "mismatch_count": 0,
+                        "clients": set()
+                    }
+                items_map[name]["total_received"] += item.get("received_qty", 0)
+                if item.get("difference", 0) != 0:
+                    items_map[name]["mismatch_count"] += 1
+                items_map[name]["clients"].add(gp.get("client_name", ""))
         except Exception:
             pass
 
@@ -273,14 +285,18 @@ async def get_item_wise_report():
             for item in dl.get("items", []):
                 name = item["item_name"]
                 if name in items_map:
-                    items_map[name]["delivered"] += item.get("quantity", 0)
+                    items_map[name]["total_delivered"] += item.get("quantity", 0)
         except Exception:
             pass
 
+    results = []
     for name, stats in items_map.items():
-        stats["pending"] = max(0, stats["received"] - stats["delivered"])
+        stats["pending"] = max(0, stats["total_received"] - stats["total_delivered"])
+        stats["client_count"] = len(stats["clients"])
+        del stats["clients"]  # Remove the set before returning
+        results.append(stats)
 
-    return list(items_map.values())
+    return results
 
 
 # --- 4. Gate Pass-wise Report ---
@@ -297,47 +313,32 @@ async def get_gatepass_wise_report():
             gp = _decrypt_gp(doc)
             gp_id = gp["id"]
 
-            expected = sum(x.get("client_qty", 0) for x in gp.get("items", []))
-            received = sum(x.get("received_qty", 0) for x in gp.get("items", []))
-            difference = received - expected
+            total_received = sum(x.get("received_qty", 0) for x in gp.get("items", []))
+            mismatch_count = sum(1 for x in gp.get("items", []) if x.get("difference", 0) != 0)
 
             del_ids = []
             del_cursor_2 = deliveries_collection.find(
                 {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
             )
-            delivered = 0
+            total_delivered = 0
             async for d_doc in del_cursor_2:
                 try:
                     dl = _decrypt_del(d_doc)
                     del_ids.append(dl["id"])
-                    delivered += sum(x.get("quantity", 0) for x in dl.get("items", []))
+                    total_delivered += sum(x.get("quantity", 0) for x in dl.get("items", []))
                 except Exception:
                     pass
-
-            pending = max(0, received - delivered)
-
-            billing_status = "UNBILLED"
-            if del_ids:
-                bill_doc = await bills_collection.find_one(
-                    {
-                        "delivery_ids": {"$in": del_ids},
-                        "payment_status": {"$ne": "CANCELLED"},
-                    }
-                )
-                if bill_doc:
-                    billing_status = "BILLED"
 
             results.append(
                 {
                     "gate_pass_number": gp["gate_pass_number"],
                     "client_name": gp["client_name"],
                     "receiving_date": gp.get("receiving_date"),
-                    "expected": expected,
-                    "received": received,
-                    "difference": difference,
-                    "delivered": delivered,
-                    "pending": pending,
-                    "billing_status": billing_status,
+                    "received_by": gp.get("received_by"),
+                    "total_received": total_received,
+                    "total_delivered": total_delivered,
+                    "mismatch_count": mismatch_count,
+                    "status": gp.get("status"),
                 }
             )
         except Exception:
