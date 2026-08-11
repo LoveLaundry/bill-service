@@ -36,7 +36,10 @@ class GatePassAdjustment(BaseModel):
 class GatePassModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
-    id: PyObjectId = Field(alias="_id")
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
     gate_pass_number: str
     client_name: str
     receiving_date: datetime
@@ -116,7 +119,10 @@ class BillCreate(BaseModel):
 class BillModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
-    id: PyObjectId = Field(alias="_id")
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
     quotation_id: str
     client_name: str
     quotation_title: Optional[str] = None
@@ -154,7 +160,10 @@ class PaymentCreate(BaseModel):
 class PaymentModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
-    id: PyObjectId = Field(alias="_id")
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
     bill_id: str
     client_name: str
     amount: float
