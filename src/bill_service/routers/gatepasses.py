@@ -4,7 +4,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from ..auth_helper import get_current_user, require_role
+from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database import audit_collection, gatepasses_collection
 from ..models import GatePassAdjustment, GatePassCreate, GatePassModel
@@ -52,7 +52,7 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str):
 )
 async def create_gate_pass(
     payload: GatePassCreate,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     # Check if uniqueness constraint violates
     existing = await gatepasses_collection.find_one(
@@ -116,7 +116,7 @@ async def list_gate_passes(
     status_filter: Optional[str] = Query(None, alias="status"),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("gatepass:read")),
 ):
     query = {}
 
@@ -148,7 +148,7 @@ async def list_gate_passes(
 @router.get("/{gate_pass_id}", response_model=GatePassModel)
 async def get_gate_pass(
     gate_pass_id: str,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("gatepass:read")),
 ):
     oid = _parse_object_id(gate_pass_id)
     doc = await gatepasses_collection.find_one({"_id": oid})
@@ -163,7 +163,7 @@ async def get_gate_pass(
 async def update_gate_pass_status(
     gate_pass_id: str,
     status_update: str = Query(...),
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     valid_statuses = [
         "RECEIVED",
@@ -212,7 +212,7 @@ async def update_gate_pass_status(
 async def adjust_gate_pass(
     gate_pass_id: str,
     payload: GatePassAdjustment,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+    current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     oid = _parse_object_id(gate_pass_id)
     doc = await gatepasses_collection.find_one({"_id": oid})

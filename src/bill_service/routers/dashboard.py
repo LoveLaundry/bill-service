@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from ..auth_helper import get_current_user, require_role
+from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, get_search_token
 from ..database import (
     bills_collection,
@@ -48,7 +48,7 @@ def _decrypt_pay(doc: dict) -> dict:
 # --- 1. Client Dashboard Summary ---
 @router.get(
     "/dashboard/client-summary",
-    dependencies=[Depends(require_role(["ADMIN", "MANAGER", "STAFF"]))],
+    dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_client_summary(client_name: str = Query(...)):
     token = get_search_token(client_name)
@@ -176,7 +176,7 @@ async def get_client_summary(client_name: str = Query(...)):
 # --- 2. Client-wise Report ---
 @router.get(
     "/reports/client-wise",
-    dependencies=[Depends(require_role(["ADMIN", "MANAGER"]))],
+    dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_client_wise_report():
     gp_cursor = gatepasses_collection.find()
@@ -245,7 +245,7 @@ async def get_client_wise_report():
 # --- 3. Item-wise Report ---
 @router.get(
     "/reports/item-wise",
-    dependencies=[Depends(require_role(["ADMIN", "MANAGER"]))],
+    dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_item_wise_report():
     gp_cursor = gatepasses_collection.find()
@@ -282,7 +282,7 @@ async def get_item_wise_report():
 # --- 4. Gate Pass-wise Report ---
 @router.get(
     "/reports/gatepass-wise",
-    dependencies=[Depends(require_role(["ADMIN", "MANAGER"]))],
+    dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_gatepass_wise_report():
     gp_cursor = gatepasses_collection.find().sort("receiving_date", -1)
@@ -345,7 +345,7 @@ async def get_gatepass_wise_report():
 # --- 5. Billing Summary Report ---
 @router.get(
     "/reports/billing",
-    dependencies=[Depends(require_role(["ADMIN", "MANAGER"]))],
+    dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_billing_report():
     cursor = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}})
@@ -376,7 +376,7 @@ async def get_billing_report():
 # --- 6. Audit Logs ---
 @router.get(
     "/audit-logs",
-    dependencies=[Depends(require_role(["ADMIN"]))],
+    dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_audit_logs(
     limit: int = Query(50, ge=1, le=200),

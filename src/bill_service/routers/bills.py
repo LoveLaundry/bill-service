@@ -4,7 +4,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from ..auth_helper import get_current_user, require_role
+from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database import (
     bills_collection,
@@ -123,7 +123,7 @@ async def get_quotation_prices(quotation_id: str) -> dict:
 @router.post("", response_model=BillModel, status_code=status.HTTP_201_CREATED)
 async def create_bill(
     payload: BillCreate,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+    current_user: dict = Depends(require_capability("bill:write")),
 ):
     # 1. Fetch quotation prices
     price_map = await get_quotation_prices(payload.quotation_id)
@@ -312,7 +312,7 @@ async def list_bills(
     date_to: Optional[datetime] = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("bill:read")),
 ):
     query: dict = {}
 
@@ -358,7 +358,7 @@ async def list_bills(
 @router.get("/{bill_id}", response_model=BillModel)
 async def get_bill(
     bill_id: str,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("bill:read")),
 ):
     oid = _parse_object_id(bill_id)
     doc = await bills_collection.find_one({"_id": oid})
@@ -373,7 +373,7 @@ async def get_bill(
 async def update_bill_status(
     bill_id: str,
     status_update: str = Query(...),
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+    current_user: dict = Depends(require_capability("bill:write")),
 ):
     valid_statuses = [
         "DRAFT",
@@ -420,7 +420,7 @@ async def update_bill_status(
 @router.delete("/{bill_id}")
 async def delete_bill(
     bill_id: str,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+    current_user: dict = Depends(require_capability("payment:write")),
 ):
     oid = _parse_object_id(bill_id)
     # Prefer Cancellation / status CANCELLED instead of hard delete
@@ -453,7 +453,7 @@ async def delete_bill(
 async def create_payment(
     bill_id: str,
     payload: PaymentCreate,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER"])),
+    current_user: dict = Depends(require_capability("payment:write")),
 ):
     oid = _parse_object_id(bill_id)
     doc = await bills_collection.find_one({"_id": oid})
@@ -527,7 +527,7 @@ async def create_payment(
 @router.get("/{bill_id}/payments", response_model=List[PaymentModel])
 async def list_payments_for_bill(
     bill_id: str,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("payment:read")),
 ):
     cursor = payments_collection.find({"bill_id": bill_id}).sort("payment_date", -1)
     results = []

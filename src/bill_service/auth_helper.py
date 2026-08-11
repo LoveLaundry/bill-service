@@ -55,3 +55,40 @@ def require_role(allowed_roles: list):
         return current_user
 
     return dependency
+
+
+ROLE_CAPABILITIES = {
+    "ADMIN": [
+        "gatepass:read", "gatepass:write",
+        "delivery:read", "delivery:write",
+        "bill:read", "bill:write",
+        "payment:read", "payment:write",
+        "dashboard:read"
+    ],
+    "MANAGER": [
+        "gatepass:read", "gatepass:write",
+        "delivery:read", "delivery:write",
+        "bill:read", "bill:write",
+        "payment:read", "payment:write",
+        "dashboard:read"
+    ],
+    "STAFF": [
+        "gatepass:read", "gatepass:write",
+        "delivery:read", "delivery:write",
+        "bill:read"
+    ]
+}
+
+def require_capability(capability: str):
+    """FastAPI dependency to validate fine-grained capabilities."""
+    def dependency(current_user: dict = Security(get_current_user)):
+        role = str(current_user.get("role") or "").upper()
+        capabilities = ROLE_CAPABILITIES.get(role, [])
+        if capability not in capabilities:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Role '{role}' is not authorized to perform this action (missing {capability})",
+            )
+        return current_user
+
+    return dependency

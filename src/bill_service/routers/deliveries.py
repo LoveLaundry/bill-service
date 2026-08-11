@@ -4,7 +4,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from ..auth_helper import get_current_user, require_role
+from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database import (
     audit_collection,
@@ -55,7 +55,7 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str):
 @router.post("", response_model=DeliveryModel, status_code=status.HTTP_201_CREATED)
 async def create_delivery(
     payload: DeliveryCreate,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("delivery:write")),
 ):
     gp_oid = _parse_object_id(payload.gate_pass_id)
 
@@ -181,7 +181,7 @@ async def create_delivery(
 async def list_deliveries(
     client_name: Optional[str] = Query(None),
     gate_pass_id: Optional[str] = Query(None),
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("delivery:read")),
 ):
     query = {}
 
@@ -204,7 +204,7 @@ async def list_deliveries(
 @router.get("/{delivery_id}", response_model=DeliveryModel)
 async def get_delivery(
     delivery_id: str,
-    current_user: dict = Depends(require_role(["ADMIN", "MANAGER", "STAFF"])),
+    current_user: dict = Depends(require_capability("delivery:read")),
 ):
     oid = _parse_object_id(delivery_id)
     doc = await deliveries_collection.find_one({"_id": oid})
