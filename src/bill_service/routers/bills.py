@@ -42,7 +42,8 @@ def _serialize(doc: dict) -> dict:
             status_code=500, detail=f"Failed to decrypt document: {str(e)}"
         )
 
-    decrypted["_id"] = str(decrypted["_id"])
+    decrypted["id"] = str(decrypted["_id"])
+    del decrypted["_id"]
     return decrypted
 
 
@@ -53,7 +54,8 @@ def _serialize_payment(doc: dict) -> dict:
         raise HTTPException(
             status_code=500, detail=f"Failed to decrypt payment: {str(e)}"
         )
-    decrypted["_id"] = str(decrypted["_id"])
+    decrypted["id"] = str(decrypted["_id"])
+    del decrypted["_id"]
     return decrypted
 
 
