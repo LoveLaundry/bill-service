@@ -23,25 +23,29 @@ SENSITIVE_FIELDS_PAY = ["client_name", "notes"]
 
 def _decrypt_gp(doc: dict) -> dict:
     dec = decrypt_dict(doc, SENSITIVE_FIELDS_GP)
-    dec["_id"] = str(dec["_id"])
+    dec["id"] = str(dec["_id"])
+    del dec["_id"]
     return dec
 
 
 def _decrypt_del(doc: dict) -> dict:
     dec = decrypt_dict(doc, SENSITIVE_FIELDS_DEL)
-    dec["_id"] = str(dec["_id"])
+    dec["id"] = str(dec["_id"])
+    del dec["_id"]
     return dec
 
 
 def _decrypt_bill(doc: dict) -> dict:
     dec = decrypt_dict(doc, SENSITIVE_FIELDS_BILL)
-    dec["_id"] = str(dec["_id"])
+    dec["id"] = str(dec["_id"])
+    del dec["_id"]
     return dec
 
 
 def _decrypt_pay(doc: dict) -> dict:
     dec = decrypt_dict(doc, SENSITIVE_FIELDS_PAY)
-    dec["_id"] = str(dec["_id"])
+    dec["id"] = str(dec["_id"])
+    del dec["_id"]
     return dec
 
 
@@ -104,7 +108,7 @@ async def get_client_summary(client_name: str = Query(...)):
                 open_mismatches += 1
                 mismatches_list.append(
                     {
-                        "gate_pass_id": gp["_id"],
+                        "gate_pass_id": gp["id"],
                         "gate_pass_number": gp["gate_pass_number"],
                         "item_name": name,
                         "expected": client_qty,
@@ -291,7 +295,7 @@ async def get_gatepass_wise_report():
     async for doc in gp_cursor:
         try:
             gp = _decrypt_gp(doc)
-            gp_id = gp["_id"]
+            gp_id = gp["id"]
 
             expected = sum(x.get("client_qty", 0) for x in gp.get("items", []))
             received = sum(x.get("received_qty", 0) for x in gp.get("items", []))
@@ -305,7 +309,7 @@ async def get_gatepass_wise_report():
             async for d_doc in del_cursor_2:
                 try:
                     dl = _decrypt_del(d_doc)
-                    del_ids.append(str(d_doc["_id"]))
+                    del_ids.append(dl["id"])
                     delivered += sum(x.get("quantity", 0) for x in dl.get("items", []))
                 except Exception:
                     pass
