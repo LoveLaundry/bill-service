@@ -1,3 +1,4 @@
+from pydantic import AliasChoices
 from datetime import datetime
 from typing import Annotated, List, Optional
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
@@ -68,7 +69,10 @@ class DeliveryCreate(BaseModel):
 class DeliveryModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
-    id: PyObjectId = Field(alias="_id")
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
     gate_pass_id: str
     client_name: str
     delivery_date: datetime
