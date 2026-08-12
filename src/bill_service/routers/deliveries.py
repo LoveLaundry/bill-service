@@ -6,11 +6,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
-from ..database import (
+from ..database.main_db import (
     audit_collection,
     deliveries_collection,
     gatepasses_collection,
 )
+from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services.verification_service import attach_verification_to
 from ..models import DeliveryCreate, DeliveryModel
 
 router = APIRouter(prefix="/deliveries", tags=["deliveries"])
@@ -144,6 +146,10 @@ async def create_delivery(
     created = await deliveries_collection.find_one({"_id": result.inserted_id})
     serialized = _serialize(created)
 
+    new_version = await bump_version("delivery", result.inserted_id)
+    await enqueue_sync("delivery", result.inserted_id, new_version)
+    serialized = await attach_verification_to("delivery", result.inserted_id, serialized)
+
     # 5. Check if Gate Pass is now fully delivered
     # Recalculate combined delivered maps after this successful write
     updated_delivered_map = delivered_map.copy()
@@ -168,6 +174,9 @@ async def create_delivery(
             }
         },
     )
+
+    gp_new_version = await bump_version("gatepass", gp_oid)
+    await enqueue_sync("gatepass", gp_oid, gp_new_version)
 
     await log_audit(
         current_user.get("auth_id", "system"),
@@ -196,7 +205,8 @@ async def list_deliveries(
     results = []
     async for doc in cursor:
         try:
-            results.append(_serialize(doc))
+            serialized = _serialize(doc)
+            results.append(await attach_verification_to("delivery", doc["_id"], serialized))
         except HTTPException:
             pass
     return results
@@ -213,4 +223,5 @@ async def get_delivery(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
         )
-    return _serialize(doc)
+    serialized = _serialize(doc)
+    return await attach_verification_to("delivery", oid, serialized)

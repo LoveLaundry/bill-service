@@ -6,7 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
-from ..database import audit_collection, gatepasses_collection
+from ..database.main_db import audit_collection, gatepasses_collection
+from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services.verification_service import attach_verification_to
 from ..models import GatePassAdjustment, GatePassCreate, GatePassModel
 
 router = APIRouter(prefix="/gatepasses", tags=["gatepasses"])
@@ -103,6 +105,11 @@ async def create_gate_pass(
     created = await gatepasses_collection.find_one({"_id": result.inserted_id})
 
     serialized = _serialize(created)
+
+    new_version = await bump_version("gatepass", result.inserted_id)
+    await enqueue_sync("gatepass", result.inserted_id, new_version)
+    serialized = await attach_verification_to("gatepass", result.inserted_id, serialized)
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_CREATE",
@@ -141,7 +148,8 @@ async def list_gate_passes(
     results = []
     async for doc in cursor:
         try:
-            results.append(_serialize(doc))
+            serialized = _serialize(doc)
+            results.append(await attach_verification_to("gatepass", doc["_id"], serialized))
         except HTTPException:
             pass  # skip if decryption fails
     return results
@@ -158,7 +166,8 @@ async def get_gate_pass(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
         )
-    return _serialize(doc)
+    serialized = _serialize(doc)
+    return await attach_verification_to("gatepass", oid, serialized)
 
 
 @router.patch("/{gate_pass_id}/status", response_model=GatePassModel)
@@ -201,6 +210,11 @@ async def update_gate_pass_status(
 
     updated_doc = await gatepasses_collection.find_one({"_id": oid})
     serialized = _serialize(updated_doc)
+
+    new_version = await bump_version("gatepass", oid)
+    await enqueue_sync("gatepass", oid, new_version)
+    serialized = await attach_verification_to("gatepass", oid, serialized)
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_STATUS_UPDATE",
@@ -265,6 +279,11 @@ async def adjust_gate_pass(
 
     updated_doc = await gatepasses_collection.find_one({"_id": oid})
     serialized = _serialize(updated_doc)
+
+    new_version = await bump_version("gatepass", oid)
+    await enqueue_sync("gatepass", oid, new_version)
+    serialized = await attach_verification_to("gatepass", oid, serialized)
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_ADJUST",

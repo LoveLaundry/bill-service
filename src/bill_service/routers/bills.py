@@ -6,12 +6,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
-from ..database import (
+from ..database.main_db import (
+    audit_collection,
     bills_collection,
     deliveries_collection,
     payments_collection,
-    audit_collection,
 )
+from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services.verification_service import attach_verification_to
 from ..models import (
     BillCreate,
     BillModel,
@@ -81,8 +83,10 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str):
 
 
 async def get_quotation_prices(quotation_id: str) -> dict:
-    """Fetch quotation pricing from quotations_db via the shared motor client."""
-    from ..database import client as motor_client
+    """Fetch quotation pricing via the MAIN cluster client (read-only)."""
+    from ..database.connection_manager import get_client
+
+    motor_client = get_client("MAIN")
 
     try:
         q_oid = ObjectId(quotation_id)
@@ -295,6 +299,12 @@ async def create_bill(
     created = await bills_collection.find_one({"_id": result.inserted_id})
 
     serialized = _serialize(created)
+
+    # Main DB write succeeded -> bump version and enqueue replication
+    new_version = await bump_version("bill", result.inserted_id)
+    await enqueue_sync("bill", result.inserted_id, new_version)
+    serialized = await attach_verification_to("bill", result.inserted_id, serialized)
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "BILL_CREATE",
@@ -350,7 +360,8 @@ async def list_bills(
     docs = []
     async for doc in cursor:
         try:
-            docs.append(_serialize(doc))
+            serialized = _serialize(doc)
+            docs.append(await attach_verification_to("bill", doc["_id"], serialized))
         except HTTPException:
             pass
 
@@ -368,7 +379,8 @@ async def get_bill(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
         )
-    return _serialize(doc)
+    serialized = _serialize(doc)
+    return await attach_verification_to("bill", oid, serialized)
 
 
 @router.patch("/{bill_id}/status", response_model=BillModel)
@@ -410,6 +422,11 @@ async def update_bill_status(
 
     updated_doc = await bills_collection.find_one({"_id": oid})
     serialized = _serialize(updated_doc)
+
+    new_version = await bump_version("bill", oid)
+    await enqueue_sync("bill", oid, new_version)
+    serialized = await attach_verification_to("bill", oid, serialized)
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "BILL_STATUS_UPDATE",
@@ -439,6 +456,9 @@ async def delete_bill(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
         )
+
+    new_version = await bump_version("bill", oid)
+    await enqueue_sync("bill", oid, new_version)
 
     await log_audit(
         current_user.get("auth_id", "system"), "BILL_CANCEL", "bill", bill_id
@@ -493,6 +513,9 @@ async def create_payment(
     encrypted_pay = encrypt_dict(payment_doc, PAYMENT_SENSITIVE_FIELDS)
     pay_result = await payments_collection.insert_one(encrypted_pay)
 
+    payment_version = await bump_version("payment", pay_result.inserted_id)
+    await enqueue_sync("payment", pay_result.inserted_id, payment_version)
+
     # 2. Update Bill totals
     new_paid = round(dec_bill["paid_amount"] + payload.amount, 2)
     new_outstanding = round(dec_bill["grand_total"] - new_paid, 2)
@@ -517,6 +540,12 @@ async def create_payment(
     created_pay = await payments_collection.find_one({"_id": pay_result.inserted_id})
     serialized_pay = _serialize_payment(created_pay)
 
+    # The bill changed too -> enqueue its replication as well
+    bill_new_version = await bump_version("bill", oid)
+    await enqueue_sync("bill", oid, bill_new_version)
+
+    serialized_pay = await attach_verification_to("payment", pay_result.inserted_id, serialized_pay)
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "PAYMENT_CREATE",
@@ -535,7 +564,8 @@ async def list_payments_for_bill(
     results = []
     async for doc in cursor:
         try:
-            results.append(_serialize_payment(doc))
+            serialized = _serialize_payment(doc)
+            results.append(await attach_verification_to("payment", doc["_id"], serialized))
         except HTTPException:
             pass
     return results

@@ -5,12 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, get_search_token
-from ..database import (
+from ..database.main_db import (
+    audit_collection,
     bills_collection,
     deliveries_collection,
     gatepasses_collection,
     payments_collection,
-    audit_collection,
 )
 
 router = APIRouter(tags=["dashboard"])

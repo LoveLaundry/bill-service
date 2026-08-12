@@ -1,12 +1,17 @@
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .database import ensure_indexes
+from .database.connection_manager import close_all
+from .database.main_db import ensure_indexes
+from .routers.admin_database import router as admin_database_router
 from .routers.bills import router as bills_router
-from .routers.gatepasses import router as gatepasses_router
 from .routers.deliveries import router as deliveries_router
 from .routers.dashboard import router as dashboard_router
+from .routers.gatepasses import router as gatepasses_router
+from .services import synchronization_service
 
 app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0")
 
@@ -22,11 +27,32 @@ app.include_router(bills_router)
 app.include_router(gatepasses_router)
 app.include_router(deliveries_router)
 app.include_router(dashboard_router)
+app.include_router(admin_database_router)
+
+# Background sync worker: MAIN -> SECONDARY replication with retry/backoff.
+_sync_task: asyncio.Task | None = None
 
 
 @app.on_event("startup")
 async def startup_event():
     await ensure_indexes()
+
+    if settings.sync_enabled:
+        global _sync_task
+        _sync_task = asyncio.create_task(synchronization_service.run_worker())
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _sync_task
+    if _sync_task is not None:
+        _sync_task.cancel()
+        try:
+            await _sync_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _sync_task = None
+    await close_all()
 
 
 @app.get("/health")
