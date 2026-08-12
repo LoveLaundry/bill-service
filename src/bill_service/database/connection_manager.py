@@ -42,7 +42,11 @@ def get_client(role: str) -> motor.motor_asyncio.AsyncIOMotorClient:
     role = role.upper()
     if role not in _clients:
         uri, _ = _resolve(role)
-        _clients[role] = motor.motor_asyncio.AsyncIOMotorClient(uri)
+        _clients[role] = motor.motor_asyncio.AsyncIOMotorClient(
+            uri,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+        )
     return _clients[role]
 
 
