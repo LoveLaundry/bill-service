@@ -50,13 +50,13 @@ class Settings(BaseSettings):
         return self.mongodb_main_db or self.mongo_db_name
 
     def resolve_secondary_uri(self) -> str:
-        return self.mongodb_secondary_uri or self.mongo_uri
+        return self.mongodb_secondary_uri or "mongodb://unconfigured"
 
     def resolve_secondary_db(self) -> str:
         return self.mongodb_secondary_db or f"{self.resolve_main_db()}_secondary"
 
     def resolve_local_uri(self) -> str:
-        return self.mongodb_local_uri or self.mongo_uri
+        return self.mongodb_local_uri or "mongodb://unconfigured"
 
     def resolve_local_db(self) -> str:
         return self.mongodb_local_db or f"{self.resolve_main_db()}_local"
