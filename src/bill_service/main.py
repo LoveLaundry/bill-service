@@ -13,11 +13,23 @@ from .routers.dashboard import router as dashboard_router
 from .routers.gatepasses import router as gatepasses_router
 from .services import synchronization_service
 
+
+import os
+import sentry_sdk
+
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")]
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        traces_sample_rate=1.0,
+    )
+
 app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
