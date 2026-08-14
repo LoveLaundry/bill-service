@@ -13,12 +13,34 @@ from .routers.dashboard import router as dashboard_router
 from .routers.gatepasses import router as gatepasses_router
 from .services import synchronization_service
 
+
+import logging
+import os
+import sentry_sdk
+
+logger = logging.getLogger(__name__)
+
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
+if not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = ["*"]
+# Starlette forbids allow_credentials=True with allow_origins=["*"]
+ALLOW_CREDENTIALS = ALLOWED_ORIGINS != ["*"]
+# Vercel sets VERCEL=1; background workers are unreliable in serverless.
+ON_VERCEL = os.getenv("VERCEL") == "1"
+
+SENTRY_DSN = os.getenv("SENTRY_DSN")
+if SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        traces_sample_rate=1.0,
+    )
+
 app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -35,9 +57,12 @@ _sync_task: asyncio.Task | None = None
 
 @app.on_event("startup")
 async def startup_event():
-    await ensure_indexes()
+    try:
+        await ensure_indexes()
+    except Exception:
+        logger.exception("Failed to ensure MongoDB indexes on startup")
 
-    if settings.sync_enabled:
+    if settings.sync_enabled and not ON_VERCEL:
         global _sync_task
         _sync_task = asyncio.create_task(synchronization_service.run_worker())
 

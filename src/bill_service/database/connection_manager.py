@@ -45,10 +45,8 @@ def get_client(role: str) -> motor.motor_asyncio.AsyncIOMotorClient:
         uri, _ = _resolve(role)
         _clients[role] = motor.motor_asyncio.AsyncIOMotorClient(
             uri,
-            # Fail fast so a single unreachable host doesn't hang the request.
-            serverSelectionTimeoutMS=3000,
-            connectTimeoutMS=3000,
-            socketTimeoutMS=3000,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
         )
     return _clients[role]
 
