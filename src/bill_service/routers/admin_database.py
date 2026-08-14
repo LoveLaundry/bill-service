@@ -8,6 +8,7 @@ GET  /admin/database/sync-logs      -> recent synchronization history
 """
 from datetime import datetime
 
+import asyncio
 from fastapi import APIRouter, Depends
 
 from ..auth_helper import require_role
@@ -32,9 +33,11 @@ def _format_log(entry: dict) -> dict:
 @router.get("/status")
 async def database_status(_user: dict = admin_only):
     """Report ONLINE/OFFLINE and sync status for each database role."""
-    main_online = await ping("MAIN")
-    secondary_online = await ping("SECONDARY")
-    local_online = await ping("LOCAL")
+    main_online, secondary_online, local_online = await asyncio.gather(
+        ping("MAIN"),
+        ping("SECONDARY"),
+        ping("LOCAL"),
+    )
 
     last_local = await local_sync_service.last_local_sync()
 

@@ -13,6 +13,7 @@ Roles:
 """
 from __future__ import annotations
 
+import asyncio
 import motor.motor_asyncio
 
 from ..config import settings
@@ -42,7 +43,13 @@ def get_client(role: str) -> motor.motor_asyncio.AsyncIOMotorClient:
     role = role.upper()
     if role not in _clients:
         uri, _ = _resolve(role)
-        _clients[role] = motor.motor_asyncio.AsyncIOMotorClient(uri)
+        _clients[role] = motor.motor_asyncio.AsyncIOMotorClient(
+            uri,
+            # Fail fast so a single unreachable host doesn't hang the request.
+            serverSelectionTimeoutMS=3000,
+            connectTimeoutMS=3000,
+            socketTimeoutMS=3000,
+        )
     return _clients[role]
 
 
@@ -56,9 +63,12 @@ def get_database(role: str) -> motor.motor_asyncio.AsyncIOMotorDatabase:
 
 
 async def ping(role: str) -> bool:
-    """Ping a database role. Returns True when reachable."""
+    """Ping a database role. Returns True when reachable within 3 s."""
     try:
-        await get_client(role).admin.command("ping")
+        await asyncio.wait_for(
+            get_client(role).admin.command("ping"),
+            timeout=3.0,
+        )
         return True
     except Exception:
         return False
