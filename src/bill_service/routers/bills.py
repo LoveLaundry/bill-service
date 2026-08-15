@@ -569,3 +569,115 @@ async def list_payments_for_bill(
         except HTTPException:
             pass
     return results
+
+
+# --- Helper endpoint for bill creation: Get unbilled gate passes ---
+@router.get("/unbilled-gatepasses", response_model=list)
+async def get_unbilled_gatepasses(
+    client_name: Optional[str] = Query(None),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    """
+    Returns gate passes that have items ready to be billed.
+    Optionally filter by client name.
+    """
+    from ..database.main_db import gatepasses_collection
+    
+    query = {"status": {"$nin": ["CANCELLED"]}}
+    
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+    
+    gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
+    
+    unbilled_gatepasses = []
+    
+    async for gp_doc in gp_cursor:
+        try:
+            gp = decrypt_dict(gp_doc, ["client_name", "items", "notes"])
+            gp["id"] = str(gp_doc["_id"])
+            gp_id = gp["id"]
+            
+            # Get all deliveries for this gate pass
+            del_cursor = deliveries_collection.find(
+                {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
+            )
+            
+            delivery_ids = []
+            delivered_items = {}
+            
+            async for del_doc in del_cursor:
+                try:
+                    delivery = decrypt_dict(del_doc, DELIVERY_SENSITIVE_FIELDS)
+                    delivery_id = str(del_doc["_id"])
+                    delivery_ids.append(delivery_id)
+                    
+                    for item in delivery.get("items", []):
+                        item_name = item["item_name"]
+                        qty = item.get("quantity", 0)
+                        delivered_items[item_name] = delivered_items.get(item_name, 0) + qty
+                except Exception:
+                    pass
+            
+            if not delivery_ids:
+                # No deliveries yet, skip this gate pass
+                continue
+            
+            # Check what's already billed from these deliveries
+            billed_items = {}
+            bills_cursor = bills_collection.find({
+                "delivery_ids": {"$in": delivery_ids},
+                "payment_status": {"$ne": "CANCELLED"}
+            })
+            
+            async for bill_doc in bills_cursor:
+                try:
+                    bill = decrypt_dict(bill_doc, SENSITIVE_FIELDS)
+                    for item in bill.get("items", []):
+                        item_name = item["item_name"]
+                        qty = item.get("quantity", 0)
+                        billed_items[item_name] = billed_items.get(item_name, 0) + qty
+                except Exception:
+                    pass
+            
+            # Calculate unbilled quantities
+            unbilled_items = []
+            total_unbilled_qty = 0
+            
+            for item_name, delivered_qty in delivered_items.items():
+                billed_qty = billed_items.get(item_name, 0)
+                unbilled_qty = delivered_qty - billed_qty
+                
+                if unbilled_qty > 0:
+                    # Find the item details from gate pass
+                    gp_item = next(
+                        (item for item in gp.get("items", []) if item["item_name"] == item_name),
+                        {}
+                    )
+                    
+                    unbilled_items.append({
+                        "item_name": item_name,
+                        "category": gp_item.get("category"),
+                        "delivered_qty": delivered_qty,
+                        "billed_qty": billed_qty,
+                        "unbilled_qty": unbilled_qty
+                    })
+                    total_unbilled_qty += unbilled_qty
+            
+            # Only include gate passes with unbilled items
+            if unbilled_items:
+                unbilled_gatepasses.append({
+                    "id": gp_id,
+                    "gate_pass_number": gp.get("gate_pass_number"),
+                    "client_name": gp.get("client_name"),
+                    "receiving_date": gp.get("receiving_date"),
+                    "quotation_id": gp.get("quotation_id"),
+                    "delivery_ids": delivery_ids,
+                    "unbilled_items": unbilled_items,
+                    "total_unbilled_qty": total_unbilled_qty
+                })
+                
+        except Exception:
+            pass
+    
+    return unbilled_gatepasses

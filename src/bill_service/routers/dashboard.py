@@ -313,10 +313,11 @@ async def get_gatepass_wise_report():
             gp = _decrypt_gp(doc)
             gp_id = gp["id"]
 
+            # Calculate totals per gate pass
             total_received = sum(x.get("received_qty", 0) for x in gp.get("items", []))
             mismatch_count = sum(1 for x in gp.get("items", []) if x.get("difference", 0) != 0)
 
-            del_ids = []
+            # Get deliveries for this gate pass
             del_cursor_2 = deliveries_collection.find(
                 {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
             )
@@ -324,21 +325,58 @@ async def get_gatepass_wise_report():
             async for d_doc in del_cursor_2:
                 try:
                     dl = _decrypt_del(d_doc)
-                    del_ids.append(dl["id"])
                     total_delivered += sum(x.get("quantity", 0) for x in dl.get("items", []))
+                except Exception:
+                    pass
+
+            # Calculate current balance
+            current_balance = max(0, total_received - total_delivered)
+
+            # Item-wise balance breakdown
+            item_balances = {}
+            for item in gp.get("items", []):
+                item_name = item["item_name"]
+                item_balances[item_name] = {
+                    "received": item.get("received_qty", 0),
+                    "delivered": 0,
+                    "balance": item.get("received_qty", 0)
+                }
+
+            # Deduct delivered quantities
+            del_cursor_3 = deliveries_collection.find(
+                {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
+            )
+            async for d_doc in del_cursor_3:
+                try:
+                    dl = _decrypt_del(d_doc)
+                    for item in dl.get("items", []):
+                        item_name = item["item_name"]
+                        qty = item.get("quantity", 0)
+                        if item_name in item_balances:
+                            item_balances[item_name]["delivered"] += qty
+                            item_balances[item_name]["balance"] = max(
+                                0, 
+                                item_balances[item_name]["received"] - item_balances[item_name]["delivered"]
+                            )
                 except Exception:
                     pass
 
             results.append(
                 {
+                    "gate_pass_id": gp_id,
                     "gate_pass_number": gp["gate_pass_number"],
                     "client_name": gp["client_name"],
                     "receiving_date": gp.get("receiving_date"),
                     "received_by": gp.get("received_by"),
                     "total_received": total_received,
                     "total_delivered": total_delivered,
+                    "current_balance": current_balance,
                     "mismatch_count": mismatch_count,
                     "status": gp.get("status"),
+                    "item_balances": [
+                        {"item_name": name, **balances} 
+                        for name, balances in item_balances.items()
+                    ]
                 }
             )
         except Exception:
@@ -393,3 +431,93 @@ async def get_audit_logs(
         del doc["_id"]
         logs.append(doc)
     return logs
+
+
+# --- 7. Notifications: Items to be Sent ---
+@router.get(
+    "/notifications/items-to-send",
+    dependencies=[Depends(require_capability("dashboard:read"))],
+)
+async def get_items_to_send():
+    """
+    Returns items that have been received but not yet delivered.
+    Grouped by client with item-wise breakdown.
+    """
+    notifications = []
+    
+    # Get all gate passes with pending items
+    gp_cursor = gatepasses_collection.find({"status": {"$nin": ["CANCELLED", "DELIVERED"]}}).sort("receiving_date", 1)
+    
+    async for doc in gp_cursor:
+        try:
+            gp = _decrypt_gp(doc)
+            gp_id = gp["id"]
+            client_name = gp["client_name"]
+            
+            # Build item balance map
+            item_balances = {}
+            for item in gp.get("items", []):
+                item_name = item["item_name"]
+                received_qty = item.get("received_qty", 0)
+                if received_qty > 0:
+                    item_balances[item_name] = {
+                        "received": received_qty,
+                        "delivered": 0,
+                        "pending": received_qty,
+                        "category": item.get("category", "")
+                    }
+            
+            # Deduct delivered quantities
+            del_cursor = deliveries_collection.find(
+                {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
+            )
+            async for d_doc in del_cursor:
+                try:
+                    dl = _decrypt_del(d_doc)
+                    for item in dl.get("items", []):
+                        item_name = item["item_name"]
+                        qty = item.get("quantity", 0)
+                        if item_name in item_balances:
+                            item_balances[item_name]["delivered"] += qty
+                            item_balances[item_name]["pending"] = max(
+                                0,
+                                item_balances[item_name]["received"] - item_balances[item_name]["delivered"]
+                            )
+                except Exception:
+                    pass
+            
+            # Filter items with pending quantities
+            pending_items = [
+                {"item_name": name, **balance}
+                for name, balance in item_balances.items()
+                if balance["pending"] > 0
+            ]
+            
+            if pending_items:
+                total_pending = sum(item["pending"] for item in pending_items)
+                
+                # Calculate days pending
+                from datetime import datetime, timezone
+                receiving_date = gp.get("receiving_date")
+                if isinstance(receiving_date, datetime):
+                    days_pending = (datetime.now(timezone.utc) - receiving_date).days
+                else:
+                    days_pending = 0
+                
+                notifications.append({
+                    "gate_pass_id": gp_id,
+                    "gate_pass_number": gp["gate_pass_number"],
+                    "client_name": client_name,
+                    "receiving_date": gp.get("receiving_date"),
+                    "days_pending": days_pending,
+                    "total_pending_items": total_pending,
+                    "pending_items": pending_items,
+                    "priority": "high" if days_pending > 7 else "medium" if days_pending > 3 else "normal"
+                })
+        except Exception:
+            pass
+    
+    return {
+        "count": len(notifications),
+        "notifications": sorted(notifications, key=lambda x: x["days_pending"], reverse=True)
+    }
