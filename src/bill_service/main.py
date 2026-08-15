@@ -20,11 +20,18 @@ import sentry_sdk
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
-if not ALLOWED_ORIGINS:
+# CORS configuration - allow all origins for now to avoid blocking
+ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
+if ALLOWED_ORIGINS_ENV:
+    ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
+    ALLOW_CREDENTIALS = True
+else:
+    # If not configured, allow all origins (development/production fallback)
     ALLOWED_ORIGINS = ["*"]
-# Starlette forbids allow_credentials=True with allow_origins=["*"]
-ALLOW_CREDENTIALS = ALLOWED_ORIGINS != ["*"]
+    ALLOW_CREDENTIALS = False
+
+logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}, credentials: {ALLOW_CREDENTIALS}")
+
 # Vercel sets VERCEL=1; background workers are unreliable in serverless.
 ON_VERCEL = os.getenv("VERCEL") == "1"
 
