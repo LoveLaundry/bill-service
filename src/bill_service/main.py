@@ -18,19 +18,26 @@ import logging
 import os
 import sentry_sdk
 
+# Configure logging first
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # CORS configuration - allow all origins for now to avoid blocking
-ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
-if ALLOWED_ORIGINS_ENV:
-    ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
-    ALLOW_CREDENTIALS = True
-else:
-    # If not configured, allow all origins (development/production fallback)
+try:
+    ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
+    if ALLOWED_ORIGINS_ENV:
+        ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
+        ALLOW_CREDENTIALS = True
+    else:
+        # If not configured, allow all origins (development/production fallback)
+        ALLOWED_ORIGINS = ["*"]
+        ALLOW_CREDENTIALS = False
+
+    logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}, credentials: {ALLOW_CREDENTIALS}")
+except Exception as e:
+    logger.warning(f"CORS configuration failed, using defaults: {e}")
     ALLOWED_ORIGINS = ["*"]
     ALLOW_CREDENTIALS = False
-
-logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}, credentials: {ALLOW_CREDENTIALS}")
 
 # Vercel sets VERCEL=1; background workers are unreliable in serverless.
 ON_VERCEL = os.getenv("VERCEL") == "1"
