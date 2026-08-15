@@ -437,19 +437,24 @@ async def get_comprehensive_dashboard(
     - Financial Health (outstanding payments, collection rate)
     - Quality Metrics (mismatch rate, error tracking)
     """
-    from datetime import datetime, timedelta, timezone
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"Dashboard request for period: {period}")
     
-    now = datetime.now(timezone.utc)
-    
-    # Calculate period boundaries
-    period_map = {
-        "day": timedelta(days=1),
-        "week": timedelta(weeks=1),
-        "month": timedelta(days=30),
-        "quarter": timedelta(days=90),
-        "year": timedelta(days=365),
-    }
-    period_start = now - period_map[period]
+    try:
+        from datetime import datetime, timedelta, timezone
+        
+        now = datetime.now(timezone.utc)
+        
+        # Calculate period boundaries
+        period_map = {
+            "day": timedelta(days=1),
+            "week": timedelta(weeks=1),
+            "month": timedelta(days=30),
+            "quarter": timedelta(days=90),
+            "year": timedelta(days=365),
+        }
+        period_start = now - period_map[period]
     
     # --- FINANCIAL METRICS ---
     bills_cursor = bills_collection.find({
@@ -711,6 +716,9 @@ async def get_comprehensive_dashboard(
             "items": critical_alerts
         }
     }
+    except Exception as e:
+        logger.exception(f"Dashboard error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Dashboard generation failed: {str(e)}")
 
 
 # --- 8. Notifications: Items to be Sent ---
