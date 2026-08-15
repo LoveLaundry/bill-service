@@ -416,24 +416,304 @@ async def get_billing_report():
     }
 
 
-# --- 6. Audit Logs ---
+# --- 6. Comprehensive Business Dashboard ---
 @router.get(
-    "/audit-logs",
+    "/dashboard/overview",
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
-async def get_audit_logs(
-    limit: int = Query(50, ge=1, le=200),
+async def get_comprehensive_dashboard(
+    period: str = Query("month", regex="^(day|week|month|quarter|year)$"),
+    _user: dict = Depends(get_current_user)
 ):
-    cursor = audit_collection.find().sort("timestamp", -1).limit(limit)
-    logs = []
-    async for doc in cursor:
-        doc["id"] = str(doc["_id"])
-        del doc["_id"]
-        logs.append(doc)
-    return logs
+    """
+    Comprehensive business dashboard with all essential KPIs following industry best practices.
+    Research sources: Spindle Live, Modeliks, BusinessPlan Templates, Intuit ERP
+    
+    Key Metrics Tracked:
+    - Revenue & Profitability (total sales, revenue trends)
+    - Operational Efficiency (turnaround time, on-time delivery rate)
+    - Client Metrics (active clients, client retention, top clients)
+    - Inventory Status (items pending, inventory turnover)
+    - Financial Health (outstanding payments, collection rate)
+    - Quality Metrics (mismatch rate, error tracking)
+    """
+    from datetime import datetime, timedelta, timezone
+    
+    now = datetime.now(timezone.utc)
+    
+    # Calculate period boundaries
+    period_map = {
+        "day": timedelta(days=1),
+        "week": timedelta(weeks=1),
+        "month": timedelta(days=30),
+        "quarter": timedelta(days=90),
+        "year": timedelta(days=365),
+    }
+    period_start = now - period_map[period]
+    
+    # --- FINANCIAL METRICS ---
+    bills_cursor = bills_collection.find({
+        "payment_status": {"$ne": "CANCELLED"},
+        "bill_date": {"$gte": period_start}
+    })
+    
+    total_revenue = 0.0
+    total_paid = 0.0
+    total_outstanding = 0.0
+    bill_count = 0
+    paid_bills = 0
+    
+    revenue_by_date = {}
+    
+    async for doc in bills_cursor:
+        try:
+            bill = _decrypt_bill(doc)
+            grand_total = bill.get("grand_total", 0.0)
+            paid_amt = bill.get("paid_amount", 0.0)
+            outstanding = bill.get("outstanding_amount", 0.0)
+            
+            total_revenue += grand_total
+            total_paid += paid_amt
+            total_outstanding += outstanding
+            bill_count += 1
+            
+            if bill.get("payment_status") == "PAID":
+                paid_bills += 1
+            
+            # Revenue trend
+            bill_date = bill.get("bill_date")
+            if isinstance(bill_date, datetime):
+                date_key = bill_date.strftime("%Y-%m-%d")
+                revenue_by_date[date_key] = revenue_by_date.get(date_key, 0) + grand_total
+                
+        except Exception:
+            pass
+    
+    # Collection rate (% of revenue collected)
+    collection_rate = (total_paid / total_revenue * 100) if total_revenue > 0 else 0
+    
+    # Average bill value
+    avg_bill_value = total_revenue / bill_count if bill_count > 0 else 0
+    
+    # --- OPERATIONAL METRICS ---
+    gp_cursor = gatepasses_collection.find({"receiving_date": {"$gte": period_start}})
+    
+    total_items_received = 0
+    total_items_delivered = 0
+    gate_pass_count = 0
+    mismatch_count = 0
+    total_mismatch_items = 0
+    
+    client_set = set()
+    turnaround_times = []
+    
+    async for doc in gp_cursor:
+        try:
+            gp = _decrypt_gp(doc)
+            gp_id = gp["id"]
+            gate_pass_count += 1
+            
+            client_set.add(gp["client_name"])
+            
+            # Count received items
+            for item in gp.get("items", []):
+                received_qty = item.get("received_qty", 0)
+                total_items_received += received_qty
+                total_mismatch_items += received_qty
+                
+                if item.get("difference", 0) != 0:
+                    mismatch_count += 1
+            
+            # Count delivered items and calculate turnaround time
+            del_cursor = deliveries_collection.find({
+                "gate_pass_id": gp_id,
+                "status": {"$ne": "CANCELLED"}
+            })
+            
+            first_delivery_date = None
+            async for d_doc in del_cursor:
+                try:
+                    dl = _decrypt_del(d_doc)
+                    for item in dl.get("items", []):
+                        total_items_delivered += item.get("quantity", 0)
+                    
+                    delivery_date = dl.get("delivery_date")
+                    if isinstance(delivery_date, datetime):
+                        if first_delivery_date is None or delivery_date < first_delivery_date:
+                            first_delivery_date = delivery_date
+                except Exception:
+                    pass
+            
+            # Calculate turnaround time (receiving to first delivery)
+            receiving_date = gp.get("receiving_date")
+            if isinstance(receiving_date, datetime) and first_delivery_date:
+                turnaround = (first_delivery_date - receiving_date).total_seconds() / 3600  # hours
+                turnaround_times.append(turnaround)
+                
+        except Exception:
+            pass
+    
+    # Average turnaround time (hours)
+    avg_turnaround_hours = sum(turnaround_times) / len(turnaround_times) if turnaround_times else 0
+    
+    # Mismatch rate (quality metric)
+    mismatch_rate = (mismatch_count / total_mismatch_items * 100) if total_mismatch_items > 0 else 0
+    
+    # On-time delivery rate (items delivered vs received)
+    delivery_fulfillment_rate = (total_items_delivered / total_items_received * 100) if total_items_received > 0 else 0
+    
+    # Inventory turnover (how many times inventory cycles through)
+    pending_items = max(0, total_items_received - total_items_delivered)
+    inventory_turnover = (total_items_delivered / pending_items) if pending_items > 0 else 0
+    
+    # --- CLIENT METRICS ---
+    active_clients = len(client_set)
+    
+    # Get all-time client data for retention calculation
+    all_gp_cursor = gatepasses_collection.find()
+    all_clients = set()
+    client_last_activity = {}
+    
+    async for doc in all_gp_cursor:
+        try:
+            gp = _decrypt_gp(doc)
+            client = gp["client_name"]
+            all_clients.add(client)
+            
+            receiving_date = gp.get("receiving_date")
+            if isinstance(receiving_date, datetime):
+                if client not in client_last_activity or receiving_date > client_last_activity[client]:
+                    client_last_activity[client] = receiving_date
+        except Exception:
+            pass
+    
+    # Client retention (clients active in last 90 days)
+    retention_cutoff = now - timedelta(days=90)
+    retained_clients = sum(1 for date in client_last_activity.values() if date >= retention_cutoff)
+    client_retention_rate = (retained_clients / len(all_clients) * 100) if all_clients else 0
+    
+    # --- TOP PERFORMERS ---
+    # Top 5 clients by revenue
+    client_revenue = {}
+    all_bills_cursor = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}})
+    
+    async for doc in all_bills_cursor:
+        try:
+            bill = _decrypt_bill(doc)
+            client = bill["client_name"]
+            revenue = bill.get("grand_total", 0.0)
+            client_revenue[client] = client_revenue.get(client, 0) + revenue
+        except Exception:
+            pass
+    
+    top_clients = sorted(
+        [{"client_name": k, "revenue": round(v, 2)} for k, v in client_revenue.items()],
+        key=lambda x: x["revenue"],
+        reverse=True
+    )[:5]
+    
+    # Revenue trend data (for charts)
+    revenue_trend = sorted(
+        [{"date": k, "revenue": round(v, 2)} for k, v in revenue_by_date.items()],
+        key=lambda x: x["date"]
+    )
+    
+    # --- ALERTS & CRITICAL METRICS ---
+    critical_alerts = []
+    
+    # Alert: High outstanding amount
+    if total_outstanding > total_revenue * 0.3:  # More than 30% outstanding
+        critical_alerts.append({
+            "type": "high_outstanding",
+            "severity": "high",
+            "message": f"Outstanding amount ({round(total_outstanding, 2)}) exceeds 30% of revenue",
+            "value": round(total_outstanding, 2)
+        })
+    
+    # Alert: Low collection rate
+    if collection_rate < 70:
+        critical_alerts.append({
+            "type": "low_collection",
+            "severity": "high",
+            "message": f"Collection rate ({round(collection_rate, 1)}%) is below 70%",
+            "value": round(collection_rate, 1)
+        })
+    
+    # Alert: High mismatch rate
+    if mismatch_rate > 5:
+        critical_alerts.append({
+            "type": "high_mismatch",
+            "severity": "medium",
+            "message": f"Mismatch rate ({round(mismatch_rate, 1)}%) exceeds 5% quality threshold",
+            "value": round(mismatch_rate, 1)
+        })
+    
+    # Alert: Large pending inventory
+    if pending_items > total_items_received * 0.4:
+        critical_alerts.append({
+            "type": "high_inventory",
+            "severity": "medium",
+            "message": f"{pending_items} items pending (>40% of received items)",
+            "value": pending_items
+        })
+    
+    return {
+        "period": period,
+        "generated_at": now.isoformat(),
+        
+        # === FINANCIAL METRICS ===
+        "financial": {
+            "total_revenue": round(total_revenue, 2),
+            "total_paid": round(total_paid, 2),
+            "total_outstanding": round(total_outstanding, 2),
+            "collection_rate": round(collection_rate, 1),
+            "avg_bill_value": round(avg_bill_value, 2),
+            "total_bills": bill_count,
+            "paid_bills": paid_bills,
+            "pending_bills": bill_count - paid_bills,
+        },
+        
+        # === OPERATIONAL METRICS ===
+        "operations": {
+            "gate_passes_processed": gate_pass_count,
+            "total_items_received": total_items_received,
+            "total_items_delivered": total_items_delivered,
+            "pending_items": pending_items,
+            "avg_turnaround_hours": round(avg_turnaround_hours, 1),
+            "delivery_fulfillment_rate": round(delivery_fulfillment_rate, 1),
+            "inventory_turnover": round(inventory_turnover, 2),
+        },
+        
+        # === QUALITY METRICS ===
+        "quality": {
+            "mismatch_count": mismatch_count,
+            "mismatch_rate": round(mismatch_rate, 2),
+            "total_items_checked": total_mismatch_items,
+        },
+        
+        # === CLIENT METRICS ===
+        "clients": {
+            "active_clients": active_clients,
+            "total_clients": len(all_clients),
+            "client_retention_rate": round(client_retention_rate, 1),
+            "new_clients_this_period": active_clients,
+        },
+        
+        # === TRENDS & CHARTS DATA ===
+        "trends": {
+            "revenue_by_date": revenue_trend,
+            "top_clients": top_clients,
+        },
+        
+        # === ALERTS ===
+        "alerts": {
+            "count": len(critical_alerts),
+            "items": critical_alerts
+        }
+    }
 
 
-# --- 7. Notifications: Items to be Sent ---
+# --- 8. Notifications: Items to be Sent ---
 @router.get(
     "/notifications/items-to-send",
     dependencies=[Depends(require_capability("dashboard:read"))],
@@ -521,3 +801,20 @@ async def get_items_to_send():
         "count": len(notifications),
         "notifications": sorted(notifications, key=lambda x: x["days_pending"], reverse=True)
     }
+
+
+# --- 9. Audit Logs ---
+@router.get(
+    "/audit-logs",
+    dependencies=[Depends(require_capability("dashboard:read"))],
+)
+async def get_audit_logs(
+    limit: int = Query(50, ge=1, le=200),
+):
+    cursor = audit_collection.find().sort("timestamp", -1).limit(limit)
+    logs = []
+    async for doc in cursor:
+        doc["id"] = str(doc["_id"])
+        del doc["_id"]
+        logs.append(doc)
+    return logs
