@@ -61,8 +61,8 @@ async def _fetch_bills(start: datetime, end: datetime):
         try:
             dec = decrypt_dict(d, BILL_DECRYPT_FIELDS)
             client = dec.get("client_name") or "Unknown"
-        except Exception:
-            client = "Unknown"
+        except Exception as e:
+            client = f"DEC_ERR:{e}"
         docs.append(
             {
                 "client_name": client,
@@ -87,8 +87,8 @@ async def _fetch_gate_passes(start: datetime, end: datetime):
             dec = decrypt_dict(d, GP_DECRYPT_FIELDS)
             client = dec.get("client_name") or "Unknown"
             items = dec.get("items") or []
-        except Exception:
-            client = "Unknown"
+        except Exception as e:
+            client = f"DEC_ERR:{e}"
             items = []
         out.append(
             {
