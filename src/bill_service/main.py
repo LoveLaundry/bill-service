@@ -39,11 +39,14 @@ DEFAULT_ALLOWED_ORIGINS = [
 ]
 
 ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
-if ALLOWED_ORIGINS_ENV:
-    ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
-else:
-    # If not configured, use the known production origins (never "*").
-    ALLOWED_ORIGINS = list(DEFAULT_ALLOWED_ORIGINS)
+# Always keep the known-good production origins in the allowlist, and never
+# accept a literal "*" (Starlette refuses "*" when credentials are enabled).
+configured = [
+    o.strip()
+    for o in ALLOWED_ORIGINS_ENV.split(",")
+    if o.strip() and o.strip() != "*"
+]
+ALLOWED_ORIGINS = list(dict.fromkeys(configured + list(DEFAULT_ALLOWED_ORIGINS)))
 ALLOW_CREDENTIALS = True
 # Vercel sets VERCEL=1; background workers are unreliable in serverless.
 ON_VERCEL = os.getenv("VERCEL") == "1"
