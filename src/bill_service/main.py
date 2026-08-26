@@ -9,8 +9,7 @@ from .database.main_db import ensure_indexes
 from .routers.admin_database import router as admin_database_router
 from .routers.bills import router as bills_router
 from .routers.deliveries import router as deliveries_router
-# Temporarily disabled dashboard due to syntax errors
-# from .routers.dashboard import router as dashboard_router
+from .routers.dashboard import router as dashboard_router
 from .routers.gatepasses import router as gatepasses_router
 from .services import synchronization_service
 
@@ -63,7 +62,7 @@ app.add_middleware(
 app.include_router(bills_router)
 app.include_router(gatepasses_router)
 app.include_router(deliveries_router)
-# Temporarily disabled: app.include_router(dashboard_router)
+app.include_router(dashboard_router)
 app.include_router(admin_database_router)
 
 # Background sync worker: MAIN -> SECONDARY replication with retry/backoff.
