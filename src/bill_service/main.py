@@ -1,7 +1,16 @@
 import asyncio
+import os
 
-from fastapi import FastAPI
+# Load secrets from .env into the real environment so that `os.getenv(...)` in
+# auth_helper/crypto_helper resolves during local development. (Production relies
+# on platform-injected environment variables and never reads .env.)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from .config import settings
 from .database.connection_manager import close_all
@@ -20,11 +29,22 @@ import sentry_sdk
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",") if origin.strip()]
-if not ALLOWED_ORIGINS:
-    ALLOWED_ORIGINS = ["*"]
-# Starlette forbids allow_credentials=True with allow_origins=["*"]
-ALLOW_CREDENTIALS = ALLOWED_ORIGINS != ["*"]
+# Known production frontend origins. Used as a safe default so the API is never
+# wide-open ("*") yet never fully locked down (which would break the live app if
+# the ALLOWED_ORIGINS env var is not injected by the platform).
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://lovelaundry-manager.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+
+ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
+if ALLOWED_ORIGINS_ENV:
+    ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
+else:
+    # If not configured, use the known production origins (never "*").
+    ALLOWED_ORIGINS = list(DEFAULT_ALLOWED_ORIGINS)
+ALLOW_CREDENTIALS = True
 # Vercel sets VERCEL=1; background workers are unreliable in serverless.
 ON_VERCEL = os.getenv("VERCEL") == "1"
 
@@ -32,7 +52,7 @@ SENTRY_DSN = os.getenv("SENTRY_DSN")
 if SENTRY_DSN:
     sentry_sdk.init(
         dsn=SENTRY_DSN,
-        traces_sample_rate=1.0,
+        traces_sample_rate=0.1,
     )
 
 app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0")
@@ -44,6 +64,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error("Unhandled exception", exc_info=exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
 
 app.include_router(bills_router)
 app.include_router(gatepasses_router)

@@ -4,7 +4,10 @@ from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer
 import jwt
 
-JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-jwt-key-love-laundry-2026")
+_jwt_secret = os.getenv("JWT_SECRET")
+if not _jwt_secret:
+    raise RuntimeError("FATAL: JWT_SECRET environment variable is not set. Refusing to start.")
+JWT_SECRET = _jwt_secret
 JWT_ALGORITHM = "HS256"
 
 security = HTTPBearer()
