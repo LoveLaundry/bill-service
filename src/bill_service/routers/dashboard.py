@@ -54,6 +54,7 @@ async def _fetch_bills(start: datetime, end: datetime):
             "outstanding_amount": 1,
             "payment_status": 1,
             "created_at": 1,
+            "encryption_metadata": 1,
             "_id": 1,
         },
     )
@@ -61,8 +62,8 @@ async def _fetch_bills(start: datetime, end: datetime):
         try:
             dec = decrypt_dict(d, BILL_DECRYPT_FIELDS)
             client = dec.get("client_name") or "Unknown"
-        except Exception as e:
-            client = f"DEC_ERR:{e}"
+        except Exception:
+            client = "Unknown"
         docs.append(
             {
                 "client_name": client,
@@ -80,15 +81,15 @@ async def _fetch_gate_passes(start: datetime, end: datetime):
     out = []
     cursor = gatepasses_collection.find(
         {"created_at": {"$gte": start, "$lte": end}},
-        {"client_name": 1, "items": 1, "gate_pass_number": 1, "created_at": 1, "_id": 1},
+        {"client_name": 1, "items": 1, "gate_pass_number": 1, "created_at": 1, "encryption_metadata": 1, "_id": 1},
     )
     async for d in cursor:
         try:
             dec = decrypt_dict(d, GP_DECRYPT_FIELDS)
             client = dec.get("client_name") or "Unknown"
             items = dec.get("items") or []
-        except Exception as e:
-            client = f"DEC_ERR:{e}"
+        except Exception:
+            client = "Unknown"
             items = []
         out.append(
             {
@@ -114,7 +115,7 @@ async def _fetch_deliveries(gate_pass_ids: List[str]):
     out = []
     cursor = deliveries_collection.find(
         {"gate_pass_id": {"$in": gate_pass_ids}},
-        {"gate_pass_id": 1, "items": 1, "created_at": 1, "_id": 1},
+        {"gate_pass_id": 1, "items": 1, "created_at": 1, "encryption_metadata": 1, "_id": 1},
     )
     async for d in cursor:
         try:
