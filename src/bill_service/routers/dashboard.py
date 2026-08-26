@@ -649,7 +649,7 @@ def aggregate(bills, gate_passes, deliveries, period):
     }
 
 
-@router.get("/summary")
+@router.get("/dashboard/summary")
 async def get_dashboard_summary(
     period: str = Query("month", pattern="^(day|week|month|quarter|year)$"),
     current_user: dict = Depends(require_capability("dashboard:read")),
