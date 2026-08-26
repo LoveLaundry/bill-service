@@ -323,7 +323,7 @@ async def list_bills(
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
     skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=1000),
+    limit: int = Query(20, ge=1, le=5000),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     query: dict = {}
