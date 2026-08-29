@@ -33,6 +33,11 @@ class GatePassAdjustment(BaseModel):
     reason: str
 
 
+class GatePassDateUpdate(BaseModel):
+    receiving_date: datetime
+    reason: Optional[str] = None
+
+
 class GatePassModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
