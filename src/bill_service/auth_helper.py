@@ -61,6 +61,8 @@ ROLE_CAPABILITIES = {
     "ADMIN": [
         "gatepass:read", "gatepass:write",
         "delivery:read", "delivery:write",
+        "dispatch:read", "dispatch:write",
+        "loyalty:read", "loyalty:write",
         "bill:read", "bill:write",
         "payment:read", "payment:write",
         "dashboard:read"
@@ -68,6 +70,8 @@ ROLE_CAPABILITIES = {
     "MANAGER": [
         "gatepass:read", "gatepass:write",
         "delivery:read", "delivery:write",
+        "dispatch:read", "dispatch:write",
+        "loyalty:read", "loyalty:write",
         "bill:read", "bill:write",
         "payment:read", "payment:write",
         "dashboard:read"
@@ -75,6 +79,8 @@ ROLE_CAPABILITIES = {
     "STAFF": [
         "gatepass:read", "gatepass:write",
         "delivery:read", "delivery:write",
+        "dispatch:read", "dispatch:write",
+        "loyalty:read",
         "bill:read"
     ]
 }

@@ -14,7 +14,9 @@ _db = get_database(ROLE_MAIN)
 bills_collection: AsyncIOMotorCollection = _db.get_collection("bills")
 gatepasses_collection: AsyncIOMotorCollection = _db.get_collection("gatepasses")
 deliveries_collection: AsyncIOMotorCollection = _db.get_collection("deliveries")
+dispatch_jobs_collection: AsyncIOMotorCollection = _db.get_collection("dispatch_jobs")
 payments_collection: AsyncIOMotorCollection = _db.get_collection("payments")
+loyalty_collection: AsyncIOMotorCollection = _db.get_collection("loyalty_accounts")
 audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
 
 # Sync infrastructure collections live alongside business data in MAIN.
@@ -41,10 +43,19 @@ async def ensure_indexes():
     await deliveries_collection.create_index("client_name_search")
     await deliveries_collection.create_index("created_at")
 
+    # Dispatch jobs indexes
+    await dispatch_jobs_collection.create_index("client_name_search")
+    await dispatch_jobs_collection.create_index("status")
+    await dispatch_jobs_collection.create_index("assigned_to")
+    await dispatch_jobs_collection.create_index("scheduled_at")
+
     # Payments indexes
     await payments_collection.create_index("bill_id")
     await payments_collection.create_index("client_name_search")
     await payments_collection.create_index("created_at")
+
+    # Loyalty indexes
+    await loyalty_collection.create_index("client_name_search", unique=True)
 
     # Audit logs indexes
     await audit_collection.create_index("timestamp")

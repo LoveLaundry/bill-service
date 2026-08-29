@@ -87,6 +87,56 @@ class DeliveryModel(BaseModel):
     created_at: datetime
 
 
+# --- Dispatch (pickup / delivery scheduling) ---
+class DispatchCreate(BaseModel):
+    job_type: str = "delivery"  # "pickup" | "delivery"
+    order_id: Optional[str] = None  # linked quotation/order id
+    client_name: str
+    address: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_phone: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    assigned_to: Optional[str] = None  # driver / field staff
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class DispatchUpdate(BaseModel):
+    status: Optional[str] = None  # SCHEDULED|ASSIGNED|EN_ROUTE|COMPLETED|CANCELLED
+    assigned_to: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class DispatchOptimize(BaseModel):
+    assigned_to: str
+    date: Optional[str] = None  # "YYYY-MM-DD"; optimize that day's jobs
+
+
+class DispatchModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    job_type: str
+    order_id: Optional[str] = None
+    client_name: str
+    address: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_phone: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    status: str  # SCHEDULED|ASSIGNED|EN_ROUTE|COMPLETED|CANCELLED
+    assigned_to: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
 # --- Billing ---
 class BillItemIn(BaseModel):
     item_name: str
@@ -155,6 +205,38 @@ class PaymentCreate(BaseModel):
     payment_date: datetime
     reference: Optional[str] = None
     notes: Optional[str] = None
+
+
+# --- Loyalty ---
+def loyalty_tier(points: int) -> str:
+    if points >= 2000:
+        return "PLATINUM"
+    if points >= 500:
+        return "GOLD"
+    if points >= 100:
+        return "SILVER"
+    return "BRONZE"
+
+
+class LoyaltyAdjust(BaseModel):
+    client_name: str
+    delta_points: int
+    reason: Optional[str] = None
+
+
+class LoyaltyAccount(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    client_name: str
+    points: int
+    tier: str
+    visits: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class PaymentModel(BaseModel):
