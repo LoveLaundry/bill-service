@@ -10,6 +10,7 @@ from ..database.main_db import (
     audit_collection,
     bills_collection,
     deliveries_collection,
+    gatepasses_collection,
     payments_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
@@ -33,6 +34,7 @@ SENSITIVE_FIELDS = [
 
 PAYMENT_SENSITIVE_FIELDS = ["client_name", "notes"]
 DELIVERY_SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+GATEPASS_SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 QUOTATION_SENSITIVE_FIELDS = ["client_name", "quotation_title", "line_items"]
 
 
@@ -131,8 +133,27 @@ async def create_bill(
     payload: BillCreate,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    # 1. Fetch quotation prices
-    price_map = await get_quotation_prices(payload.quotation_id)
+    # 0. Resolve gate pass (optional) and its quotation for pricing
+    gp_doc = None
+    gp_dec = None
+    if payload.gate_pass_id:
+        try:
+            gp_oid = ObjectId(payload.gate_pass_id)
+        except InvalidId:
+            raise HTTPException(
+                status_code=400, detail="Invalid gate_pass_id format."
+            )
+        gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
+        if not gp_doc:
+            raise HTTPException(
+                status_code=404, detail="Gate Pass not found."
+            )
+        gp_dec = decrypt_dict(gp_doc, GATEPASS_SENSITIVE_FIELDS)
+
+    gp_quotation_id = payload.quotation_id or (
+        gp_dec.get("quotation_id") if gp_doc else None
+    )
+    price_map = await get_quotation_prices(gp_quotation_id) if gp_quotation_id else {}
 
     # 2. Prevent Double Billing & Auto populate or validate quantities
     bill_items_to_save = []
@@ -227,6 +248,79 @@ async def create_bill(
                         "line_total": line_total,
                     }
                 )
+    elif payload.gate_pass_id and gp_doc:
+        # Derive billable items from the gate pass received quantities
+        existing = await bills_collection.count_documents(
+            {
+                "gate_pass_id": payload.gate_pass_id,
+                "payment_status": {"$ne": "CANCELLED"},
+            }
+        )
+        if existing > 0:
+            raise HTTPException(
+                status_code=400,
+                detail="A bill already exists for this gate pass.",
+            )
+
+        gp_map = {}
+        for item in gp_dec.get("items", []):
+            name = item["item_name"]
+            qty = item.get("received_qty", 0)
+            gp_map[name] = gp_map.get(name, 0) + qty
+
+        if payload.items:
+            for input_item in payload.items:
+                name = input_item.item_name
+                qty = input_item.quantity
+                allowed = gp_map.get(name, 0)
+                if qty > allowed:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Item '{name}' requested: {qty}, but only "
+                            f"{allowed} received on this gate pass."
+                        ),
+                    )
+                price_info = price_map.get(
+                    name,
+                    {"price": input_item.unit_price, "category": input_item.category},
+                )
+                unit_price = price_info["price"]
+                line_total = round(unit_price * qty, 2)
+                bill_items_to_save.append(
+                    {
+                        "item_name": name,
+                        "category": price_info.get("category") or input_item.category,
+                        "unit_price": unit_price,
+                        "quantity": qty,
+                        "line_total": line_total,
+                    }
+                )
+        else:
+            for name, qty in gp_map.items():
+                if qty <= 0:
+                    continue
+                price_info = price_map.get(name)
+                if not price_info:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Pricing rule for item '{name}' not defined. "
+                            "Link a quotation to the gate pass first."
+                        ),
+                    )
+                unit_price = price_info["price"]
+                line_total = round(unit_price * qty, 2)
+                bill_items_to_save.append(
+                    {
+                        "item_name": name,
+                        "category": price_info.get("category"),
+                        "unit_price": unit_price,
+                        "quantity": qty,
+                        "line_total": line_total,
+                    }
+                )
+
     else:
         # Create manually from items list in payload
         if not payload.items:
@@ -273,8 +367,11 @@ async def create_bill(
         grand_total = 0.0
 
     now = datetime.now(timezone.utc)
+    payment_status = "PAID" if payload.instant else "DRAFT"
+    paid_amount = grand_total if payload.instant else 0.0
+    outstanding_amount = 0.0 if payload.instant else grand_total
     doc = {
-        "quotation_id": payload.quotation_id,
+        "quotation_id": payload.quotation_id or "",
         "client_name": payload.client_name,
         "quotation_title": payload.quotation_title,
         "items": bill_items_to_save,
@@ -285,10 +382,11 @@ async def create_bill(
         "taxes": taxes,
         "additional_charges": additional_charges,
         "grand_total": grand_total,
-        "payment_status": "DRAFT",
-        "paid_amount": 0.0,
-        "outstanding_amount": grand_total,
+        "payment_status": payment_status,
+        "paid_amount": paid_amount,
+        "outstanding_amount": outstanding_amount,
         "delivery_ids": del_ids_to_save,
+        "gate_pass_id": payload.gate_pass_id,
         "notes": payload.notes,
         "created_at": now,
         "updated_at": now,

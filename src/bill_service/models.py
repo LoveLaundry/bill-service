@@ -159,11 +159,13 @@ class BillItemOut(BaseModel):
 
 
 class BillCreate(BaseModel):
-    quotation_id: str
+    quotation_id: Optional[str] = None
     client_name: str
     quotation_title: Optional[str] = None
     items: Optional[List[BillItemIn]] = None
     delivery_ids: Optional[List[str]] = None
+    gate_pass_id: Optional[str] = None
+    instant: bool = False
     notes: Optional[str] = None
     discounts: Optional[float] = 0.0
     transport_fee: Optional[float] = 0.0
