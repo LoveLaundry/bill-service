@@ -12,6 +12,7 @@ COLLECTION_MAP: dict[str, tuple[AsyncIOMotorCollection, AsyncIOMotorCollection, 
     "bill": (main_db.bills_collection, secondary_db.bills_collection, local_db.bills_collection),
     "gatepass": (main_db.gatepasses_collection, secondary_db.gatepasses_collection, local_db.gatepasses_collection),
     "delivery": (main_db.deliveries_collection, secondary_db.deliveries_collection, local_db.deliveries_collection),
+    "dispatch": (main_db.dispatch_jobs_collection, secondary_db.dispatch_jobs_collection, local_db.dispatch_jobs_collection),
     "payment": (main_db.payments_collection, secondary_db.payments_collection, local_db.payments_collection),
     "audit_log": (main_db.audit_collection, secondary_db.audit_collection, local_db.audit_collection),
 }

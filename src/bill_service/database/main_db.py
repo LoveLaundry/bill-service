@@ -14,6 +14,7 @@ _db = get_database(ROLE_MAIN)
 bills_collection: AsyncIOMotorCollection = _db.get_collection("bills")
 gatepasses_collection: AsyncIOMotorCollection = _db.get_collection("gatepasses")
 deliveries_collection: AsyncIOMotorCollection = _db.get_collection("deliveries")
+dispatch_jobs_collection: AsyncIOMotorCollection = _db.get_collection("dispatch_jobs")
 payments_collection: AsyncIOMotorCollection = _db.get_collection("payments")
 audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
 
@@ -40,6 +41,12 @@ async def ensure_indexes():
     await deliveries_collection.create_index("gate_pass_id")
     await deliveries_collection.create_index("client_name_search")
     await deliveries_collection.create_index("created_at")
+
+    # Dispatch jobs indexes
+    await dispatch_jobs_collection.create_index("client_name_search")
+    await dispatch_jobs_collection.create_index("status")
+    await dispatch_jobs_collection.create_index("assigned_to")
+    await dispatch_jobs_collection.create_index("scheduled_at")
 
     # Payments indexes
     await payments_collection.create_index("bill_id")

@@ -87,6 +87,47 @@ class DeliveryModel(BaseModel):
     created_at: datetime
 
 
+# --- Dispatch (pickup / delivery scheduling) ---
+class DispatchCreate(BaseModel):
+    job_type: str = "delivery"  # "pickup" | "delivery"
+    order_id: Optional[str] = None  # linked quotation/order id
+    client_name: str
+    address: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_phone: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    assigned_to: Optional[str] = None  # driver / field staff
+    notes: Optional[str] = None
+
+
+class DispatchUpdate(BaseModel):
+    status: Optional[str] = None  # SCHEDULED|ASSIGNED|EN_ROUTE|COMPLETED|CANCELLED
+    assigned_to: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    notes: Optional[str] = None
+
+
+class DispatchModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    job_type: str
+    order_id: Optional[str] = None
+    client_name: str
+    address: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_phone: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    status: str  # SCHEDULED|ASSIGNED|EN_ROUTE|COMPLETED|CANCELLED
+    assigned_to: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
 # --- Billing ---
 class BillItemIn(BaseModel):
     item_name: str

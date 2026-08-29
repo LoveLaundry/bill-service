@@ -14,6 +14,7 @@ _db = get_database(ROLE_LOCAL)
 bills_collection: AsyncIOMotorCollection = _db.get_collection("bills")
 gatepasses_collection: AsyncIOMotorCollection = _db.get_collection("gatepasses")
 deliveries_collection: AsyncIOMotorCollection = _db.get_collection("deliveries")
+dispatch_jobs_collection: AsyncIOMotorCollection = _db.get_collection("dispatch_jobs")
 payments_collection: AsyncIOMotorCollection = _db.get_collection("payments")
 audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
 
