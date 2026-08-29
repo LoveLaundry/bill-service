@@ -12,7 +12,7 @@ from ..database.main_db import (
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services.verification_service import attach_verification_to
-from ..models import DispatchCreate, DispatchUpdate, DispatchModel
+from ..models import DispatchCreate, DispatchUpdate, DispatchModel, DispatchOptimize
 
 router = APIRouter(prefix="/dispatch", tags=["dispatch"])
 
@@ -78,6 +78,8 @@ async def create_dispatch_job(
         else None,
         "status": "SCHEDULED",
         "assigned_to": payload.assigned_to,
+        "latitude": payload.latitude,
+        "longitude": payload.longitude,
         "notes": payload.notes,
         "client_name_search": get_search_token(payload.client_name),
         "created_at": now,
@@ -181,6 +183,10 @@ async def update_dispatch_job(
         update_data["assigned_to"] = payload.assigned_to
     if payload.scheduled_at is not None:
         update_data["scheduled_at"] = payload.scheduled_at.replace(tzinfo=timezone.utc)
+    if payload.latitude is not None:
+        update_data["latitude"] = payload.latitude
+    if payload.longitude is not None:
+        update_data["longitude"] = payload.longitude
     if payload.notes is not None:
         update_data["notes"] = payload.notes
 
@@ -221,3 +227,76 @@ async def delete_dispatch_job(
         )
     new_version = await bump_version("dispatch", oid)
     await enqueue_sync("dispatch", oid, new_version)
+
+
+def _haversine(a: tuple[float, float], b: tuple[float, float]) -> float:
+    from math import radians, sin, cos, asin, sqrt
+
+    lat1, lon1 = radians(a[0]), radians(a[1])
+    lat2, lon2 = radians(b[0]), radians(b[1])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    h = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return 2 * asin(sqrt(h)) * 6371.0  # km
+
+
+@router.post("/optimize")
+async def optimize_route(
+    payload: DispatchOptimize,
+    current_user: dict = Depends(require_capability("dispatch:read")),
+):
+    """Return a travel-efficient stop order for a driver's jobs (nearest-neighbour).
+
+    Jobs without coordinates are appended in scheduled order after the geo-routed
+    stops. This is a lightweight TSP heuristic — no external map service required.
+    """
+    query: dict = {
+        "assigned_to": payload.assigned_to,
+        "status": {"$in": ["SCHEDULED", "ASSIGNED", "EN_ROUTE"]},
+    }
+    if payload.date:
+        query["scheduled_at"] = {
+            "$gte": f"{payload.date}T00:00:00",
+            "$lt": f"{payload.date}T23:59:59",
+        }
+
+    cursor = dispatch_jobs_collection.find(query).sort("scheduled_at", 1)
+    jobs: list[dict] = []
+    async for doc in cursor:
+        try:
+            jobs.append(_serialize(doc))
+        except HTTPException:
+            pass
+
+    if not jobs:
+        return {"order": [], "stops": []}
+
+    geo = [j for j in jobs if j.get("latitude") is not None and j.get("longitude") is not None]
+    rest = [j for j in jobs if j not in geo]
+
+    ordered: list[dict] = []
+    if geo:
+        remaining = list(geo)
+        # Start from the earliest-scheduled geocoded job.
+        current = min(
+            remaining,
+            key=lambda j: j.get("scheduled_at") or "9999",
+        )
+        ordered.append(current)
+        remaining.remove(current)
+        while remaining:
+            cur_coords = (current["latitude"], current["longitude"])
+            nxt = min(
+                remaining,
+                key=lambda j: _haversine(cur_coords, (j["latitude"], j["longitude"])),
+            )
+            ordered.append(nxt)
+            remaining.remove(nxt)
+            current = nxt
+
+    ordered.extend(rest)
+
+    return {
+        "order": [j["id"] for j in ordered],
+        "stops": ordered,
+    }

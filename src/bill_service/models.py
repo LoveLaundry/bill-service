@@ -97,6 +97,8 @@ class DispatchCreate(BaseModel):
     contact_phone: Optional[str] = None
     scheduled_at: Optional[datetime] = None
     assigned_to: Optional[str] = None  # driver / field staff
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     notes: Optional[str] = None
 
 
@@ -104,7 +106,14 @@ class DispatchUpdate(BaseModel):
     status: Optional[str] = None  # SCHEDULED|ASSIGNED|EN_ROUTE|COMPLETED|CANCELLED
     assigned_to: Optional[str] = None
     scheduled_at: Optional[datetime] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     notes: Optional[str] = None
+
+
+class DispatchOptimize(BaseModel):
+    assigned_to: str
+    date: Optional[str] = None  # "YYYY-MM-DD"; optimize that day's jobs
 
 
 class DispatchModel(BaseModel):
