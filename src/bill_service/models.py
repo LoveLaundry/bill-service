@@ -207,6 +207,38 @@ class PaymentCreate(BaseModel):
     notes: Optional[str] = None
 
 
+# --- Loyalty ---
+def loyalty_tier(points: int) -> str:
+    if points >= 2000:
+        return "PLATINUM"
+    if points >= 500:
+        return "GOLD"
+    if points >= 100:
+        return "SILVER"
+    return "BRONZE"
+
+
+class LoyaltyAdjust(BaseModel):
+    client_name: str
+    delta_points: int
+    reason: Optional[str] = None
+
+
+class LoyaltyAccount(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    client_name: str
+    points: int
+    tier: str
+    visits: int
+    created_at: datetime
+    updated_at: datetime
+
+
 class PaymentModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 

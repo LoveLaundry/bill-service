@@ -62,6 +62,7 @@ ROLE_CAPABILITIES = {
         "gatepass:read", "gatepass:write",
         "delivery:read", "delivery:write",
         "dispatch:read", "dispatch:write",
+        "loyalty:read", "loyalty:write",
         "bill:read", "bill:write",
         "payment:read", "payment:write",
         "dashboard:read"
@@ -70,6 +71,7 @@ ROLE_CAPABILITIES = {
         "gatepass:read", "gatepass:write",
         "delivery:read", "delivery:write",
         "dispatch:read", "dispatch:write",
+        "loyalty:read", "loyalty:write",
         "bill:read", "bill:write",
         "payment:read", "payment:write",
         "dashboard:read"
@@ -78,6 +80,7 @@ ROLE_CAPABILITIES = {
         "gatepass:read", "gatepass:write",
         "delivery:read", "delivery:write",
         "dispatch:read", "dispatch:write",
+        "loyalty:read",
         "bill:read"
     ]
 }
