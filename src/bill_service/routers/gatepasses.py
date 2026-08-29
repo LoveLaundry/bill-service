@@ -9,7 +9,7 @@ from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import audit_collection, gatepasses_collection
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services.verification_service import attach_verification_to
-from ..models import GatePassAdjustment, GatePassCreate, GatePassModel
+from ..models import GatePassAdjustment, GatePassCreate, GatePassDateUpdate, GatePassModel
 
 router = APIRouter(prefix="/gatepasses", tags=["gatepasses"])
 
@@ -218,6 +218,45 @@ async def update_gate_pass_status(
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_STATUS_UPDATE",
+        "gatepass",
+        serialized["id"],
+    )
+    return serialized
+
+
+@router.patch("/{gate_pass_id}/date", response_model=GatePassModel)
+async def update_gate_pass_date(
+    gate_pass_id: str,
+    payload: GatePassDateUpdate,
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    oid = _parse_object_id(gate_pass_id)
+    doc = await gatepasses_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
+        )
+
+    await gatepasses_collection.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "receiving_date": payload.receiving_date,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+
+    updated_doc = await gatepasses_collection.find_one({"_id": oid})
+    serialized = _serialize(updated_doc)
+
+    new_version = await bump_version("gatepass", oid)
+    await enqueue_sync("gatepass", oid, new_version)
+    serialized = await attach_verification_to("gatepass", oid, serialized)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "RECEIVING_DATE_UPDATE",
         "gatepass",
         serialized["id"],
     )
