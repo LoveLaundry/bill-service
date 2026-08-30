@@ -298,14 +298,14 @@ async def update_gate_pass(
             for item in update_data["items"]:
                 processed_items.append(
                     {
-                        "item_name": item.item_name,
-                        "category": item.category,
-                        "specification": getattr(item, "specification", None),
-                        "client_qty": item.client_qty,
-                        "received_qty": item.received_qty,
-                        "difference": item.received_qty - item.client_qty,
-                        "mismatch_reason": item.mismatch_reason,
-                        "mismatch_notes": item.mismatch_notes,
+                        "item_name": item["item_name"],
+                        "category": item.get("category"),
+                        "specification": item.get("specification"),
+                        "client_qty": item["client_qty"],
+                        "received_qty": item["received_qty"],
+                        "difference": item["received_qty"] - item["client_qty"],
+                        "mismatch_reason": item.get("mismatch_reason"),
+                        "mismatch_notes": item.get("mismatch_notes"),
                     }
                 )
             decrypted["items"] = processed_items
