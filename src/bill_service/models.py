@@ -10,6 +10,7 @@ PyObjectId = Annotated[str, BeforeValidator(str)]
 class GatePassItem(BaseModel):
     item_name: str
     category: Optional[str] = None
+    specification: Optional[str] = None
     client_qty: int = Field(ge=0)
     received_qty: int = Field(ge=0)
     difference: int = 0

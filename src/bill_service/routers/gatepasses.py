@@ -81,6 +81,7 @@ async def create_gate_pass(
             {
                 "item_name": item.item_name,
                 "category": item.category,
+                "specification": item.specification,
                 "client_qty": item.client_qty,
                 "received_qty": item.received_qty,
                 "difference": diff,
@@ -299,6 +300,7 @@ async def update_gate_pass(
                 {
                     "item_name": item.item_name,
                     "category": item.category,
+                    "specification": item.specification,
                     "client_qty": item.client_qty,
                     "received_qty": item.received_qty,
                     "difference": item.received_qty - item.client_qty,
