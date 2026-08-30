@@ -18,6 +18,8 @@ dispatch_jobs_collection: AsyncIOMotorCollection = _db.get_collection("dispatch_
 payments_collection: AsyncIOMotorCollection = _db.get_collection("payments")
 loyalty_collection: AsyncIOMotorCollection = _db.get_collection("loyalty_accounts")
 audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
+linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
+linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")
@@ -61,6 +63,20 @@ async def ensure_indexes():
     await audit_collection.create_index("timestamp")
     await audit_collection.create_index("user_id")
     await audit_collection.create_index("entity_id")
+
+    # Linens indexes
+    await linens_collection.create_index("linen_id", unique=True)
+    await linens_collection.create_index("category")
+    await linens_collection.create_index("status")
+    await linens_collection.create_index("client_name")
+    await linens_collection.create_index("condition")
+    await linens_collection.create_index("created_at")
+    await linens_collection.create_index("last_scanned_date")
+
+    # Linen events indexes
+    await linen_events_collection.create_index("linen_id")
+    await linen_events_collection.create_index("timestamp")
+    await linen_events_collection.create_index([("linen_id", 1), ("timestamp", -1)])
 
     # Sync infrastructure indexes
     await sync_status_collection.create_index([("entity", 1), ("record_id", 1)], unique=True)

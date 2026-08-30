@@ -17,6 +17,8 @@ deliveries_collection: AsyncIOMotorCollection = _db.get_collection("deliveries")
 dispatch_jobs_collection: AsyncIOMotorCollection = _db.get_collection("dispatch_jobs")
 payments_collection: AsyncIOMotorCollection = _db.get_collection("payments")
 audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
+linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
+linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
 
 # Mirror sync metadata so LOCAL sync can compare versions locally.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")

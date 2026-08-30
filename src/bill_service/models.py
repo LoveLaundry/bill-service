@@ -271,3 +271,155 @@ class PaymentModel(BaseModel):
     reference: Optional[str] = None
     notes: Optional[str] = None
     created_at: datetime
+
+
+# --- Linen Tracking ---
+LINEN_STATUSES = [
+    "IN_STOCK", "AT_CLIENT", "COLLECTED", "AT_LAUNDRY",
+    "WASHING", "DRYING", "PRESSING", "READY",
+    "DELIVERED", "MISSING", "DAMAGED", "RETIRED",
+]
+
+LINEN_CATEGORIES = [
+    "BEDSHEET", "PILLOWCASE", "TOWEL", "DUVET_COVER",
+    "BATH_MAT", "UNIFORM", "TABLECLOTH", "NAPKIN",
+    "ROBE", "SLIPPER", "OTHER",
+]
+
+
+class LinenCreate(BaseModel):
+    category: str
+    item_type: str
+    description: Optional[str] = None
+    size: Optional[str] = None
+    color: Optional[str] = None
+    client_name: str
+    department: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LinenBulkCreate(BaseModel):
+    category: str
+    item_type: str
+    description: Optional[str] = None
+    size: Optional[str] = None
+    color: Optional[str] = None
+    client_name: str
+    department: Optional[str] = None
+    quantity: int = Field(gt=0, le=10000)
+    notes: Optional[str] = None
+
+
+class LinenUpdate(BaseModel):
+    category: Optional[str] = None
+    item_type: Optional[str] = None
+    description: Optional[str] = None
+    size: Optional[str] = None
+    color: Optional[str] = None
+    client_name: Optional[str] = None
+    department: Optional[str] = None
+    status: Optional[str] = None
+    condition: Optional[str] = None
+    location: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LinenScanAction(BaseModel):
+    action: str  # collect, receive, start_wash, complete_wash, press, ready, deliver, mark_missing, mark_damaged, retire
+    location: Optional[str] = None
+    user: Optional[str] = None
+    related_order: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class LinenEventModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    linen_id: str
+    action: str
+    from_status: Optional[str] = None
+    to_status: str
+    location: Optional[str] = None
+    user: Optional[str] = None
+    related_order: Optional[str] = None
+    notes: Optional[str] = None
+    timestamp: datetime
+
+
+class LinenModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    linen_id: str
+    category: str
+    item_type: str
+    description: Optional[str] = None
+    size: Optional[str] = None
+    color: Optional[str] = None
+    client_name: str
+    department: Optional[str] = None
+    status: str  # IN_STOCK, AT_CLIENT, COLLECTED, AT_LAUNDRY, WASHING, DRYING, PRESSING, READY, DELIVERED, MISSING, DAMAGED, RETIRED
+    condition: str  # NEW, GOOD, FAIR, WORN, DAMAGED
+    location: Optional[str] = None
+    wash_count: int = 0
+    last_washed_date: Optional[datetime] = None
+    last_scanned_date: Optional[datetime] = None
+    retirement_date: Optional[datetime] = None
+    notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class LinenListResponse(BaseModel):
+    items: List[LinenModel]
+    total: int
+
+
+class LinenEventListResponse(BaseModel):
+    items: List[LinenEventModel]
+    total: int
+
+
+class LinenStats(BaseModel):
+    total: int
+    in_stock: int = 0
+    at_client: int = 0
+    collected: int = 0
+    at_laundry: int = 0
+    washing: int = 0
+    drying: int = 0
+    pressing: int = 0
+    ready: int = 0
+    delivered: int = 0
+    missing: int = 0
+    damaged: int = 0
+    retired: int = 0
+    total_wash_cycles: int = 0
+    recently_scanned: int = 0
+
+
+class LinenTagGenerate(BaseModel):
+    category: str
+    item_type: str
+    client_name: str
+    quantity: int = Field(gt=0, le=10000)
+    size: Optional[str] = None
+    color: Optional[str] = None
+    department: Optional[str] = None
+
+
+class LinenListParams(BaseModel):
+    search: Optional[str] = None
+    category: Optional[str] = None
+    status: Optional[str] = None
+    client_name: Optional[str] = None
+    condition: Optional[str] = None
+    sort_by: str = "created_at"
+    sort_order: str = "desc"
+    skip: int = 0
+    limit: int = 50
