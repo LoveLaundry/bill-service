@@ -446,11 +446,14 @@ async def list_bills(
             pipeline.append({"$match": base_match})
 
         # Join with gatepasses to access receiving_date
+        # gate_pass_id is stored as a string, _id is ObjectId — must convert
         pipeline.append({
             "$lookup": {
                 "from": "gatepasses",
-                "localField": "gate_pass_id",
-                "foreignField": "_id",
+                "let": {"gp_id_str": "$gate_pass_id"},
+                "pipeline": [
+                    {"$match": {"$expr": {"$eq": ["$_id", {"$toObjectId": "$$gp_id_str"}]}}},
+                ],
                 "as": "gp",
             }
         })
