@@ -276,67 +276,75 @@ async def update_gate_pass(
     payload: GatePassUpdate,
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
-
-    if doc.get("status") in ("DELIVERED", "CANCELLED"):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Gate Pass cannot be edited once it is {doc.get('status')}.",
-        )
-
-    # Decrypt original so encrypted fields can be updated wholesale.
-    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
-    update_data = payload.model_dump(exclude_unset=True)
-
-    if "items" in update_data and update_data["items"]:
-        processed_items = []
-        for item in update_data["items"]:
-            processed_items.append(
-                {
-                    "item_name": item.item_name,
-                    "category": item.category,
-                    "specification": item.specification,
-                    "client_qty": item.client_qty,
-                    "received_qty": item.received_qty,
-                    "difference": item.received_qty - item.client_qty,
-                    "mismatch_reason": item.mismatch_reason,
-                    "mismatch_notes": item.mismatch_notes,
-                }
+    try:
+        oid = _parse_object_id(gate_pass_id)
+        doc = await gatepasses_collection.find_one({"_id": oid})
+        if not doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
             )
-        decrypted["items"] = processed_items
 
-    if "client_name" in update_data:
-        decrypted["client_name"] = update_data["client_name"]
-    if "received_by" in update_data:
-        decrypted["received_by"] = update_data["received_by"]
-    if "notes" in update_data:
-        decrypted["notes"] = update_data["notes"]
+        if doc.get("status") in ("DELIVERED", "CANCELLED"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Gate Pass cannot be edited once it is {doc.get('status')}.",
+            )
 
-    decrypted["updated_at"] = datetime.now(timezone.utc)
+        decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+        update_data = payload.model_dump(exclude_unset=True)
 
-    # Re-encrypt and save
-    encrypted_new = encrypt_dict(decrypted, SENSITIVE_FIELDS)
-    await gatepasses_collection.replace_one({"_id": oid}, encrypted_new)
+        if "items" in update_data and update_data["items"]:
+            processed_items = []
+            for item in update_data["items"]:
+                processed_items.append(
+                    {
+                        "item_name": item.item_name,
+                        "category": item.category,
+                        "specification": getattr(item, "specification", None),
+                        "client_qty": item.client_qty,
+                        "received_qty": item.received_qty,
+                        "difference": item.received_qty - item.client_qty,
+                        "mismatch_reason": item.mismatch_reason,
+                        "mismatch_notes": item.mismatch_notes,
+                    }
+                )
+            decrypted["items"] = processed_items
 
-    updated_doc = await gatepasses_collection.find_one({"_id": oid})
-    serialized = _serialize(updated_doc)
+        if "client_name" in update_data:
+            decrypted["client_name"] = update_data["client_name"]
+        if "received_by" in update_data:
+            decrypted["received_by"] = update_data["received_by"]
+        if "notes" in update_data:
+            decrypted["notes"] = update_data["notes"]
 
-    new_version = await bump_version("gatepass", oid)
-    await enqueue_sync("gatepass", oid, new_version)
-    serialized = await attach_verification_to("gatepass", oid, serialized)
+        decrypted["updated_at"] = datetime.now(timezone.utc)
 
-    await log_audit(
-        current_user.get("auth_id", "system"),
-        "RECEIVING_UPDATE",
-        "gatepass",
-        serialized["id"],
-    )
-    return serialized
+        encrypted_new = encrypt_dict(decrypted, SENSITIVE_FIELDS)
+        await gatepasses_collection.replace_one({"_id": oid}, encrypted_new)
+
+        updated_doc = await gatepasses_collection.find_one({"_id": oid})
+        serialized = _serialize(updated_doc)
+
+        new_version = await bump_version("gatepass", oid)
+        await enqueue_sync("gatepass", oid, new_version)
+        serialized = await attach_verification_to("gatepass", oid, serialized)
+
+        await log_audit(
+            current_user.get("auth_id", "system"),
+            "RECEIVING_UPDATE",
+            "gatepass",
+            serialized["id"],
+        )
+        return serialized
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to update gate pass: {str(e)}",
+        )
 
 
 @router.post("/{gate_pass_id}/adjust", response_model=GatePassModel)
