@@ -420,10 +420,79 @@ async def list_bills(
     payment_status: Optional[str] = Query(None),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
+    gate_pass_date_from: Optional[datetime] = Query(None),
+    gate_pass_date_to: Optional[datetime] = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=5000),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
+    use_pipeline = gate_pass_date_from or gate_pass_date_to
+
+    if use_pipeline:
+        # Build aggregation pipeline — filter by gate pass receiving_date
+        pipeline: list = []
+
+        # Start with basic bill-level filters (non-date)
+        base_match: dict = {}
+        if client_name:
+            base_match["client_name_search"] = get_search_token(client_name)
+        if quotation_id:
+            base_match["quotation_id"] = quotation_id
+        if payment_status:
+            base_match["payment_status"] = payment_status
+        if search:
+            base_match["client_name_search"] = get_search_token(search)
+        if base_match:
+            pipeline.append({"$match": base_match})
+
+        # Join with gatepasses to access receiving_date
+        pipeline.append({
+            "$lookup": {
+                "from": "gatepasses",
+                "localField": "gate_pass_id",
+                "foreignField": "_id",
+                "as": "gp",
+            }
+        })
+
+        # Filter by gate pass receiving_date (handles null gate_pass_id too)
+        gp_date_match: dict = {}
+        if gate_pass_date_from:
+            gp_date_match["$gte"] = gate_pass_date_from.replace(tzinfo=timezone.utc)
+        if gate_pass_date_to:
+            gp_date_match["$lte"] = gate_pass_date_to.replace(tzinfo=timezone.utc)
+        pipeline.append({
+            "$match": {
+                "gp": {"$ne": []},
+                "gp.receiving_date": gp_date_match,
+            }
+        })
+
+        # Drop the gp join field before returning
+        pipeline.append({"$project": {"gp": 0}})
+
+        # Count total before sort/skip/limit
+        count_pipeline = pipeline + [{"$count": "total"}]
+        count_result = await bills_collection.aggregate(count_pipeline).to_list(1)
+        total = count_result[0]["total"] if count_result else 0
+
+        # Sort, skip, limit
+        pipeline.append({"$sort": {"created_at": -1}})
+        pipeline.append({"$skip": skip})
+        pipeline.append({"$limit": limit})
+
+        cursor = bills_collection.aggregate(pipeline)
+        docs = []
+        async for doc in cursor:
+            try:
+                serialized = _serialize(doc)
+                docs.append(await attach_verification_to("bill", doc["_id"], serialized))
+            except HTTPException:
+                pass
+
+        return {"items": docs, "total": total}
+
+    # Original simple query (no gate pass date filter)
     query: dict = {}
 
     if client_name:
@@ -444,7 +513,6 @@ async def list_bills(
         query["created_at"] = date_filter
 
     if search:
-        # For general search, we filter client by token
         query["client_name_search"] = get_search_token(search)
 
     total = await bills_collection.count_documents(query)
