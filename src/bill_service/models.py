@@ -38,6 +38,15 @@ class GatePassDateUpdate(BaseModel):
     reason: Optional[str] = None
 
 
+class GatePassUpdate(BaseModel):
+    """Full edit of a gate pass that is not yet fully delivered."""
+
+    client_name: Optional[str] = None
+    received_by: Optional[str] = None
+    notes: Optional[str] = None
+    items: Optional[List[GatePassItem]] = Field(default=None, min_length=1)
+
+
 class GatePassModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 

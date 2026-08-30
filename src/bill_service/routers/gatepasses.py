@@ -9,7 +9,13 @@ from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import audit_collection, gatepasses_collection
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services.verification_service import attach_verification_to
-from ..models import GatePassAdjustment, GatePassCreate, GatePassDateUpdate, GatePassModel
+from ..models import (
+    GatePassAdjustment,
+    GatePassCreate,
+    GatePassDateUpdate,
+    GatePassModel,
+    GatePassUpdate,
+)
 
 router = APIRouter(prefix="/gatepasses", tags=["gatepasses"])
 
@@ -257,6 +263,74 @@ async def update_gate_pass_date(
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_DATE_UPDATE",
+        "gatepass",
+        serialized["id"],
+    )
+    return serialized
+
+
+@router.patch("/{gate_pass_id}", response_model=GatePassModel)
+async def update_gate_pass(
+    gate_pass_id: str,
+    payload: GatePassUpdate,
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    oid = _parse_object_id(gate_pass_id)
+    doc = await gatepasses_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
+        )
+
+    if doc.get("status") in ("DELIVERED", "CANCELLED"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Gate Pass cannot be edited once it is {doc.get('status')}.",
+        )
+
+    # Decrypt original so encrypted fields can be updated wholesale.
+    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+    update_data = payload.model_dump(exclude_unset=True)
+
+    if "items" in update_data and update_data["items"]:
+        processed_items = []
+        for item in update_data["items"]:
+            processed_items.append(
+                {
+                    "item_name": item.item_name,
+                    "category": item.category,
+                    "client_qty": item.client_qty,
+                    "received_qty": item.received_qty,
+                    "difference": item.received_qty - item.client_qty,
+                    "mismatch_reason": item.mismatch_reason,
+                    "mismatch_notes": item.mismatch_notes,
+                }
+            )
+        decrypted["items"] = processed_items
+
+    if "client_name" in update_data:
+        decrypted["client_name"] = update_data["client_name"]
+    if "received_by" in update_data:
+        decrypted["received_by"] = update_data["received_by"]
+    if "notes" in update_data:
+        decrypted["notes"] = update_data["notes"]
+
+    decrypted["updated_at"] = datetime.now(timezone.utc)
+
+    # Re-encrypt and save
+    encrypted_new = encrypt_dict(decrypted, SENSITIVE_FIELDS)
+    await gatepasses_collection.replace_one({"_id": oid}, encrypted_new)
+
+    updated_doc = await gatepasses_collection.find_one({"_id": oid})
+    serialized = _serialize(updated_doc)
+
+    new_version = await bump_version("gatepass", oid)
+    await enqueue_sync("gatepass", oid, new_version)
+    serialized = await attach_verification_to("gatepass", oid, serialized)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "RECEIVING_UPDATE",
         "gatepass",
         serialized["id"],
     )
