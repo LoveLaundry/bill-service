@@ -616,15 +616,28 @@ def aggregate(bills, gate_passes, deliveries, period):
     pending_gps = []
     for gp in gate_passes:
         dm = del_map.get(gp["id"], {})
-        pending_items = sum(
-            max(0, it["received_qty"] - dm.get(it["item_name"], 0)) for it in gp["items"]
-        )
-        if pending_items > 0:
+        pending_detail = []
+        total_pending = 0
+        for it in gp["items"]:
+            delivered = dm.get(it["item_name"], 0)
+            p = max(0, it["received_qty"] - delivered)
+            if p > 0:
+                total_pending += p
+                pending_detail.append({
+                    "item_name": it["item_name"],
+                    "specification": it.get("specification") or "",
+                    "category": it.get("category") or "",
+                    "received": it["received_qty"],
+                    "delivered": delivered,
+                    "pending": p,
+                })
+        if total_pending > 0:
             pending_gps.append(
                 {
                     "gate_pass_number": gp["gate_pass_number"],
                     "client_name": gp["client_name"],
-                    "pending": pending_items,
+                    "pending": total_pending,
+                    "items": pending_detail,
                 }
             )
     pending_gps.sort(key=lambda x: -x["pending"])
