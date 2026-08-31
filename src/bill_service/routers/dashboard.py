@@ -683,6 +683,29 @@ async def get_dashboard_summary(
     return {"current": current, "previous": previous}
 
 
+# ── Recent Activity ───────────────────────────────────────────────────────────
+
+@router.get("/dashboard/recent-activity")
+async def recent_activity(
+    limit: int = Query(default=10, ge=1, le=50),
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
+    cursor = audit_collection.find().sort("timestamp", -1).limit(limit)
+    activities = []
+    async for doc in cursor:
+        ts = doc.get("timestamp")
+        activities.append({
+            "id": str(doc.get("_id", "")),
+            "user_id": doc.get("user_id") or doc.get("auth_id") or "system",
+            "action": doc.get("action") or "UNKNOWN",
+            "entity": doc.get("entity_type") or doc.get("entity") or "",
+            "entity_id": str(doc.get("entity_id", "")),
+            "details": doc.get("details") or {},
+            "timestamp": ts.isoformat() if ts else None,
+        })
+    return activities
+
+
 # ── CSV Export ────────────────────────────────────────────────────────────────
 
 
