@@ -8,6 +8,7 @@ from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import audit_collection, gatepasses_collection
 from ..repositories.main_repository import bump_version, enqueue_sync
+from ..error_responses import NotFoundError, ValidationError, ConflictError, ForbiddenError
 from ..services.verification_service import attach_verification_to
 from ..models import (
     GatePassAdjustment,

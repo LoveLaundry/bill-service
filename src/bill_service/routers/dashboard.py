@@ -5,6 +5,8 @@ import io
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, get_search_token
@@ -979,4 +981,184 @@ async def export_deliveries_csv(
         iter([output.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=deliveries.csv"},
+    )
+
+
+# ── Excel Export ──────────────────────────────────────────────────────────────
+
+HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+HEADER_FILL = PatternFill(start_color="DC2626", end_color="DC2626", fill_type="solid")
+HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+THIN_BORDER = Border(
+    left=Side(style="thin"),
+    right=Side(style="thin"),
+    top=Side(style="thin"),
+    bottom=Side(style="thin"),
+)
+
+
+def _style_sheet(ws, headers, rows):
+    for col_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col_idx, value=h)
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = HEADER_ALIGN
+        cell.border = THIN_BORDER
+    for row_idx, row_data in enumerate(rows, 2):
+        for col_idx, val in enumerate(row_data, 1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(vertical="center")
+    for col_idx, h in enumerate(headers, 1):
+        max_len = max(len(str(h)), *(len(str(r[col_idx - 1])) for r in rows) if rows else [0])
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 4, 40)
+    ws.auto_filter.ref = ws.dimensions
+
+
+@router.get("/export/gatepasses/xlsx")
+async def export_gatepasses_xlsx(
+    client_name: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: dict = Depends(require_capability("report:read")),
+):
+    """Export gate passes as Excel."""
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+    if status:
+        query["status"] = status
+
+    cursor = gatepasses_collection.find(query).sort("created_at", -1)
+    rows = []
+    async for doc in cursor:
+        dec = _decrypt_gp(doc)
+        for item in dec.get("items", []):
+            rows.append([
+                dec.get("gate_pass_number", ""),
+                dec.get("client_name", ""),
+                str(dec.get("receiving_date", ""))[:10],
+                dec.get("status", ""),
+                item.get("item_name", ""),
+                item.get("specification", ""),
+                item.get("category", ""),
+                item.get("client_qty", 0),
+                item.get("received_qty", 0),
+                item.get("difference", 0),
+            ])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Gate Passes"
+    headers = ["Gate Pass #", "Client", "Date", "Status", "Item", "Specification", "Category", "Client Qty", "Received", "Difference"]
+    if rows:
+        _style_sheet(ws, headers, rows)
+    else:
+        ws.cell(row=1, column=1, value="No data")
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=gate-passes.xlsx"},
+    )
+
+
+@router.get("/export/bills/xlsx")
+async def export_bills_xlsx(
+    client_name: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: dict = Depends(require_capability("report:read")),
+):
+    """Export bills as Excel."""
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+    if status:
+        query["status"] = status
+
+    cursor = bills_collection.find(query).sort("created_at", -1)
+    rows = []
+    async for doc in cursor:
+        try:
+            dec = decrypt_dict(doc, SENSITIVE_FIELDS_BILL)
+        except Exception:
+            continue
+        for item in dec.get("items", []):
+            rows.append([
+                dec.get("bill_number", ""),
+                dec.get("client_name", ""),
+                str(dec.get("bill_date", ""))[:10],
+                dec.get("status", ""),
+                item.get("item_name", ""),
+                item.get("quantity", 0),
+                item.get("unit_price", 0),
+                item.get("total", 0),
+                dec.get("grand_total", 0),
+                dec.get("amount_paid", 0),
+                dec.get("balance", 0),
+            ])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bills"
+    headers = ["Bill #", "Client", "Date", "Status", "Item", "Qty", "Unit Price", "Item Total", "Grand Total", "Paid", "Balance"]
+    if rows:
+        _style_sheet(ws, headers, rows)
+    else:
+        ws.cell(row=1, column=1, value="No data")
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=bills.xlsx"},
+    )
+
+
+@router.get("/export/deliveries/xlsx")
+async def export_deliveries_xlsx(
+    client_name: Optional[str] = None,
+    current_user: dict = Depends(require_capability("report:read")),
+):
+    """Export deliveries as Excel."""
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+
+    cursor = deliveries_collection.find(query).sort("created_at", -1)
+    rows = []
+    async for doc in cursor:
+        try:
+            dec = decrypt_dict(doc, SENSITIVE_FIELDS_DEL)
+        except Exception:
+            continue
+        for item in dec.get("items", []):
+            rows.append([
+                dec.get("client_name", ""),
+                str(dec.get("delivery_date", ""))[:10],
+                dec.get("delivered_by", ""),
+                dec.get("received_by", ""),
+                dec.get("status", ""),
+                item.get("item_name", ""),
+                item.get("specification", ""),
+                item.get("quantity", 0),
+            ])
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Deliveries"
+    headers = ["Client", "Date", "Delivered By", "Received By", "Status", "Item", "Specification", "Qty"]
+    if rows:
+        _style_sheet(ws, headers, rows)
+    else:
+        ws.cell(row=1, column=1, value="No data")
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=deliveries.xlsx"},
     )
