@@ -71,7 +71,7 @@ ROLE_CAPABILITIES = {
         "loyalty:read", "loyalty:write",
         "bill:read", "bill:write",
         "payment:read", "payment:write",
-        "dashboard:read",
+        "dashboard:read", "report:read",
         "linen:read", "linen:write", "linen:scan",
     ],
     "MANAGER": [
@@ -81,7 +81,7 @@ ROLE_CAPABILITIES = {
         "loyalty:read", "loyalty:write",
         "bill:read", "bill:write",
         "payment:read", "payment:write",
-        "dashboard:read",
+        "dashboard:read", "report:read",
         "linen:read", "linen:write", "linen:scan",
     ],
     "STAFF": [
@@ -90,6 +90,7 @@ ROLE_CAPABILITIES = {
         "dispatch:read", "dispatch:write",
         "loyalty:read",
         "bill:read",
+        "dashboard:read", "report:read",
         "linen:read", "linen:scan",
     ]
 }

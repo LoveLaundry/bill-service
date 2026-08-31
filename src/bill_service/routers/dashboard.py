@@ -5,8 +5,6 @@ import io
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, get_search_token
@@ -765,7 +763,11 @@ async def outstanding_aging(
         if not created:
             buckets["current"] += outstanding
             continue
-        age_days = (now - created).days
+        created_utc = _utc(created)
+        if not created_utc:
+            buckets["current"] += outstanding
+            continue
+        age_days = (now - created_utc).days
         if age_days <= 0:
             buckets["current"] += outstanding
         elif age_days <= 30:
@@ -815,7 +817,10 @@ async def yearly_trend(
         created = doc.get("created_at")
         if not created:
             continue
-        key = created.strftime("%Y-%m")
+        created_utc = _utc(created)
+        if not created_utc:
+            continue
+        key = created_utc.strftime("%Y-%m")
         if key in month_index:
             month_index[key]["revenue"] += float(doc.get("grand_total") or 0)
             month_index[key]["collected"] += float(doc.get("paid_amount") or 0)
@@ -891,7 +896,7 @@ async def export_bills_csv(
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
     if status:
-        query["status"] = status
+        query["payment_status"] = status
 
     cursor = bills_collection.find(query).sort("created_at", -1)
     rows = []
@@ -907,7 +912,7 @@ async def export_bills_csv(
                 "bill_number": dec.get("bill_number", ""),
                 "client_name": dec.get("client_name", ""),
                 "bill_date": str(dec.get("bill_date", ""))[:10],
-                "status": dec.get("status", ""),
+                "status": dec.get("payment_status", ""),
                 "item_name": item.get("item_name", ""),
                 "quantity": item.get("quantity", 0),
                 "unit_price": item.get("unit_price", 0),
@@ -986,18 +991,30 @@ async def export_deliveries_csv(
 
 # ── Excel Export ──────────────────────────────────────────────────────────────
 
-HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
-HEADER_FILL = PatternFill(start_color="DC2626", end_color="DC2626", fill_type="solid")
-HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
-THIN_BORDER = Border(
-    left=Side(style="thin"),
-    right=Side(style="thin"),
-    top=Side(style="thin"),
-    bottom=Side(style="thin"),
-)
+HEADER_FONT = None
+HEADER_FILL = None
+HEADER_ALIGN = None
+THIN_BORDER = None
+
+
+def _init_openpyxl():
+    global HEADER_FONT, HEADER_FILL, HEADER_ALIGN, THIN_BORDER
+    if HEADER_FONT is not None:
+        return
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+    HEADER_FILL = PatternFill(start_color="DC2626", end_color="DC2626", fill_type="solid")
+    HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    THIN_BORDER = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
 
 
 def _style_sheet(ws, headers, rows):
+    _init_openpyxl()
     for col_idx, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=h)
         cell.font = HEADER_FONT
@@ -1022,6 +1039,8 @@ async def export_gatepasses_xlsx(
     current_user: dict = Depends(require_capability("report:read")),
 ):
     """Export gate passes as Excel."""
+    from openpyxl import Workbook
+
     query: dict = {}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
@@ -1071,11 +1090,13 @@ async def export_bills_xlsx(
     current_user: dict = Depends(require_capability("report:read")),
 ):
     """Export bills as Excel."""
+    from openpyxl import Workbook
+
     query: dict = {}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
     if status:
-        query["status"] = status
+        query["payment_status"] = status
 
     cursor = bills_collection.find(query).sort("created_at", -1)
     rows = []
@@ -1089,7 +1110,7 @@ async def export_bills_xlsx(
                 dec.get("bill_number", ""),
                 dec.get("client_name", ""),
                 str(dec.get("bill_date", ""))[:10],
-                dec.get("status", ""),
+                dec.get("payment_status", ""),
                 item.get("item_name", ""),
                 item.get("quantity", 0),
                 item.get("unit_price", 0),
@@ -1123,6 +1144,8 @@ async def export_deliveries_xlsx(
     current_user: dict = Depends(require_capability("report:read")),
 ):
     """Export deliveries as Excel."""
+    from openpyxl import Workbook
+
     query: dict = {}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
