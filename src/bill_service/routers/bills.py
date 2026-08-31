@@ -18,6 +18,7 @@ from ..services.verification_service import attach_verification_to
 from pydantic import BaseModel
 from ..models import (
     BillCreate,
+    BillItemIn,
     BillModel,
     BillListResponse,
     PaymentCreate,
