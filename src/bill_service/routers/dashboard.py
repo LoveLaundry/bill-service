@@ -209,8 +209,10 @@ async def get_client_wise_report():
                     "outstanding": 0.0,
                     "gate_pass_count": 0,
                     "items_detail": {},
+                    "gate_passes": [],
                 }
             clients_map[c_label]["gate_pass_count"] += 1
+            gp_items = []
             for item in gp.get("items", []):
                 clients_map[c_label]["total_received"] += item.get("received_qty", 0)
                 if item.get("difference", 0) != 0:
@@ -227,6 +229,16 @@ async def get_client_wise_report():
                         "delivered": 0,
                     }
                 clients_map[c_label]["items_detail"][detail_key]["received"] += item.get("received_qty", 0)
+                gp_items.append({
+                    "item_name": item_key,
+                    "specification": spec,
+                    "received": item.get("received_qty", 0),
+                })
+            clients_map[c_label]["gate_passes"].append({
+                "gate_pass_number": gp.get("gate_pass_number", ""),
+                "receiving_date": str(gp.get("receiving_date", ""))[:10],
+                "items": gp_items,
+            })
         except Exception:
             continue
 
@@ -268,6 +280,7 @@ async def get_client_wise_report():
         for it in items_list:
             it["pending"] = max(0, it["received"] - it["delivered"])
         stats["items"] = [it for it in items_list if it["pending"] > 0]
+        stats["gate_passes"] = stats.pop("gate_passes", [])
         results.append(stats)
 
     return results
