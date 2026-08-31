@@ -1,7 +1,10 @@
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+import csv
+import io
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, get_search_token
@@ -681,9 +684,6 @@ async def get_dashboard_summary(
 
 
 # ── CSV Export ────────────────────────────────────────────────────────────────
-import csv
-import io
-from fastapi.responses import StreamingResponse
 
 
 @router.get("/export/gatepasses")

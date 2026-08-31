@@ -15,6 +15,7 @@ from ..database.main_db import (
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services.verification_service import attach_verification_to
+from pydantic import BaseModel
 from ..models import (
     BillCreate,
     BillModel,
