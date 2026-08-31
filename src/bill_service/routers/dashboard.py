@@ -719,6 +719,91 @@ async def recent_activity(
     return activities
 
 
+# ── Outstanding Aging ─────────────────────────────────────────────────────────
+
+@router.get("/dashboard/outstanding-aging")
+async def outstanding_aging(
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    buckets = {"current": 0.0, "30_day": 0.0, "60_day": 0.0, "90_day": 0.0, "over_90": 0.0}
+
+    cursor = bills_collection.find(
+        {"payment_status": {"$in": ["PENDING", "PARTIALLY_PAID", "ISSUED"]}},
+        {"outstanding_amount": 1, "created_at": 1, "_id": 0},
+    )
+    async for doc in cursor:
+        outstanding = float(doc.get("outstanding_amount") or 0)
+        if outstanding <= 0:
+            continue
+        created = doc.get("created_at")
+        if not created:
+            buckets["current"] += outstanding
+            continue
+        age_days = (now - created).days
+        if age_days <= 0:
+            buckets["current"] += outstanding
+        elif age_days <= 30:
+            buckets["30_day"] += outstanding
+        elif age_days <= 60:
+            buckets["60_day"] += outstanding
+        elif age_days <= 90:
+            buckets["90_day"] += outstanding
+        else:
+            buckets["over_90"] += outstanding
+
+    return {
+        "current": round(buckets["current"], 2),
+        "30_day": round(buckets["30_day"], 2),
+        "60_day": round(buckets["60_day"], 2),
+        "90_day": round(buckets["90_day"], 2),
+        "over_90": round(buckets["over_90"], 2),
+    }
+
+
+# ── 12-Month Trend ───────────────────────────────────────────────────────────
+
+@router.get("/dashboard/yearly-trend")
+async def yearly_trend(
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    months = []
+    for i in range(11, -1, -1):
+        d = now - timedelta(days=30 * i)
+        months.append({
+            "key": d.strftime("%Y-%m"),
+            "label": d.strftime("%b %y"),
+            "revenue": 0.0,
+            "collected": 0.0,
+            "bills": 0,
+        })
+
+    month_index = {m["key"]: m for m in months}
+
+    cursor = bills_collection.find(
+        {"payment_status": {"$ne": "CANCELLED"}},
+        {"grand_total": 1, "paid_amount": 1, "created_at": 1, "_id": 0},
+    )
+    async for doc in cursor:
+        created = doc.get("created_at")
+        if not created:
+            continue
+        key = created.strftime("%Y-%m")
+        if key in month_index:
+            month_index[key]["revenue"] += float(doc.get("grand_total") or 0)
+            month_index[key]["collected"] += float(doc.get("paid_amount") or 0)
+            month_index[key]["bills"] += 1
+
+    for m in months:
+        m["revenue"] = round(m["revenue"], 2)
+        m["collected"] = round(m["collected"], 2)
+
+    return months
+
+
 # ── CSV Export ────────────────────────────────────────────────────────────────
 
 
