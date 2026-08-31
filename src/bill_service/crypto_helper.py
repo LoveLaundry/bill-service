@@ -4,7 +4,13 @@ import hashlib
 import hmac
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-MASTER_KEY_ENV = os.getenv("MASTER_KEY", "default-secret-master-key-love-laundry-2026")
+import logging as _crypto_log
+_crypto_logger = _crypto_log.getLogger("crypto")
+_master_key = os.getenv("MASTER_KEY")
+if not _master_key:
+    _crypto_logger.warning("MASTER_KEY not set — using insecure fallback. Set MASTER_KEY in production!")
+_master_key = _master_key or "CHANGE-ME-IN-PRODUCTION-love-laundry-2026"
+MASTER_KEY_ENV = _master_key
 
 # Derive KEK and HMAC Key
 KEK = hashlib.sha256((MASTER_KEY_ENV + "-kek").encode()).digest()

@@ -27,22 +27,27 @@ import sentry_sdk
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# CORS configuration - allow all origins for now to avoid blocking
+# CORS configuration
 try:
     ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
     if ALLOWED_ORIGINS_ENV:
         ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
         ALLOW_CREDENTIALS = True
     else:
-        # If not configured, allow all origins (development/production fallback)
-        ALLOWED_ORIGINS = ["*"]
-        ALLOW_CREDENTIALS = False
+        # Production fallback — restrict to known domains
+        ALLOWED_ORIGINS = [
+            "https://lovelaundry-manager.vercel.app",
+            "https://public.lovelaundry.lk",
+            "http://localhost:5173",
+            "http://localhost:3000",
+        ]
+        ALLOW_CREDENTIALS = True
 
     logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}, credentials: {ALLOW_CREDENTIALS}")
 except Exception as e:
     logger.warning(f"CORS configuration failed, using defaults: {e}")
-    ALLOWED_ORIGINS = ["*"]
-    ALLOW_CREDENTIALS = False
+    ALLOWED_ORIGINS = ["http://localhost:5173"]
+    ALLOW_CREDENTIALS = True
 
 # Vercel sets VERCEL=1; background workers are unreliable in serverless.
 ON_VERCEL = os.getenv("VERCEL") == "1"
@@ -51,7 +56,7 @@ SENTRY_DSN = os.getenv("SENTRY_DSN")
 if SENTRY_DSN:
     sentry_sdk.init(
         dsn=SENTRY_DSN,
-        traces_sample_rate=1.0,
+        traces_sample_rate=0.1,
     )
 
 app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0")
@@ -70,7 +75,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {exc}\n{traceback.format_exc()}")
     return JSONResponse(
         status_code=500,
-        content={"detail": str(exc)},
+        content={"detail": "Internal server error. Please try again later."},
     )
 
 app.include_router(bills_router)

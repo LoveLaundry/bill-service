@@ -678,3 +678,162 @@ async def get_dashboard_summary(
         m["quotationAcceptedValue"] = 0.0
 
     return {"current": current, "previous": previous}
+
+
+# ── CSV Export ────────────────────────────────────────────────────────────────
+import csv
+import io
+from fastapi.responses import StreamingResponse
+
+
+@router.get("/export/gatepasses")
+async def export_gatepasses_csv(
+    client_name: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: dict = Depends(require_capability("report:read")),
+):
+    """Export gate passes as CSV for download."""
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+    if status:
+        query["status"] = status
+
+    cursor = gatepasses_collection.find(query).sort("created_at", -1)
+    rows = []
+    async for doc in cursor:
+        dec = _decrypt_gp(doc)
+        for item in dec.get("items", []):
+            rows.append({
+                "gate_pass_number": dec.get("gate_pass_number", ""),
+                "client_name": dec.get("client_name", ""),
+                "receiving_date": str(dec.get("receiving_date", ""))[:10],
+                "status": dec.get("status", ""),
+                "item_name": item.get("item_name", ""),
+                "specification": item.get("specification", ""),
+                "category": item.get("category", ""),
+                "client_qty": item.get("client_qty", 0),
+                "received_qty": item.get("received_qty", 0),
+                "difference": item.get("difference", 0),
+            })
+
+    if not rows:
+        rows.append({"gate_pass_number": "No data", "client_name": "", "receiving_date": "",
+                       "status": "", "item_name": "", "specification": "", "category": "",
+                       "client_qty": 0, "received_qty": 0, "difference": 0})
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    output.seek(0)
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=gate-passes.csv"},
+    )
+
+
+@router.get("/export/bills")
+async def export_bills_csv(
+    client_name: Optional[str] = None,
+    status: Optional[str] = None,
+    current_user: dict = Depends(require_capability("report:read")),
+):
+    """Export bills as CSV for download."""
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+    if status:
+        query["status"] = status
+
+    cursor = bills_collection.find(query).sort("created_at", -1)
+    rows = []
+    async for doc in cursor:
+        try:
+            dec = decrypt_dict(doc, SENSITIVE_FIELDS_BILL)
+        except Exception:
+            continue
+        dec["id"] = str(dec["_id"])
+        del dec["_id"]
+        for item in dec.get("items", []):
+            rows.append({
+                "bill_number": dec.get("bill_number", ""),
+                "client_name": dec.get("client_name", ""),
+                "bill_date": str(dec.get("bill_date", ""))[:10],
+                "status": dec.get("status", ""),
+                "item_name": item.get("item_name", ""),
+                "quantity": item.get("quantity", 0),
+                "unit_price": item.get("unit_price", 0),
+                "total": item.get("total", 0),
+                "grand_total": dec.get("grand_total", 0),
+                "amount_paid": dec.get("amount_paid", 0),
+                "balance": dec.get("balance", 0),
+            })
+
+    if not rows:
+        rows.append({"bill_number": "No data", "client_name": "", "bill_date": "",
+                       "status": "", "item_name": "", "quantity": 0, "unit_price": 0,
+                       "total": 0, "grand_total": 0, "amount_paid": 0, "balance": 0})
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    output.seek(0)
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=bills.csv"},
+    )
+
+
+@router.get("/export/deliveries")
+async def export_deliveries_csv(
+    client_name: Optional[str] = None,
+    current_user: dict = Depends(require_capability("report:read")),
+):
+    """Export deliveries as CSV for download."""
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+
+    cursor = deliveries_collection.find(query).sort("created_at", -1)
+    rows = []
+    async for doc in cursor:
+        try:
+            dec = decrypt_dict(doc, SENSITIVE_FIELDS_DEL)
+        except Exception:
+            continue
+        dec["id"] = str(dec["_id"])
+        del dec["_id"]
+        for item in dec.get("items", []):
+            rows.append({
+                "client_name": dec.get("client_name", ""),
+                "delivery_date": str(dec.get("delivery_date", ""))[:10],
+                "delivered_by": dec.get("delivered_by", ""),
+                "received_by": dec.get("received_by", ""),
+                "status": dec.get("status", ""),
+                "item_name": item.get("item_name", ""),
+                "specification": item.get("specification", ""),
+                "quantity": item.get("quantity", 0),
+            })
+
+    if not rows:
+        rows.append({"client_name": "No data", "delivery_date": "", "delivered_by": "",
+                       "received_by": "", "status": "", "item_name": "", "specification": "",
+                       "quantity": 0})
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+    output.seek(0)
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=deliveries.csv"},
+    )
