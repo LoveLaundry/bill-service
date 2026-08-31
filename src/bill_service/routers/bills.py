@@ -605,6 +605,89 @@ async def update_bill_status(
     return serialized
 
 
+# ── Bill Edit (PATCH) ─────────────────────────────────────────────────────────
+
+class BillEdit(BaseModel):
+    client_name: Optional[str] = None
+    quotation_title: Optional[str] = None
+    notes: Optional[str] = None
+    discounts: Optional[float] = None
+    transport_fee: Optional[float] = None
+    taxes: Optional[float] = None
+    additional_charges: Optional[float] = None
+    items: Optional[List[BillItemIn]] = None
+
+
+@router.patch("/{bill_id}", response_model=BillModel)
+async def edit_bill(
+    bill_id: str,
+    payload: BillEdit,
+    current_user: dict = Depends(require_capability("bill:write")),
+):
+    oid = _parse_object_id(bill_id)
+    doc = await bills_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bill not found")
+
+    dec = decrypt_dict(doc, SENSITIVE_FIELDS)
+    if dec.get("payment_status") in ("PAID", "CANCELLED"):
+        raise HTTPException(status_code=400, detail="Cannot edit a paid or cancelled bill")
+
+    update_fields: dict = {}
+    for field in ("client_name", "quotation_title", "notes", "discounts", "transport_fee", "taxes", "additional_charges"):
+        val = getattr(payload, field)
+        if val is not None:
+            update_fields[field] = val
+
+    if payload.items is not None:
+        items_out = []
+        for item in payload.items:
+            items_out.append({
+                "item_name": item.item_name,
+                "category": item.category,
+                "unit_price": item.unit_price,
+                "quantity": item.quantity,
+                "line_total": round(item.unit_price * item.quantity, 2),
+            })
+        update_fields["items"] = items_out
+        total_amount = sum(i["line_total"] for i in items_out)
+        total_quantity = sum(i["quantity"] for i in items_out)
+        update_fields["total_amount"] = total_amount
+        update_fields["total_quantity"] = total_quantity
+        grand_total = (
+            total_amount
+            - (update_fields.get("discounts", dec.get("discounts", 0)) or 0)
+            + (update_fields.get("transport_fee", dec.get("transport_fee", 0)) or 0)
+            + (update_fields.get("taxes", dec.get("taxes", 0)) or 0)
+            + (update_fields.get("additional_charges", dec.get("additional_charges", 0)) or 0)
+        )
+        update_fields["grand_total"] = round(grand_total, 2)
+        paid = dec.get("paid_amount", 0) or 0
+        update_fields["outstanding_amount"] = round(grand_total - paid, 2)
+
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    update_fields["updated_at"] = datetime.now(timezone.utc)
+    await bills_collection.update_one({"_id": oid}, {"$set": update_fields})
+
+    updated_doc = await bills_collection.find_one({"_id": oid})
+    serialized = _serialize(updated_doc)
+
+    new_version = await bump_version("bill", oid)
+    await enqueue_sync("bill", oid, new_version)
+    serialized = await attach_verification_to("bill", oid, serialized)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "BILL_EDIT",
+        "bill",
+        serialized["id"],
+        details={"edited_fields": list(update_fields.keys())},
+    )
+    return serialized
+
+
 @router.delete("/{bill_id}")
 async def delete_bill(
     bill_id: str,
