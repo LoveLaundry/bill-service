@@ -208,12 +208,25 @@ async def get_client_wise_report():
                     "paid_amount": 0.0,
                     "outstanding": 0.0,
                     "gate_pass_count": 0,
+                    "items_detail": {},
                 }
             clients_map[c_label]["gate_pass_count"] += 1
             for item in gp.get("items", []):
                 clients_map[c_label]["total_received"] += item.get("received_qty", 0)
                 if item.get("difference", 0) != 0:
                     clients_map[c_label]["total_mismatches"] += 1
+                item_key = item.get("item_name", "")
+                spec = item.get("specification") or ""
+                detail_key = f"{item_key}||{spec}" if spec else item_key
+                if detail_key not in clients_map[c_label]["items_detail"]:
+                    clients_map[c_label]["items_detail"][detail_key] = {
+                        "item_name": item_key,
+                        "specification": spec,
+                        "category": item.get("category") or "",
+                        "received": 0,
+                        "delivered": 0,
+                    }
+                clients_map[c_label]["items_detail"][detail_key]["received"] += item.get("received_qty", 0)
         except Exception:
             continue
 
@@ -225,6 +238,11 @@ async def get_client_wise_report():
             if client in clients_map:
                 for item in dl.get("items", []):
                     clients_map[client]["total_delivered"] += item.get("quantity", 0)
+                    item_key = item.get("item_name", "")
+                    spec = item.get("specification") or ""
+                    detail_key = f"{item_key}||{spec}" if spec else item_key
+                    if detail_key in clients_map[client]["items_detail"]:
+                        clients_map[client]["items_detail"][detail_key]["delivered"] += item.get("quantity", 0)
         except Exception:
             continue
 
@@ -246,6 +264,10 @@ async def get_client_wise_report():
         stats["total_billed"] = round(stats["total_billed"], 2)
         stats["paid_amount"] = round(stats["paid_amount"], 2)
         stats["outstanding"] = round(stats["outstanding"], 2)
+        items_list = list(stats.pop("items_detail").values())
+        for it in items_list:
+            it["pending"] = max(0, it["received"] - it["delivered"])
+        stats["items"] = [it for it in items_list if it["pending"] > 0]
         results.append(stats)
 
     return results
