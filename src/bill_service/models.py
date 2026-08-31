@@ -71,6 +71,7 @@ class GatePassModel(BaseModel):
 # --- Delivery ---
 class DeliveryItem(BaseModel):
     item_name: str
+    specification: Optional[str] = None
     quantity: int = Field(gt=0)
 
 

@@ -76,53 +76,63 @@ async def create_delivery(
             status_code=500, detail=f"Failed to decrypt Gate Pass: {str(e)}"
         )
 
-    # Map item_name -> actual received quantity
-    received_map = {}
+    # Map composite_key (item_name + specification) -> actual received quantity
+    def _item_key(name: str, spec: str | None) -> str:
+        return f"{name}||{spec or ''}"
+
+    received_map: dict[str, int] = {}
     for gp_item in gp_decrypted.get("items", []):
-        received_map[gp_item["item_name"]] = gp_item["received_qty"]
+        key = _item_key(gp_item["item_name"], gp_item.get("specification"))
+        received_map[key] = received_map.get(key, 0) + gp_item["received_qty"]
 
     # 2. Query previous deliveries for this Gate Pass
     prev_deliveries_cursor = deliveries_collection.find(
         {"gate_pass_id": payload.gate_pass_id, "status": {"$ne": "CANCELLED"}}
     )
-    delivered_map = {}
+    delivered_map: dict[str, int] = {}
     async for prev_del_doc in prev_deliveries_cursor:
         try:
             prev_decrypted = decrypt_dict(prev_del_doc, SENSITIVE_FIELDS)
         except Exception:
             continue
         for prev_item in prev_decrypted.get("items", []):
-            name = prev_item["item_name"]
-            delivered_map[name] = delivered_map.get(name, 0) + prev_item["quantity"]
+            key = _item_key(prev_item["item_name"], prev_item.get("specification"))
+            delivered_map[key] = delivered_map.get(key, 0) + prev_item["quantity"]
 
     # 3. Validate new delivery quantities against available balance
     new_delivery_items = []
     for item in payload.items:
-        item_name = item.item_name
+        key = _item_key(item.item_name, item.specification)
         req_qty = item.quantity
 
-        if item_name not in received_map:
+        if key not in received_map:
+            detail_msg = f"Item '{item.item_name}'"
+            if item.specification:
+                detail_msg += f" ({item.specification})"
+            detail_msg += " was not received in the original Gate Pass."
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Item '{item_name}' was not received in the original Gate Pass.",
+                detail=detail_msg,
             )
 
-        actual_rec = received_map[item_name]
-        already_del = delivered_map.get(item_name, 0)
+        actual_rec = received_map[key]
+        already_del = delivered_map.get(key, 0)
         available = actual_rec - already_del
 
         if req_qty > available:
+            detail_msg = f"Cannot deliver {req_qty} of '{item.item_name}'"
+            if item.specification:
+                detail_msg += f" ({item.specification})"
+            detail_msg += f". Only {available} available (Received: {actual_rec}, Already delivered: {already_del})."
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Cannot deliver {req_qty} of '{item_name}'. "
-                    f"Only {available} available (Received: {actual_rec}, Already delivered: {already_del})."
-                ),
+                detail=detail_msg,
             )
 
         new_delivery_items.append(
             {
-                "item_name": item_name,
+                "item_name": item.item_name,
+                "specification": item.specification,
                 "quantity": req_qty,
             }
         )
@@ -154,12 +164,12 @@ async def create_delivery(
     # Recalculate combined delivered maps after this successful write
     updated_delivered_map = delivered_map.copy()
     for item in new_delivery_items:
-        name = item["item_name"]
-        updated_delivered_map[name] = updated_delivered_map.get(name, 0) + item["quantity"]
+        key = _item_key(item["item_name"], item.get("specification"))
+        updated_delivered_map[key] = updated_delivered_map.get(key, 0) + item["quantity"]
 
     fully_delivered = True
-    for item_name, rec_qty in received_map.items():
-        del_qty = updated_delivered_map.get(item_name, 0)
+    for key, rec_qty in received_map.items():
+        del_qty = updated_delivered_map.get(key, 0)
         if del_qty < rec_qty:
             fully_delivered = False
             break
