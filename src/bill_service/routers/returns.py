@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from ..auth_helper import require_capability
 from ..database.main_db import returns_collection, gatepasses_collection, deliveries_collection
 from ..models import ReturnCreate, ReturnUpdate, RETURN_STATUSES
-from ..router_utils import parse_object_id, serialize, log_audit, get_search_token
+from ..router_utils import parse_object_id, serialize, log_audit
+from ..crypto_helper import get_search_token
 
 router = APIRouter(tags=["Returns"])
 
