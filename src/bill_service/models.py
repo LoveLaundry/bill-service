@@ -424,3 +424,61 @@ class LinenListParams(BaseModel):
     sort_order: str = "desc"
     skip: int = 0
     limit: int = 50
+
+
+# --- Garment Returns ---
+
+RETURN_REASONS = ["WRONG_ITEM", "DAMAGED", "MISSING", "OTHER"]
+RETURN_CONDITIONS = ["GOOD", "DAMAGED", "STAINED", "LOST"]
+RETURN_ACTIONS = ["RECEIVE_BACK", "RE_WASH", "DISCARD", "COMPENSATE"]
+RETURN_ADJUSTMENT_TYPES = ["NONE", "QUANTITY_REDUCE", "AMOUNT_REDUCE", "COMPENSATE"]
+RETURN_STATUSES = ["PENDING", "RECEIVED", "PROCESSED"]
+
+
+class ReturnItem(BaseModel):
+    item_name: str
+    specification: Optional[str] = None
+    returned_qty: int = Field(gt=0)
+    reason: str  # WRONG_ITEM, DAMAGED, MISSING, OTHER
+    condition: str = "GOOD"  # GOOD, DAMAGED, STAINED, LOST
+    action: str = "RECEIVE_BACK"  # RECEIVE_BACK, RE_WASH, DISCARD, COMPENSATE
+    notes: Optional[str] = None
+
+
+class BillAdjustment(BaseModel):
+    adjustment_type: str = "NONE"  # NONE, QUANTITY_REDUCE, AMOUNT_REDUCE, COMPENSATE
+    amount: float = 0.0
+    notes: Optional[str] = None
+
+
+class ReturnCreate(BaseModel):
+    gate_pass_id: str
+    delivery_id: Optional[str] = None
+    client_name: str
+    items: List[ReturnItem] = Field(min_length=1)
+    bill_adjustment: Optional[BillAdjustment] = None
+    notes: Optional[str] = None
+
+
+class ReturnUpdate(BaseModel):
+    status: Optional[str] = None
+    items: Optional[List[ReturnItem]] = None
+    bill_adjustment: Optional[BillAdjustment] = None
+    notes: Optional[str] = None
+
+
+class ReturnModel(BaseModel):
+    id: Optional[PyObjectId] = Field(alias="_id", default=None)
+    return_id: str
+    gate_pass_id: str
+    delivery_id: Optional[str] = None
+    client_name: str
+    client_name_search: Optional[str] = None
+    items: List[ReturnItem]
+    bill_adjustment: Optional[BillAdjustment] = None
+    status: str = "PENDING"
+    recorded_by: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    model_config = ConfigDict(populate_by_name=True)

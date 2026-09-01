@@ -20,6 +20,7 @@ loyalty_collection: AsyncIOMotorCollection = _db.get_collection("loyalty_account
 audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
 linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
 linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
+returns_collection: AsyncIOMotorCollection = _db.get_collection("returns")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")
@@ -77,6 +78,13 @@ async def ensure_indexes():
     await linen_events_collection.create_index("linen_id")
     await linen_events_collection.create_index("timestamp")
     await linen_events_collection.create_index([("linen_id", 1), ("timestamp", -1)])
+
+    # Returns indexes
+    await returns_collection.create_index("return_id", unique=True)
+    await returns_collection.create_index("gate_pass_id")
+    await returns_collection.create_index("client_name_search")
+    await returns_collection.create_index("status")
+    await returns_collection.create_index("created_at")
 
     # Sync infrastructure indexes
     await sync_status_collection.create_index([("entity", 1), ("record_id", 1)], unique=True)
