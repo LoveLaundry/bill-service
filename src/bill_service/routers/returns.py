@@ -8,12 +8,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from ..auth_helper import require_capability
 from ..database.main_db import returns_collection, gatepasses_collection, deliveries_collection
 from ..models import ReturnCreate, ReturnUpdate, RETURN_STATUSES
-from ..router_utils import parse_object_id, serialize, log_audit
-from ..crypto_helper import get_search_token
+from ..router_utils import parse_object_id, log_audit
+from ..crypto_helper import get_search_token, encrypt_dict, decrypt_dict
 
 router = APIRouter(tags=["Returns"])
 
 SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+
+
+def _dec(doc: dict) -> dict:
+    """Decrypt and convert _id to id."""
+    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+    if "_id" in decrypted:
+        decrypted["id"] = str(decrypted["_id"])
+        del decrypted["_id"]
+    return decrypted
 
 
 def _generate_return_id() -> str:
@@ -49,7 +58,6 @@ async def create_return(
         "gate_pass_id": payload.gate_pass_id,
         "delivery_id": payload.delivery_id,
         "client_name": payload.client_name.strip(),
-        "client_name_search": get_search_token(payload.client_name),
         "items": [item.model_dump() for item in payload.items],
         "bill_adjustment": payload.bill_adjustment.model_dump() if payload.bill_adjustment else None,
         "status": "PENDING",
@@ -59,7 +67,8 @@ async def create_return(
         "updated_at": now,
     }
 
-    result = await returns_collection.insert_one(doc)
+    encrypted = encrypt_dict(doc, SENSITIVE_FIELDS)
+    result = await returns_collection.insert_one(encrypted)
     doc["_id"] = str(result.inserted_id)
 
     await log_audit(
@@ -70,7 +79,7 @@ async def create_return(
         details={"return_id": return_id, "client": payload.client_name, "items": len(payload.items)},
     )
 
-    return serialize(doc, SENSITIVE_FIELDS)
+    return _dec(doc)
 
 
 @router.get("/returns")
@@ -95,7 +104,7 @@ async def list_returns(
     cursor = returns_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
     items = []
     async for doc in cursor:
-        items.append(serialize(doc, SENSITIVE_FIELDS))
+        items.append(_dec(doc))
 
     return {"items": items, "total": total}
 
@@ -109,7 +118,7 @@ async def get_return(
     doc = await returns_collection.find_one({"return_id": return_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Return not found")
-    return serialize(doc, SENSITIVE_FIELDS)
+    return _dec(doc)
 
 
 @router.patch("/returns/{return_id}")
@@ -153,7 +162,7 @@ async def update_return(
     )
 
     updated = await returns_collection.find_one({"return_id": return_id})
-    return serialize(updated, SENSITIVE_FIELDS)
+    return _dec(updated)
 
 
 @router.get("/returns/stats/summary")
@@ -216,7 +225,7 @@ async def mark_item_resent(
     )
 
     updated = await returns_collection.find_one({"return_id": return_id})
-    return serialize(updated, SENSITIVE_FIELDS)
+    return _dec(updated)
 
 
 @router.get("/returns/pending-resent")
@@ -235,7 +244,7 @@ async def pending_resent_items(
     cursor = returns_collection.find(query).sort("created_at", -1)
     results = []
     async for doc in cursor:
-        ser = serialize(doc, SENSITIVE_FIELDS)
+        ser = _dec(doc)
         # Filter to only pending items
         pending_items = [
             item for item in ser.get("items", [])
