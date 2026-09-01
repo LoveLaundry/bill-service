@@ -12,6 +12,8 @@ from ..router_utils import parse_object_id, serialize, log_audit, get_search_tok
 
 router = APIRouter(tags=["Returns"])
 
+SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+
 
 def _generate_return_id() -> str:
     alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
@@ -60,12 +62,14 @@ async def create_return(
     doc["_id"] = str(result.inserted_id)
 
     await log_audit(
-        "return", "create", str(result.inserted_id),
-        user=current_user.get("user_name"),
+        current_user.get("user_name", ""),
+        "create",
+        "return",
+        str(result.inserted_id),
         details={"return_id": return_id, "client": payload.client_name, "items": len(payload.items)},
     )
 
-    return serialize(doc)
+    return serialize(doc, SENSITIVE_FIELDS)
 
 
 @router.get("/returns")
@@ -90,7 +94,7 @@ async def list_returns(
     cursor = returns_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
     items = []
     async for doc in cursor:
-        items.append(serialize(doc))
+        items.append(serialize(doc, SENSITIVE_FIELDS))
 
     return {"items": items, "total": total}
 
@@ -104,7 +108,7 @@ async def get_return(
     doc = await returns_collection.find_one({"return_id": return_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Return not found")
-    return serialize(doc)
+    return serialize(doc, SENSITIVE_FIELDS)
 
 
 @router.patch("/returns/{return_id}")
@@ -140,13 +144,15 @@ async def update_return(
     await returns_collection.update_one({"return_id": return_id}, {"$set": update_fields})
 
     await log_audit(
-        "return", "update", str(doc["_id"]),
-        user=current_user.get("user_name"),
+        current_user.get("user_name", ""),
+        "update",
+        "return",
+        str(doc["_id"]),
         details={"return_id": return_id, "changes": list(update_fields.keys())},
     )
 
     updated = await returns_collection.find_one({"return_id": return_id})
-    return serialize(updated)
+    return serialize(updated, SENSITIVE_FIELDS)
 
 
 @router.get("/returns/stats/summary")
