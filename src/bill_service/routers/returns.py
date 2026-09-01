@@ -17,8 +17,11 @@ SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 
 
 def _dec(doc: dict) -> dict:
-    """Decrypt and convert _id to id."""
-    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+    """Decrypt and convert _id to id. Handles unencrypted legacy docs gracefully."""
+    try:
+        decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+    except (ValueError, KeyError):
+        decrypted = {k: v for k, v in doc.items() if k != "encryption_metadata" and not k.endswith("_search")}
     if "_id" in decrypted:
         decrypted["id"] = str(decrypted["_id"])
         del decrypted["_id"]

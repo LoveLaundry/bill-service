@@ -70,26 +70,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    origin = request.headers.get("origin", "")
+    cors_headers = {}
+    if origin in ALLOWED_ORIGINS:
+        cors_headers = {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+
     if isinstance(exc, HTTPException):
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.detail},
+            headers=cors_headers,
         )
+
     logger.error(f"Unhandled exception: {exc}\n{traceback.format_exc()}")
-    origin = request.headers.get("origin", "")
-    headers = {}
-    if origin in ALLOWED_ORIGINS:
-        headers["Access-Control-Allow-Origin"] = origin
-        headers["Access-Control-Allow-Credentials"] = "true"
-        headers["Access-Control-Allow-Methods"] = "*"
-        headers["Access-Control-Allow-Headers"] = "*"
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error. Please try again later."},
-        headers=headers,
+        headers=cors_headers,
     )
 
 app.include_router(bills_router)
