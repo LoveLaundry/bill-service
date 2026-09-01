@@ -202,8 +202,11 @@ async def update_return(
     if payload.notes is not None:
         update_fields["notes"] = payload.notes
 
-    encrypted_update = encrypt_dict(update_fields, SENSITIVE_FIELDS)
-    await returns_collection.update_one({"return_id": return_id}, {"$set": encrypted_update})
+    # Merge with existing decrypted doc, then re-encrypt entire document
+    merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+    merged.update(update_fields)
+    encrypted = encrypt_dict(merged, SENSITIVE_FIELDS)
+    await returns_collection.update_one({"return_id": return_id}, {"$set": encrypted})
 
     await log_audit(
         current_user.get("user_name", ""),
@@ -248,10 +251,14 @@ async def mark_item_resent(
     if not found:
         raise HTTPException(status_code=400, detail="Item not found or not eligible for resend")
 
-    encrypted_update = encrypt_dict({"items": updated_items, "updated_at": now}, SENSITIVE_FIELDS)
+    # Merge updated items with full decrypted doc, then re-encrypt everything
+    merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+    merged["items"] = updated_items
+    merged["updated_at"] = now
+    encrypted = encrypt_dict(merged, SENSITIVE_FIELDS)
     await returns_collection.update_one(
         {"return_id": return_id},
-        {"$set": encrypted_update},
+        {"$set": encrypted},
     )
 
     await log_audit(
