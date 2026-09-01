@@ -852,14 +852,14 @@ async def yearly_trend(
 async def today_deliveries(
     current_user: dict = Depends(require_capability("dashboard:read")),
 ):
-    """Today's delivery breakdown by client with pending items."""
+    """Today's delivery breakdown by client with pending items from ALL open gate passes."""
     from datetime import timedelta as td
 
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today_start + td(days=1)
 
-    # Step 1: Get today's deliveries grouped by client, collect gate_pass_ids
+    # Step 1: Get today's deliveries grouped by client
     client_map: Dict[str, dict] = {}
 
     del_cursor = deliveries_collection.find({
@@ -877,7 +877,6 @@ async def today_deliveries(
                     "client_name": client,
                     "items": {},
                     "total_qty": 0,
-                    "gate_pass_ids": set(),
                 }
             for item in dl.get("items", []):
                 item_name = item.get("item_name", "")
@@ -892,21 +891,17 @@ async def today_deliveries(
                     }
                 client_map[client]["items"][detail_key]["quantity"] += qty
                 client_map[client]["total_qty"] += qty
-            gp_id = dl.get("gate_pass_id")
-            if gp_id:
-                client_map[client]["gate_pass_ids"].add(gp_id)
         except Exception:
             continue
 
-    # Step 2: For each client, get ONLY their gate passes involved in today's deliveries
+    # Step 2: For each client with today's deliveries, get ALL open gate passes
     for client, data in client_map.items():
-        gp_ids = list(data["gate_pass_ids"])
-        if not gp_ids:
-            continue
-
-        # Get received qty from those gate passes
+        # Get ALL open gate passes for this client (not just today's)
         received_map: Dict[str, dict] = {}
-        gp_cursor = gatepasses_collection.find({"_id": {"$in": [ObjectId(gid) for gid in gp_ids if ObjectId.is_valid(gid)]}})
+        gp_cursor = gatepasses_collection.find({
+            "client_name_search": get_search_token(client),
+            "status": {"$ne": "CANCELLED"},
+        })
         async for doc in gp_cursor:
             try:
                 gp = _decrypt_gp(doc)
@@ -921,10 +916,10 @@ async def today_deliveries(
             except Exception:
                 continue
 
-        # Get delivered qty from ALL deliveries for these gate passes (not just today)
+        # Get ALL delivered qty for this client across ALL gate passes
         delivered_map: Dict[str, int] = {}
         del_cursor2 = deliveries_collection.find({
-            "gate_pass_id": {"$in": gp_ids},
+            "client_name_search": get_search_token(client),
             "status": {"$ne": "CANCELLED"},
         })
         async for doc in del_cursor2:
@@ -939,7 +934,7 @@ async def today_deliveries(
             except Exception:
                 continue
 
-        # Calculate pending = received - delivered
+        # Calculate pending = total received (all open GPs) - total delivered (all time)
         pending_items = []
         for dk, recv in received_map.items():
             del_qty = delivered_map.get(dk, 0)
@@ -954,14 +949,13 @@ async def today_deliveries(
                 })
         data["pending_items"] = pending_items
 
-    # Build result (remove internal gate_pass_ids)
+    # Build result
     results = []
     for client, data in client_map.items():
         results.append({
             "client_name": client,
             "delivered_items": list(data["items"].values()),
             "total_qty": data["total_qty"],
-            "gate_pass_count": len(data["gate_pass_ids"]),
             "pending_items": data.get("pending_items", []),
         })
 
