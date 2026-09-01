@@ -846,6 +846,134 @@ async def yearly_trend(
     return months
 
 
+# ── Today's Deliveries ────────────────────────────────────────────────────────
+
+@router.get("/dashboard/today-deliveries")
+async def today_deliveries(
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
+    """Today's delivery breakdown by client with current balance."""
+    from datetime import timedelta as td
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + td(days=1)
+
+    # Aggregate today's deliveries by client
+    client_map: Dict[str, dict] = {}
+
+    del_cursor = deliveries_collection.find({
+        "created_at": {"$gte": today_start, "$lt": today_end},
+        "status": {"$ne": "CANCELLED"},
+    })
+    async for doc in del_cursor:
+        try:
+            dl = _decrypt_del(doc)
+            client = dl.get("client_name", "").strip()
+            if not client:
+                continue
+            if client not in client_map:
+                client_map[client] = {
+                    "client_name": client,
+                    "items": {},
+                    "total_qty": 0,
+                    "gate_pass_ids": set(),
+                }
+            for item in dl.get("items", []):
+                item_name = item.get("item_name", "")
+                spec = item.get("specification") or ""
+                qty = item.get("quantity", 0)
+                detail_key = f"{item_name}||{spec}" if spec else item_name
+                if detail_key not in client_map[client]["items"]:
+                    client_map[client]["items"][detail_key] = {
+                        "item_name": item_name,
+                        "specification": spec,
+                        "quantity": 0,
+                    }
+                client_map[client]["items"][detail_key]["quantity"] += qty
+                client_map[client]["total_qty"] += qty
+            gp_id = dl.get("gate_pass_id")
+            if gp_id:
+                client_map[client]["gate_pass_ids"].add(gp_id)
+        except Exception:
+            continue
+
+    # Get outstanding balance per client
+    bill_cursor = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}})
+    async for doc in bill_cursor:
+        try:
+            bill = _decrypt_bill(doc)
+            client = bill.get("client_name", "").strip()
+            if client in client_map:
+                client_map[client]["outstanding"] = client_map[client].get("outstanding", 0) + (bill.get("outstanding_amount", 0) or 0)
+        except Exception:
+            continue
+
+    # Get pending items per client (from all open gate passes)
+    gp_cursor = gatepasses_collection.find({"status": {"$ne": "CANCELLED"}})
+    async for doc in gp_cursor:
+        try:
+            gp = _decrypt_gp(doc)
+            client = gp.get("client_name", "").strip()
+            if client not in client_map:
+                continue
+            for item in gp.get("items", []):
+                item_name = item.get("item_name", "")
+                spec = item.get("specification") or ""
+                received = item.get("received_qty", 0)
+                detail_key = f"{item_name}||{spec}" if spec else item_name
+                if detail_key not in client_map[client].get("pending_items", {}):
+                    client_map[client].setdefault("pending_items", {})[detail_key] = {
+                        "item_name": item_name,
+                        "specification": spec,
+                        "received": 0,
+                        "delivered": 0,
+                    }
+                client_map[client]["pending_items"][detail_key]["received"] += received
+        except Exception:
+            continue
+
+    # Subtract delivered quantities from pending
+    del_cursor2 = deliveries_collection.find({"status": {"$ne": "CANCELLED"}})
+    async for doc in del_cursor2:
+        try:
+            dl = _decrypt_del(doc)
+            client = dl.get("client_name", "").strip()
+            if client not in client_map:
+                continue
+            for item in dl.get("items", []):
+                item_name = item.get("item_name", "")
+                spec = item.get("specification") or ""
+                qty = item.get("quantity", 0)
+                detail_key = f"{item_name}||{spec}" if spec else item_name
+                if detail_key in client_map.get(client, {}).get("pending_items", {}):
+                    client_map[client]["pending_items"][detail_key]["delivered"] += qty
+        except Exception:
+            continue
+
+    # Build result
+    results = []
+    for client, data in client_map.items():
+        items_list = list(data["items"].values())
+        pending_items = []
+        for pi in data.get("pending_items", {}).values():
+            pi["pending"] = max(0, pi["received"] - pi["delivered"])
+            if pi["pending"] > 0:
+                pending_items.append(pi)
+
+        results.append({
+            "client_name": client,
+            "delivered_items": items_list,
+            "total_qty": data["total_qty"],
+            "gate_pass_count": len(data.get("gate_pass_ids", set())),
+            "outstanding": round(data.get("outstanding", 0), 2),
+            "pending_items": pending_items,
+        })
+
+    results.sort(key=lambda x: x["total_qty"], reverse=True)
+    return results
+
+
 # ── CSV Export ────────────────────────────────────────────────────────────────
 
 
