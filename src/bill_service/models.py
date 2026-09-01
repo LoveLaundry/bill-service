@@ -1,5 +1,5 @@
 from pydantic import AliasChoices
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, List, Optional
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
