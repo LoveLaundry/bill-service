@@ -443,6 +443,8 @@ class ReturnItem(BaseModel):
     condition: str = "GOOD"  # GOOD, DAMAGED, STAINED, LOST
     action: str = "RECEIVE_BACK"  # RECEIVE_BACK, RE_WASH, DISCARD, COMPENSATE
     notes: Optional[str] = None
+    resend_status: Optional[str] = None  # PENDING, SENT (for RECEIVE_BACK/RE_WASH items)
+    resent_at: Optional[datetime] = None
 
 
 class BillAdjustment(BaseModel):

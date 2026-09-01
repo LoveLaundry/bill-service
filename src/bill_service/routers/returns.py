@@ -171,3 +171,83 @@ async def returns_summary(
         "received": received,
         "processed": processed,
     }
+
+
+@router.post("/returns/{return_id}/resent")
+async def mark_item_resent(
+    return_id: str,
+    item_name: str,
+    specification: str = "",
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    """Mark a returned item as re-sent to client."""
+    doc = await returns_collection.find_one({"return_id": return_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Return not found")
+
+    now = datetime.now(timezone.utc)
+    updated_items = []
+    found = False
+    for item in doc.get("items", []):
+        if (
+            item.get("item_name") == item_name
+            and item.get("specification", "") == specification
+            and item.get("action") in ("RECEIVE_BACK", "RE_WASH")
+        ):
+            item["resend_status"] = "SENT"
+            item["resent_at"] = now.isoformat()
+            found = True
+        updated_items.append(item)
+
+    if not found:
+        raise HTTPException(status_code=400, detail="Item not found or not eligible for resend")
+
+    await returns_collection.update_one(
+        {"return_id": return_id},
+        {"$set": {"items": updated_items, "updated_at": now}},
+    )
+
+    await log_audit(
+        current_user.get("user_name", ""),
+        "resent",
+        "return",
+        str(doc["_id"]),
+        details={"return_id": return_id, "item": item_name, "spec": specification},
+    )
+
+    updated = await returns_collection.find_one({"return_id": return_id})
+    return serialize(updated, SENSITIVE_FIELDS)
+
+
+@router.get("/returns/pending-resent")
+async def pending_resent_items(
+    client_name: Optional[str] = Query(None),
+    current_user: dict = Depends(require_capability("gatepass:read")),
+):
+    """Get all returned items pending resend to clients."""
+    query: dict = {
+        "items.action": {"$in": ["RECEIVE_BACK", "RE_WASH"]},
+        "items.resend_status": {"$ne": "SENT"},
+    }
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+
+    cursor = returns_collection.find(query).sort("created_at", -1)
+    results = []
+    async for doc in cursor:
+        ser = serialize(doc, SENSITIVE_FIELDS)
+        # Filter to only pending items
+        pending_items = [
+            item for item in ser.get("items", [])
+            if item.get("action") in ("RECEIVE_BACK", "RE_WASH")
+            and item.get("resend_status") != "SENT"
+        ]
+        if pending_items:
+            results.append({
+                "return_id": ser["return_id"],
+                "client_name": ser["client_name"],
+                "items": pending_items,
+                "created_at": ser["created_at"],
+            })
+
+    return results
