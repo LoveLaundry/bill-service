@@ -14,6 +14,7 @@ from ..database.main_db import (
     deliveries_collection,
     gatepasses_collection,
     payments_collection,
+    returns_collection,
 )
 
 router = APIRouter(tags=["dashboard"])
@@ -935,16 +936,40 @@ async def today_deliveries(
                 continue
 
         # Calculate pending = total received (all open GPs) - total delivered (all time)
+        # Returned items with action RECEIVE_BACK/RE_WASH need to be re-sent, so they count as pending
+        returned_map: Dict[str, int] = {}
+        ret_cursor = returns_collection.find({
+            "client_name_search": get_search_token(client),
+        })
+        async for ret_doc in ret_cursor:
+            try:
+                try:
+                    ret_dec = decrypt_dict(ret_doc, SENSITIVE_FIELDS_GP)
+                except (ValueError, KeyError):
+                    ret_dec = ret_doc
+                for item in ret_doc.get("items", []) if isinstance(ret_doc.get("items"), list) else []:
+                    if isinstance(item, dict) and item.get("action") in ("RECEIVE_BACK", "RE_WASH") and item.get("resend_status") != "SENT":
+                        item_name = item.get("item_name", "")
+                        spec = item.get("specification") or ""
+                        qty = item.get("returned_qty", 0)
+                        detail_key = f"{item_name}||{spec}" if spec else item_name
+                        returned_map[detail_key] = returned_map.get(detail_key, 0) + qty
+            except Exception:
+                continue
+
         pending_items = []
         for dk, recv in received_map.items():
             del_qty = delivered_map.get(dk, 0)
-            pending = max(0, recv["received"] - del_qty)
+            ret_qty = returned_map.get(dk, 0)
+            # Items returned by client that need re-sending are pending
+            pending = max(0, recv["received"] - del_qty + ret_qty)
             if pending > 0:
                 pending_items.append({
                     "item_name": recv["item_name"],
                     "specification": recv["specification"],
                     "received": recv["received"],
                     "delivered": del_qty,
+                    "returned": ret_qty,
                     "pending": pending,
                 })
         data["pending_items"] = pending_items
