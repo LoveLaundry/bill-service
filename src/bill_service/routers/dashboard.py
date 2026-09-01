@@ -852,14 +852,14 @@ async def yearly_trend(
 async def today_deliveries(
     current_user: dict = Depends(require_capability("dashboard:read")),
 ):
-    """Today's delivery breakdown by client with current balance."""
+    """Today's delivery breakdown by client with pending items."""
     from datetime import timedelta as td
 
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today_start + td(days=1)
 
-    # Aggregate today's deliveries by client
+    # Step 1: Get today's deliveries grouped by client, collect gate_pass_ids
     client_map: Dict[str, dict] = {}
 
     del_cursor = deliveries_collection.find({
@@ -898,76 +898,71 @@ async def today_deliveries(
         except Exception:
             continue
 
-    # Get outstanding balance per client
-    bill_cursor = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}})
-    async for doc in bill_cursor:
-        try:
-            bill = _decrypt_bill(doc)
-            client = bill.get("client_name", "").strip()
-            if client in client_map:
-                client_map[client]["outstanding"] = client_map[client].get("outstanding", 0) + (bill.get("outstanding_amount", 0) or 0)
-        except Exception:
+    # Step 2: For each client, get ONLY their gate passes involved in today's deliveries
+    for client, data in client_map.items():
+        gp_ids = list(data["gate_pass_ids"])
+        if not gp_ids:
             continue
 
-    # Get pending items per client (from all open gate passes)
-    gp_cursor = gatepasses_collection.find({"status": {"$ne": "CANCELLED"}})
-    async for doc in gp_cursor:
-        try:
-            gp = _decrypt_gp(doc)
-            client = gp.get("client_name", "").strip()
-            if client not in client_map:
+        # Get received qty from those gate passes
+        received_map: Dict[str, dict] = {}
+        gp_cursor = gatepasses_collection.find({"_id": {"$in": [ObjectId(gid) for gid in gp_ids if ObjectId.is_valid(gid)]}})
+        async for doc in gp_cursor:
+            try:
+                gp = _decrypt_gp(doc)
+                for item in gp.get("items", []):
+                    item_name = item.get("item_name", "")
+                    spec = item.get("specification") or ""
+                    qty = item.get("received_qty", 0)
+                    detail_key = f"{item_name}||{spec}" if spec else item_name
+                    if detail_key not in received_map:
+                        received_map[detail_key] = {"item_name": item_name, "specification": spec, "received": 0}
+                    received_map[detail_key]["received"] += qty
+            except Exception:
                 continue
-            for item in gp.get("items", []):
-                item_name = item.get("item_name", "")
-                spec = item.get("specification") or ""
-                received = item.get("received_qty", 0)
-                detail_key = f"{item_name}||{spec}" if spec else item_name
-                if detail_key not in client_map[client].get("pending_items", {}):
-                    client_map[client].setdefault("pending_items", {})[detail_key] = {
-                        "item_name": item_name,
-                        "specification": spec,
-                        "received": 0,
-                        "delivered": 0,
-                    }
-                client_map[client]["pending_items"][detail_key]["received"] += received
-        except Exception:
-            continue
 
-    # Subtract delivered quantities from pending
-    del_cursor2 = deliveries_collection.find({"status": {"$ne": "CANCELLED"}})
-    async for doc in del_cursor2:
-        try:
-            dl = _decrypt_del(doc)
-            client = dl.get("client_name", "").strip()
-            if client not in client_map:
+        # Get delivered qty from ALL deliveries for these gate passes (not just today)
+        delivered_map: Dict[str, int] = {}
+        del_cursor2 = deliveries_collection.find({
+            "gate_pass_id": {"$in": gp_ids},
+            "status": {"$ne": "CANCELLED"},
+        })
+        async for doc in del_cursor2:
+            try:
+                dl = _decrypt_del(doc)
+                for item in dl.get("items", []):
+                    item_name = item.get("item_name", "")
+                    spec = item.get("specification") or ""
+                    qty = item.get("quantity", 0)
+                    detail_key = f"{item_name}||{spec}" if spec else item_name
+                    delivered_map[detail_key] = delivered_map.get(detail_key, 0) + qty
+            except Exception:
                 continue
-            for item in dl.get("items", []):
-                item_name = item.get("item_name", "")
-                spec = item.get("specification") or ""
-                qty = item.get("quantity", 0)
-                detail_key = f"{item_name}||{spec}" if spec else item_name
-                if detail_key in client_map.get(client, {}).get("pending_items", {}):
-                    client_map[client]["pending_items"][detail_key]["delivered"] += qty
-        except Exception:
-            continue
 
-    # Build result
+        # Calculate pending = received - delivered
+        pending_items = []
+        for dk, recv in received_map.items():
+            del_qty = delivered_map.get(dk, 0)
+            pending = max(0, recv["received"] - del_qty)
+            if pending > 0:
+                pending_items.append({
+                    "item_name": recv["item_name"],
+                    "specification": recv["specification"],
+                    "received": recv["received"],
+                    "delivered": del_qty,
+                    "pending": pending,
+                })
+        data["pending_items"] = pending_items
+
+    # Build result (remove internal gate_pass_ids)
     results = []
     for client, data in client_map.items():
-        items_list = list(data["items"].values())
-        pending_items = []
-        for pi in data.get("pending_items", {}).values():
-            pi["pending"] = max(0, pi["received"] - pi["delivered"])
-            if pi["pending"] > 0:
-                pending_items.append(pi)
-
         results.append({
             "client_name": client,
-            "delivered_items": items_list,
+            "delivered_items": list(data["items"].values()),
             "total_qty": data["total_qty"],
-            "gate_pass_count": len(data.get("gate_pass_ids", set())),
-            "outstanding": round(data.get("outstanding", 0), 2),
-            "pending_items": pending_items,
+            "gate_pass_count": len(data["gate_pass_ids"]),
+            "pending_items": data.get("pending_items", []),
         })
 
     results.sort(key=lambda x: x["total_qty"], reverse=True)
