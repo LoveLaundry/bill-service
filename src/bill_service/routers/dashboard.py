@@ -53,6 +53,42 @@ def _decrypt_pay(doc: dict) -> dict:
     return dec
 
 
+async def _get_returned_items_by_client() -> Dict[str, Dict[str, int]]:
+    """Fetch all returns and build a map of client_name → {item_name → returned_qty}.
+
+    Only includes items with action RECEIVE_BACK/RE_WASH that haven't been
+    re-sent yet (resend_status != SENT). These count as pending items
+    because they must be sent back to the client.
+    """
+    returned: Dict[str, Dict[str, int]] = {}
+    ret_cursor = returns_collection.find()
+    async for ret_doc in ret_cursor:
+        try:
+            try:
+                ret = decrypt_dict(ret_doc, SENSITIVE_FIELDS_GP)
+            except (ValueError, KeyError):
+                ret = ret_doc
+            client = ret.get("client_name", "").strip()
+            if not client:
+                continue
+            if client not in returned:
+                returned[client] = {}
+            for item in ret.get("items", []):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("action") not in ("RECEIVE_BACK", "RE_WASH"):
+                    continue
+                if item.get("resend_status") == "SENT":
+                    continue
+                name = item.get("item_name", "")
+                qty = int(item.get("returned_qty", 0) or 0)
+                if qty > 0:
+                    returned[client][name] = returned[client].get(name, 0) + qty
+        except Exception:
+            continue
+    return returned
+
+
 # --- 1. Client Dashboard Summary ---
 @router.get(
     "/dashboard/client-summary",
@@ -140,9 +176,17 @@ async def get_client_summary(client_name: str = Query(...)):
                 balances_map[name] = {"received": 0, "delivered": 0, "pending": 0}
             balances_map[name]["delivered"] += qty
 
+    # Add returned items to pending — items returned by client need re-sending
+    returned_by_client = await _get_returned_items_by_client()
+    returned_global: Dict[str, int] = {}
+    for client_items in returned_by_client.values():
+        for name, qty in client_items.items():
+            returned_global[name] = returned_global.get(name, 0) + qty
+
     pending_items_sum = 0
     for name, item_bal in balances_map.items():
-        item_bal["pending"] = max(0, item_bal["received"] - item_bal["delivered"])
+        ret_qty = returned_global.get(name, 0)
+        item_bal["pending"] = max(0, item_bal["received"] - item_bal["delivered"] + ret_qty)
         pending_items_sum += item_bal["pending"]
 
     total_billed = 0.0
@@ -259,6 +303,9 @@ async def get_client_wise_report():
         except Exception:
             continue
 
+    # Fetch returned items per client
+    returned_by_client = await _get_returned_items_by_client()
+
     bill_cursor = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}})
     async for doc in bill_cursor:
         try:
@@ -273,13 +320,17 @@ async def get_client_wise_report():
 
     results = []
     for c_label, stats in clients_map.items():
-        stats["total_pending"] = max(0, stats["total_received"] - stats["total_delivered"])
+        client_returned = returned_by_client.get(c_label, {})
+        total_returned = sum(client_returned.values())
+        stats["total_pending"] = max(0, stats["total_received"] - stats["total_delivered"] + total_returned)
         stats["total_billed"] = round(stats["total_billed"], 2)
         stats["paid_amount"] = round(stats["paid_amount"], 2)
         stats["outstanding"] = round(stats["outstanding"], 2)
         items_list = list(stats.pop("items_detail").values())
         for it in items_list:
-            it["pending"] = max(0, it["received"] - it["delivered"])
+            ret_qty = client_returned.get(it["item_name"], 0)
+            it["returned"] = ret_qty
+            it["pending"] = max(0, it["received"] - it["delivered"] + ret_qty)
         stats["items"] = [it for it in items_list if it["pending"] > 0]
         stats["gate_passes"] = stats.pop("gate_passes", [])
         results.append(stats)
@@ -328,9 +379,18 @@ async def get_item_wise_report():
         except Exception:
             pass
 
+    # Add returned items — returned by client, need re-sending
+    returned_by_client = await _get_returned_items_by_client()
+    returned_global: Dict[str, int] = {}
+    for client_items in returned_by_client.values():
+        for name, qty in client_items.items():
+            returned_global[name] = returned_global.get(name, 0) + qty
+
     results = []
     for name, stats in items_map.items():
-        stats["pending"] = max(0, stats["total_received"] - stats["total_delivered"])
+        ret_qty = returned_global.get(name, 0)
+        stats["returned"] = ret_qty
+        stats["pending"] = max(0, stats["total_received"] - stats["total_delivered"] + ret_qty)
         stats["client_count"] = len(stats["clients"])
         del stats["clients"]  # Remove the set before returning
         results.append(stats)
@@ -579,7 +639,7 @@ def _outstanding(b):
     return max(0.0, b["grand_total"] - b["paid_amount"])
 
 
-def aggregate(bills, gate_passes, deliveries, period):
+def aggregate(bills, gate_passes, deliveries, period, returned_by_client=None):
     revenue = sum(b["grand_total"] for b in bills)
     collected = sum(b["paid_amount"] for b in bills)
     outstanding = sum(_outstanding(b) for b in bills)
@@ -603,7 +663,14 @@ def aggregate(bills, gate_passes, deliveries, period):
         for it in d["items"]:
             m[it["item_name"]] = m.get(it["item_name"], 0) + it["quantity"]
     items_delivered = sum(it["quantity"] for d in deliveries for it in d["items"])
-    items_pending = max(0, items_received - items_delivered)
+
+    # Total returned items (need re-sending)
+    total_returned = 0
+    if returned_by_client:
+        for client_items in returned_by_client.values():
+            total_returned += sum(client_items.values())
+
+    items_pending = max(0, items_received - items_delivered + total_returned)
 
     active_clients = len(set(b["client_name"] for b in bills))
 
@@ -652,11 +719,13 @@ def aggregate(bills, gate_passes, deliveries, period):
     pending_gps = []
     for gp in gate_passes:
         dm = del_map.get(gp["id"], {})
+        client_returned = (returned_by_client or {}).get(gp["client_name"], {})
         pending_detail = []
         total_pending = 0
         for it in gp["items"]:
             delivered = dm.get(it["item_name"], 0)
-            p = max(0, it["received_qty"] - delivered)
+            ret_qty = client_returned.get(it["item_name"], 0)
+            p = max(0, it["received_qty"] - delivered + ret_qty)
             if p > 0:
                 total_pending += p
                 pending_detail.append({
@@ -665,6 +734,7 @@ def aggregate(bills, gate_passes, deliveries, period):
                     "category": it.get("category") or "",
                     "received": it["received_qty"],
                     "delivered": delivered,
+                    "returned": ret_qty,
                     "pending": p,
                 })
         if total_pending > 0:
@@ -715,8 +785,10 @@ async def get_dashboard_summary(
     prev_gps = await _fetch_gate_passes(prev_start, prev_end)
     prev_dels = await _fetch_deliveries([gp["id"] for gp in prev_gps])
 
-    current = aggregate(cur_bills, cur_gps, cur_dels, period)
-    previous = aggregate(prev_bills, prev_gps, prev_dels, period)
+    returned_by_client = await _get_returned_items_by_client()
+
+    current = aggregate(cur_bills, cur_gps, cur_dels, period, returned_by_client)
+    previous = aggregate(prev_bills, prev_gps, prev_dels, period, returned_by_client)
 
     cur_clients = {b["client_name"] for b in cur_bills}
     prev_clients = {b["client_name"] for b in prev_bills}
@@ -947,7 +1019,7 @@ async def today_deliveries(
                     ret_dec = decrypt_dict(ret_doc, SENSITIVE_FIELDS_GP)
                 except (ValueError, KeyError):
                     ret_dec = ret_doc
-                for item in ret_doc.get("items", []) if isinstance(ret_doc.get("items"), list) else []:
+                for item in ret_dec.get("items", []) if isinstance(ret_dec.get("items"), list) else []:
                     if isinstance(item, dict) and item.get("action") in ("RECEIVE_BACK", "RE_WASH") and item.get("resend_status") != "SENT":
                         item_name = item.get("item_name", "")
                         spec = item.get("specification") or ""
