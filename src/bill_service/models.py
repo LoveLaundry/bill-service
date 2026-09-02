@@ -484,3 +484,82 @@ class ReturnModel(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     model_config = ConfigDict(populate_by_name=True)
+
+
+# --- Shop Bills ---
+
+SHOP_BILL_STATUSES = ["PENDING", "PROCESSING", "DELIVERED", "COMPLETED", "CANCELLED"]
+SHOP_PAYMENT_STATUSES = ["DRAFT", "PENDING", "PARTIALLY_PAID", "PAID", "CANCELLED"]
+
+
+class ShopBillItem(BaseModel):
+    item_name: str
+    specification: Optional[str] = None
+    category: Optional[str] = None
+    unit_price: float = Field(ge=0)
+    quantity: int = Field(gt=0)
+    line_total: float = 0.0
+
+
+class ShopBillCreate(BaseModel):
+    bill_number: Optional[str] = None  # auto-generated if not provided
+    client_name: str
+    quotation_id: Optional[str] = None
+    items: List[ShopBillItem] = Field(min_length=1)
+    notes: Optional[str] = None
+    delivery_date: Optional[datetime] = None
+    discounts: Optional[float] = 0.0
+    transport_fee: Optional[float] = 0.0
+    taxes: Optional[float] = 0.0
+
+
+class ShopBillUpdate(BaseModel):
+    status: Optional[str] = None
+    payment_status: Optional[str] = None
+    notes: Optional[str] = None
+    delivery_date: Optional[datetime] = None
+    items: Optional[List[ShopBillItem]] = None
+    discounts: Optional[float] = None
+    transport_fee: Optional[float] = None
+    taxes: Optional[float] = None
+
+
+class ShopBillPayment(BaseModel):
+    amount: float = Field(gt=0)
+    payment_method: str  # CASH, CARD, BANK_TRANSFER, CHEQUE
+    payment_date: datetime
+    reference: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ShopBillModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    bill_number: str
+    client_name: str
+    quotation_id: Optional[str] = None
+    items: List[ShopBillItem]
+    total_quantity: int
+    total_amount: float
+    discounts: float = 0.0
+    transport_fee: float = 0.0
+    taxes: float = 0.0
+    grand_total: float
+    status: str  # PENDING, PROCESSING, DELIVERED, COMPLETED, CANCELLED
+    payment_status: str  # DRAFT, PENDING, PARTIALLY_PAID, PAID, CANCELLED
+    paid_amount: float = 0.0
+    outstanding_amount: float
+    notes: Optional[str] = None
+    delivery_date: Optional[datetime] = None
+    tags: Optional[List[dict]] = []
+    created_at: datetime
+    updated_at: datetime
+
+
+class ShopBillListResponse(BaseModel):
+    items: List[ShopBillModel]
+    total: int

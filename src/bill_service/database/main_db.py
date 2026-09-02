@@ -21,6 +21,7 @@ audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
 linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
 linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
 returns_collection: AsyncIOMotorCollection = _db.get_collection("returns")
+shop_bills_collection: AsyncIOMotorCollection = _db.get_collection("shop_bills")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")
@@ -85,6 +86,13 @@ async def ensure_indexes():
     await returns_collection.create_index("client_name_search")
     await returns_collection.create_index("status")
     await returns_collection.create_index("created_at")
+
+    # Shop Bills indexes
+    await shop_bills_collection.create_index("bill_number", unique=True)
+    await shop_bills_collection.create_index("client_name_search")
+    await shop_bills_collection.create_index("status")
+    await shop_bills_collection.create_index("payment_status")
+    await shop_bills_collection.create_index("created_at")
 
     # Sync infrastructure indexes
     await sync_status_collection.create_index([("entity", 1), ("record_id", 1)], unique=True)
