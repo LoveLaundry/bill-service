@@ -120,6 +120,18 @@ async def list_returns(
     return {"items": items, "total": total}
 
 
+@router.get("/returns/{return_id}")
+async def get_return(
+    return_id: str,
+    current_user: dict = Depends(require_capability("gatepass:read")),
+):
+    """Get a single return by return_id."""
+    raw_doc = await returns_collection.find_one({"return_id": return_id})
+    if not raw_doc:
+        raise HTTPException(status_code=404, detail="Return not found")
+    return _dec(raw_doc)
+
+
 @router.get("/returns/stats/summary")
 async def returns_summary(
     current_user: dict = Depends(require_capability("dashboard:read")),
