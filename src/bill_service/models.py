@@ -498,6 +498,8 @@ class ShopBillItem(BaseModel):
     category: Optional[str] = None
     unit_price: float = Field(ge=0)
     quantity: int = Field(gt=0)
+    discount: float = 0.0
+    discount_type: str = "FIXED"  # FIXED or PERCENT
     line_total: float = 0.0
 
 
@@ -511,6 +513,11 @@ class ShopBillCreate(BaseModel):
     discounts: Optional[float] = 0.0
     transport_fee: Optional[float] = 0.0
     taxes: Optional[float] = 0.0
+    tags: Optional[List[str]] = []
+    is_recurring: Optional[bool] = False
+    recurring_interval: Optional[str] = None  # DAILY, WEEKLY, BIWEEKLY, MONTHLY
+    recurring_end_date: Optional[datetime] = None
+    locked: Optional[bool] = False
 
 
 class ShopBillUpdate(BaseModel):
@@ -522,6 +529,8 @@ class ShopBillUpdate(BaseModel):
     discounts: Optional[float] = None
     transport_fee: Optional[float] = None
     taxes: Optional[float] = None
+    tags: Optional[List[str]] = None
+    locked: Optional[bool] = None
 
 
 class ShopBillPayment(BaseModel):
@@ -554,8 +563,14 @@ class ShopBillModel(BaseModel):
     paid_amount: float = 0.0
     outstanding_amount: float
     notes: Optional[str] = None
+    notes_history: Optional[List[dict]] = []
     delivery_date: Optional[datetime] = None
-    tags: Optional[List[dict]] = []
+    tags: Optional[List[str]] = []
+    locked: bool = False
+    is_recurring: bool = False
+    recurring_interval: Optional[str] = None
+    recurring_end_date: Optional[datetime] = None
+    parent_bill_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -563,3 +578,45 @@ class ShopBillModel(BaseModel):
 class ShopBillListResponse(BaseModel):
     items: List[ShopBillModel]
     total: int
+
+
+class ShopBillBulkStatus(BaseModel):
+    bill_ids: List[str]
+    status: str
+
+
+class ShopBillSplit(BaseModel):
+    item_indices: List[int]  # indices of items to move to new bill
+
+
+class ShopBillMerge(BaseModel):
+    bill_ids: List[str]  # IDs of bills to merge (first bill becomes base)
+
+
+class BillTemplateCreate(BaseModel):
+    name: str
+    client_name: Optional[str] = None
+    items: List[ShopBillItem] = Field(min_length=1)
+    discounts: float = 0.0
+    transport_fee: float = 0.0
+    taxes: float = 0.0
+    notes: Optional[str] = None
+
+
+class BillTemplateModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    name: str
+    client_name: Optional[str] = None
+    items: List[ShopBillItem]
+    discounts: float = 0.0
+    transport_fee: float = 0.0
+    taxes: float = 0.0
+    notes: Optional[str] = None
+    use_count: int = 0
+    created_at: datetime
+    updated_at: datetime
