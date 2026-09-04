@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -10,6 +10,7 @@ from ..database.main_db import (
     audit_collection,
     deliveries_collection,
     gatepasses_collection,
+    returns_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services.verification_service import attach_verification_to
@@ -195,6 +196,118 @@ async def create_delivery(
         serialized["id"],
     )
     return serialized
+
+
+@router.get("/pending-gatepasses")
+async def pending_gatepasses(
+    client_name: Optional[str] = Query(None),
+    current_user: dict = Depends(require_capability("delivery:read")),
+):
+    """Return gate passes with actual pending items (received - delivered + returned).
+
+    Used by the multi-select delivery form to show which gate passes have
+    items that still need to be sent.
+    """
+    query: dict = {"status": {"$nin": ["DELIVERED", "CANCELLED"]}}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+
+    # Pre-fetch all deliveries and returns to compute delivered/returned maps
+    del_cursor = deliveries_collection.find({"status": {"$ne": "CANCELLED"}})
+    all_deliveries: List[dict] = []
+    async for doc in del_cursor:
+        try:
+            all_deliveries.append(decrypt_dict(doc, SENSITIVE_FIELDS))
+        except Exception:
+            continue
+
+    ret_cursor = returns_collection.find()
+    all_returns: List[dict] = []
+    async for doc in ret_cursor:
+        try:
+            all_returns.append(decrypt_dict(doc, GATEPASS_SENSITIVE_FIELDS))
+        except Exception:
+            continue
+
+    # Build delivered map: gate_pass_id → {item_key → qty}
+    delivered_by_gp: Dict[str, Dict[str, int]] = {}
+    for dl in all_deliveries:
+        gp_id = dl.get("gate_pass_id", "")
+        if gp_id not in delivered_by_gp:
+            delivered_by_gp[gp_id] = {}
+        for item in dl.get("items", []):
+            key = f"{item.get('item_name', '')}||{item.get('specification') or ''}"
+            delivered_by_gp[gp_id][key] = delivered_by_gp[gp_id].get(key, 0) + item.get("quantity", 0)
+
+    # Build returned map: client_name → {item_key → qty} for RECEIVE_BACK/RE_WASH not SENT
+    returned_by_client: Dict[str, Dict[str, int]] = {}
+    for ret in all_returns:
+        client = (ret.get("client_name") or "").strip()
+        if not client:
+            continue
+        if client not in returned_by_client:
+            returned_by_client[client] = {}
+        for item in ret.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            if item.get("action") not in ("RECEIVE_BACK", "RE_WASH"):
+                continue
+            if item.get("resend_status") == "SENT":
+                continue
+            name = item.get("item_name", "")
+            spec = item.get("specification") or ""
+            qty = int(item.get("returned_qty", 0) or 0)
+            if qty > 0:
+                key = f"{name}||{spec}"
+                returned_by_client[client][key] = returned_by_client[client].get(key, 0) + qty
+
+    # Process gate passes
+    gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
+    results = []
+    async for doc in gp_cursor:
+        try:
+            gp = decrypt_dict(doc, GATEPASS_SENSITIVE_FIELDS)
+        except Exception:
+            continue
+
+        gp_id = gp.get("id") or str(doc["_id"])
+        client = (gp.get("client_name") or "").strip()
+        del_map = delivered_by_gp.get(gp_id, {})
+        ret_map = returned_by_client.get(client, {})
+
+        items_with_pending = []
+        for gp_item in gp.get("items", []):
+            name = gp_item.get("item_name", "")
+            spec = gp_item.get("specification") or ""
+            key = f"{name}||{spec}"
+            received = gp_item.get("received_qty", 0)
+            delivered = del_map.get(key, 0)
+            returned = ret_map.get(key, 0)
+            pending = max(0, received - delivered + returned)
+            if pending > 0:
+                items_with_pending.append({
+                    "item_name": name,
+                    "specification": spec,
+                    "category": gp_item.get("category") or "",
+                    "received_qty": received,
+                    "delivered_qty": delivered,
+                    "returned_qty": returned,
+                    "pending_qty": pending,
+                })
+
+        if items_with_pending:
+            total_pending = sum(i["pending_qty"] for i in items_with_pending)
+            results.append({
+                "gate_pass_id": gp_id,
+                "gate_pass_number": gp.get("gate_pass_number", ""),
+                "client_name": client,
+                "receiving_date": str(gp.get("receiving_date", ""))[:10],
+                "status": gp.get("status", ""),
+                "total_pending": total_pending,
+                "items": items_with_pending,
+            })
+
+    return results
 
 
 @router.get("", response_model=List[DeliveryModel])
