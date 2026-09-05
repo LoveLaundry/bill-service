@@ -15,6 +15,7 @@ from ..database.main_db import (
     gatepasses_collection,
     payments_collection,
     returns_collection,
+    shop_bills_collection,
 )
 
 router = APIRouter(tags=["dashboard"])
@@ -23,6 +24,7 @@ SENSITIVE_FIELDS_GP = ["client_name", "items", "notes"]
 SENSITIVE_FIELDS_DEL = ["client_name", "items", "notes"]
 SENSITIVE_FIELDS_BILL = ["client_name", "quotation_title", "notes", "items"]
 SENSITIVE_FIELDS_PAY = ["client_name", "notes"]
+SENSITIVE_FIELDS_SHOP_BILL = ["client_name", "items", "notes"]
 
 
 def _decrypt_gp(doc: dict) -> dict:
@@ -48,6 +50,13 @@ def _decrypt_bill(doc: dict) -> dict:
 
 def _decrypt_pay(doc: dict) -> dict:
     dec = decrypt_dict(doc, SENSITIVE_FIELDS_PAY)
+    dec["id"] = str(dec["_id"])
+    del dec["_id"]
+    return dec
+
+
+def _decrypt_shop_bill(doc: dict) -> dict:
+    dec = decrypt_dict(doc, SENSITIVE_FIELDS_SHOP_BILL)
     dec["id"] = str(dec["_id"])
     del dec["_id"]
     return dec
@@ -101,6 +110,7 @@ async def get_client_summary(client_name: str = Query(...)):
     del_cursor = deliveries_collection.find({"client_name_search": token})
     bill_cursor = bills_collection.find({"client_name_search": token})
     pay_cursor = payments_collection.find({"client_name_search": token})
+    sb_cursor = shop_bills_collection.find({"client_name_search": token})
 
     gps = []
     async for d in gp_cursor:
@@ -127,6 +137,13 @@ async def get_client_summary(client_name: str = Query(...)):
     async for d in pay_cursor:
         try:
             payments.append(_decrypt_pay(d))
+        except Exception:
+            pass
+
+    shop_bills = []
+    async for d in sb_cursor:
+        try:
+            shop_bills.append(_decrypt_shop_bill(d))
         except Exception:
             pass
 
@@ -202,6 +219,19 @@ async def get_client_summary(client_name: str = Query(...)):
         if bill.get("payment_status") not in ["PAID"]:
             pending_bills_count += 1
 
+    total_shop_billed = 0.0
+    total_shop_paid = 0.0
+    shop_outstanding = 0.0
+    pending_shop_bills = 0
+    for sb in shop_bills:
+        if sb.get("status") == "CANCELLED":
+            continue
+        total_shop_billed += sb.get("grand_total", 0.0)
+        total_shop_paid += sb.get("paid_amount", 0.0)
+        shop_outstanding += sb.get("outstanding_amount", 0.0)
+        if sb.get("payment_status") not in ["PAID"]:
+            pending_shop_bills += 1
+
     return {
         "stats": {
             "total_gate_passes": len(gps),
@@ -213,17 +243,23 @@ async def get_client_summary(client_name: str = Query(...)):
             "total_billed": round(total_billed, 2),
             "total_paid": round(total_paid, 2),
             "outstanding_amount": round(outstanding_amt, 2),
+            "total_shop_bills": len(shop_bills),
+            "total_shop_billed": round(total_shop_billed, 2),
+            "total_shop_paid": round(total_shop_paid, 2),
+            "shop_outstanding": round(shop_outstanding, 2),
+            "pending_shop_bills": pending_shop_bills,
         },
         "gatepasses": gps,
-        "recent_gate_passes": gps,  # Include both for compatibility
+        "recent_gate_passes": gps,
         "deliveries": deliveries,
         "mismatches": mismatches_list,
         "pending_balances": [
             {"item_name": k, **v} for k, v in balances_map.items()
         ],
         "bills": bills,
-        "recent_bills": bills,  # Include both for compatibility
+        "recent_bills": bills,
         "payments": payments,
+        "shop_bills": shop_bills,
     }
 
 

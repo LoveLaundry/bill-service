@@ -581,7 +581,7 @@ class ShopBillListResponse(BaseModel):
 
 
 class ShopBillBulkStatus(BaseModel):
-    bill_ids: List[str]
+    bill_ids: List[str] = Field(min_length=1)
     status: str
 
 
