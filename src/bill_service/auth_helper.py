@@ -13,6 +13,14 @@ _jwt_secret = _jwt_secret or "CHANGE-ME-IN-PRODUCTION-love-laundry-2026"
 JWT_SECRET = _jwt_secret
 JWT_ALGORITHM = "HS256"
 
+# Track insecure defaults so the health endpoint can report them
+try:
+    from .security import mark_jwt_insecure
+    if not os.getenv("JWT_SECRET"):
+        mark_jwt_insecure()
+except ImportError:
+    pass
+
 security = HTTPBearer()
 
 

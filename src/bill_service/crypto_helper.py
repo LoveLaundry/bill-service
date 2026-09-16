@@ -12,6 +12,14 @@ if not _master_key:
 _master_key = _master_key or "CHANGE-ME-IN-PRODUCTION-love-laundry-2026"
 MASTER_KEY_ENV = _master_key
 
+# Track insecure defaults so the health endpoint can report them
+try:
+    from .security import mark_master_insecure
+    if not os.getenv("MASTER_KEY"):
+        mark_master_insecure()
+except ImportError:
+    pass
+
 # Derive KEK and HMAC Key
 KEK = hashlib.sha256((MASTER_KEY_ENV + "-kek").encode()).digest()
 HMAC_KEY = hashlib.sha256((MASTER_KEY_ENV + "-hmac").encode()).digest()

@@ -2,7 +2,6 @@ import asyncio
 import traceback
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .config import settings
@@ -34,7 +33,6 @@ try:
     ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
     if ALLOWED_ORIGINS_ENV:
         ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
-        ALLOW_CREDENTIALS = True
     else:
         # Production fallback — restrict to known domains
         ALLOWED_ORIGINS = [
@@ -43,13 +41,11 @@ try:
             "http://localhost:5173",
             "http://localhost:3000",
         ]
-        ALLOW_CREDENTIALS = True
 
-    logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}, credentials: {ALLOW_CREDENTIALS}")
+    logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}")
 except Exception as e:
     logger.warning(f"CORS configuration failed, using defaults: {e}")
     ALLOWED_ORIGINS = ["http://localhost:5173"]
-    ALLOW_CREDENTIALS = True
 
 # Vercel sets VERCEL=1; background workers are unreliable in serverless.
 ON_VERCEL = os.getenv("VERCEL") == "1"
@@ -63,13 +59,10 @@ if SENTRY_DSN:
 
 app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from .security import apply_security, insecure_flags
+
+origins = ALLOWED_ORIGINS if settings.cors_origins == ["*"] or not settings.cors_origins else settings.cors_origins
+apply_security(app, rate_limit=300, origins=origins)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -139,4 +132,12 @@ async def shutdown_event():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    flags = insecure_flags()
+    return {
+        "status": "ok",
+        "security": {
+            "headers": True,
+            "rate_limiting": True,
+            "insecure_defaults": flags,
+        },
+    }
