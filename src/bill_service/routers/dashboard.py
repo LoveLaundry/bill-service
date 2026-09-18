@@ -1017,6 +1017,58 @@ async def today_deliveries(
         except Exception:
             continue
 
+    # Step 1b: Gate passes completed via catch-up note (delivery never recorded)
+    # Show them on today's dashboard when the note was added today or the
+    # recorded delivered date falls on today.
+    note_deliveries: Dict[str, List[dict]] = {}
+
+    def _md_in_window(cand) -> bool:
+        if not isinstance(cand, datetime):
+            return False
+        d = cand if cand.tzinfo is None else cand.astimezone(timezone.utc)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return today_start <= d < today_end
+
+    md_cursor = gatepasses_collection.find({"marked_delivered": {"$exists": True}})
+    async for doc in md_cursor:
+        md = doc.get("marked_delivered") or {}
+        if not (_md_in_window(md.get("at")) or _md_in_window(md.get("delivered_date"))):
+            continue
+        try:
+            gp = _decrypt_gp(doc)
+        except Exception:
+            continue
+        client = (gp.get("client_name") or "").strip()
+        if not client:
+            continue
+        if client not in client_map:
+            client_map[client] = {
+                "client_name": client,
+                "items": {},
+                "total_qty": 0,
+            }
+        if client not in note_deliveries:
+            note_deliveries[client] = []
+        note_deliveries[client].append({
+            "gate_pass_number": gp.get("gate_pass_number", ""),
+            "note": md.get("note", ""),
+            "delivered_date": md.get("delivered_date"),
+        })
+        for item in gp.get("items", []):
+            item_name = item.get("item_name", "")
+            spec = item.get("specification") or ""
+            qty = int(item.get("received_qty", 0) or 0)
+            detail_key = f"{item_name}||{spec}" if spec else item_name
+            if detail_key not in client_map[client]["items"]:
+                client_map[client]["items"][detail_key] = {
+                    "item_name": item_name,
+                    "specification": spec,
+                    "quantity": 0,
+                }
+            client_map[client]["items"][detail_key]["quantity"] += qty
+            client_map[client]["total_qty"] += qty
+
     # Step 2: For each client with today's deliveries, get ALL open gate passes
     for client, data in client_map.items():
         # Get ALL open gate passes for this client (not just today's)
@@ -1054,6 +1106,24 @@ async def today_deliveries(
                     qty = item.get("quantity", 0)
                     detail_key = f"{item_name}||{spec}" if spec else item_name
                     delivered_map[detail_key] = delivered_map.get(detail_key, 0) + qty
+            except Exception:
+                continue
+
+        # Mark-delivered gate passes count as fully delivered for pending math
+        md_cursor2 = gatepasses_collection.find({
+            "client_name_search": get_search_token(client),
+            "marked_delivered": {"$exists": True},
+        })
+        async for doc in md_cursor2:
+            try:
+                gp = _decrypt_gp(doc)
+                for item in gp.get("items", []):
+                    item_name = item.get("item_name", "")
+                    spec = item.get("specification") or ""
+                    qty = int(item.get("received_qty", 0) or 0)
+                    detail_key = f"{item_name}||{spec}" if spec else item_name
+                    if qty > delivered_map.get(detail_key, 0):
+                        delivered_map[detail_key] = qty
             except Exception:
                 continue
 
@@ -1099,11 +1169,14 @@ async def today_deliveries(
     # Build result
     results = []
     for client, data in client_map.items():
+        client_notes = note_deliveries.get(client, [])
         results.append({
             "client_name": client,
             "delivered_items": list(data["items"].values()),
             "total_qty": data["total_qty"],
             "pending_items": data.get("pending_items", []),
+            "note_deliveries": client_notes,
+            "has_note_delivery": len(client_notes) > 0,
         })
 
     results.sort(key=lambda x: x["total_qty"], reverse=True)
