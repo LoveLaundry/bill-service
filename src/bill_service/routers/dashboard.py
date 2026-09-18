@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import csv
@@ -281,10 +282,19 @@ async def get_client_summary(client_name: str = Query(...)):
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_client_wise_report():
-    gp_cursor = gatepasses_collection.find()
+    # Fetch the independent full-collection scans concurrently (they no longer
+    # run back-to-back), then process in the same order as before.
+    gp_fut = gatepasses_collection.find().to_list(length=None)
+    del_fut = deliveries_collection.find({"status": {"$ne": "CANCELLED"}}).to_list(length=None)
+    md_fut = gatepasses_collection.find({"marked_delivered": {"$exists": True}}).to_list(length=None)
+    ret_fut = _get_returned_items_by_client()
+    gp_docs, del_docs, md_docs, returned_by_client = await asyncio.gather(
+        gp_fut, del_fut, md_fut, ret_fut
+    )
+
     clients_map: Dict[str, dict] = {}
 
-    async for doc in gp_cursor:
+    for doc in gp_docs:
         try:
             gp = _decrypt_gp(doc)
             c_label = gp["client_name"].strip()
@@ -335,8 +345,7 @@ async def get_client_wise_report():
         except Exception:
             continue
 
-    del_cursor = deliveries_collection.find({"status": {"$ne": "CANCELLED"}})
-    async for doc in del_cursor:
+    for doc in del_docs:
         try:
             dl = _decrypt_del(doc)
             client = dl["client_name"].strip()
@@ -352,8 +361,7 @@ async def get_client_wise_report():
             continue
 
     # Gate passes completed via catch-up mark-delivered count as fully delivered
-    md_cursor = gatepasses_collection.find({"marked_delivered": {"$exists": True}})
-    async for doc in md_cursor:
+    for doc in md_docs:
         try:
             gp = _decrypt_gp(doc)
             if not gp.get("marked_delivered"):
@@ -370,11 +378,9 @@ async def get_client_wise_report():
         except Exception:
             continue
 
-    # Fetch returned items per client
-    returned_by_client = await _get_returned_items_by_client()
-
-    bill_cursor = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}})
-    async for doc in bill_cursor:
+    bill_fut = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}}).to_list(length=None)
+    bill_docs = await bill_fut
+    for doc in bill_docs:
         try:
             bill = _decrypt_bill(doc)
             client = bill["client_name"].strip()
@@ -411,10 +417,18 @@ async def get_client_wise_report():
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_item_wise_report():
-    gp_cursor = gatepasses_collection.find()
+    # Fetch the independent full-collection scans concurrently, then aggregate.
+    gp_fut = gatepasses_collection.find().to_list(length=None)
+    del_fut = deliveries_collection.find({"status": {"$ne": "CANCELLED"}}).to_list(length=None)
+    md_fut = gatepasses_collection.find({"marked_delivered": {"$exists": True}}).to_list(length=None)
+    ret_fut = _get_returned_items_by_client()
+    gp_docs, del_docs, md_docs, returned_by_client = await asyncio.gather(
+        gp_fut, del_fut, md_fut, ret_fut
+    )
+
     items_map: Dict[str, dict] = {}
 
-    async for doc in gp_cursor:
+    for doc in gp_docs:
         try:
             gp = _decrypt_gp(doc)
             for item in gp.get("items", []):
@@ -435,8 +449,7 @@ async def get_item_wise_report():
         except Exception:
             pass
 
-    del_cursor = deliveries_collection.find({"status": {"$ne": "CANCELLED"}})
-    async for doc in del_cursor:
+    for doc in del_docs:
         try:
             dl = _decrypt_del(doc)
             for item in dl.get("items", []):
@@ -447,8 +460,7 @@ async def get_item_wise_report():
             pass
 
     # Gate passes completed via catch-up mark-delivered count as fully delivered
-    md_cursor = gatepasses_collection.find({"marked_delivered": {"$exists": True}})
-    async for doc in md_cursor:
+    for doc in md_docs:
         try:
             gp = _decrypt_gp(doc)
             if not gp.get("marked_delivered"):
@@ -461,7 +473,6 @@ async def get_item_wise_report():
             pass
 
     # Add returned items — returned by client, need re-sending
-    returned_by_client = await _get_returned_items_by_client()
     returned_global: Dict[str, int] = {}
     for client_items in returned_by_client.values():
         for name, qty in client_items.items():
@@ -485,10 +496,32 @@ async def get_item_wise_report():
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
 async def get_gatepass_wise_report():
-    gp_cursor = gatepasses_collection.find().sort("receiving_date", -1)
+    gp_docs = await gatepasses_collection.find().sort("receiving_date", -1).to_list(length=None)
+
+    # Batched delivery lookup: fetch all non-cancelled deliveries for every
+    # gate pass in a single query instead of one query per gate pass.
+    gp_by_id: Dict[str, dict] = {}
+    for doc in gp_docs:
+        try:
+            gp = _decrypt_gp(doc)
+            gp_by_id[gp["id"]] = gp
+        except Exception:
+            continue
+    del_docs = await deliveries_collection.find(
+        {"gate_pass_id": {"$in": list(gp_by_id.keys())}, "status": {"$ne": "CANCELLED"}}
+    ).to_list(length=None) if gp_by_id else []
+
+    dels_by_gp: Dict[str, List[dict]] = {}
+    for d_doc in del_docs:
+        try:
+            dl = _decrypt_del(d_doc)
+            dels_by_gp.setdefault(dl.get("gate_pass_id"), []).append(dl)
+        except Exception:
+            pass
+
     results = []
 
-    async for doc in gp_cursor:
+    for doc in gp_docs:
         try:
             gp = _decrypt_gp(doc)
             gp_id = gp["id"]
@@ -497,17 +530,10 @@ async def get_gatepass_wise_report():
             mismatch_count = sum(1 for x in gp.get("items", []) if x.get("difference", 0) != 0)
 
             del_ids = []
-            del_cursor_2 = deliveries_collection.find(
-                {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
-            )
             total_delivered = 0
-            async for d_doc in del_cursor_2:
-                try:
-                    dl = _decrypt_del(d_doc)
-                    del_ids.append(dl["id"])
-                    total_delivered += sum(x.get("quantity", 0) for x in dl.get("items", []))
-                except Exception:
-                    pass
+            for dl in dels_by_gp.get(gp_id, []):
+                del_ids.append(dl["id"])
+                total_delivered += sum(x.get("quantity", 0) for x in dl.get("items", []))
             if gp.get("marked_delivered"):
                 total_delivered = max(total_delivered, total_received)
 
