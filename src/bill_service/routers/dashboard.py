@@ -193,6 +193,18 @@ async def get_client_summary(client_name: str = Query(...)):
                 balances_map[name] = {"received": 0, "delivered": 0, "pending": 0}
             balances_map[name]["delivered"] += qty
 
+    # Gate passes completed via catch-up mark-delivered count as fully delivered
+    for gp in gps:
+        if not gp.get("marked_delivered"):
+            continue
+        for item in gp.get("items", []):
+            name = item["item_name"]
+            qty = int(item.get("received_qty", 0) or 0)
+            total_delivered += qty
+            if name not in balances_map:
+                balances_map[name] = {"received": 0, "delivered": 0, "pending": 0}
+            balances_map[name]["delivered"] += qty
+
     # Add returned items to pending — items returned by client need re-sending
     returned_by_client = await _get_returned_items_by_client()
     returned_global: Dict[str, int] = {}
@@ -339,6 +351,25 @@ async def get_client_wise_report():
         except Exception:
             continue
 
+    # Gate passes completed via catch-up mark-delivered count as fully delivered
+    md_cursor = gatepasses_collection.find({"marked_delivered": {"$exists": True}})
+    async for doc in md_cursor:
+        try:
+            gp = _decrypt_gp(doc)
+            if not gp.get("marked_delivered"):
+                continue
+            client = gp["client_name"].strip()
+            if client in clients_map:
+                for item in gp.get("items", []):
+                    clients_map[client]["total_delivered"] += item.get("received_qty", 0)
+                    item_key = item.get("item_name", "")
+                    spec = item.get("specification") or ""
+                    detail_key = f"{item_key}||{spec}" if spec else item_key
+                    if detail_key in clients_map[client]["items_detail"]:
+                        clients_map[client]["items_detail"][detail_key]["delivered"] += item.get("received_qty", 0)
+        except Exception:
+            continue
+
     # Fetch returned items per client
     returned_by_client = await _get_returned_items_by_client()
 
@@ -415,6 +446,20 @@ async def get_item_wise_report():
         except Exception:
             pass
 
+    # Gate passes completed via catch-up mark-delivered count as fully delivered
+    md_cursor = gatepasses_collection.find({"marked_delivered": {"$exists": True}})
+    async for doc in md_cursor:
+        try:
+            gp = _decrypt_gp(doc)
+            if not gp.get("marked_delivered"):
+                continue
+            for item in gp.get("items", []):
+                name = item["item_name"]
+                if name in items_map:
+                    items_map[name]["total_delivered"] += item.get("received_qty", 0)
+        except Exception:
+            pass
+
     # Add returned items — returned by client, need re-sending
     returned_by_client = await _get_returned_items_by_client()
     returned_global: Dict[str, int] = {}
@@ -463,6 +508,8 @@ async def get_gatepass_wise_report():
                     total_delivered += sum(x.get("quantity", 0) for x in dl.get("items", []))
                 except Exception:
                     pass
+            if gp.get("marked_delivered"):
+                total_delivered = max(total_delivered, total_received)
 
             results.append(
                 {
@@ -1117,6 +1164,8 @@ async def today_deliveries(
         async for doc in md_cursor2:
             try:
                 gp = _decrypt_gp(doc)
+                if not gp.get("marked_delivered"):
+                    continue
                 for item in gp.get("items", []):
                     item_name = item.get("item_name", "")
                     spec = item.get("specification") or ""
