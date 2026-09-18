@@ -48,6 +48,17 @@ class GatePassUpdate(BaseModel):
     items: Optional[List[GatePassItem]] = Field(default=None, min_length=1)
 
 
+class GatePassMarkDelivered(BaseModel):
+    """Catch-up delivery: manager forgot to record the delivery on the dispatch date.
+
+    The gate pass is completed (status -> DELIVERED) directly with a mandatory
+    note instead of a dated item-level delivery record.
+    """
+
+    note: str = Field(min_length=1, description="Required note explaining the delivery")
+    delivered_date: Optional[datetime] = None
+
+
 class GatePassModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
@@ -66,6 +77,7 @@ class GatePassModel(BaseModel):
     created_at: datetime
     updated_at: datetime
     adjustments: Optional[List[dict]] = []
+    marked_delivered: Optional[dict] = None
 
 
 # --- Delivery ---

@@ -14,6 +14,7 @@ from ..models import (
     GatePassAdjustment,
     GatePassCreate,
     GatePassDateUpdate,
+    GatePassMarkDelivered,
     GatePassModel,
     GatePassUpdate,
 )
@@ -226,6 +227,71 @@ async def update_gate_pass_status(
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_STATUS_UPDATE",
+        "gatepass",
+        serialized["id"],
+    )
+    return serialized
+
+
+@router.post("/{gate_pass_id}/mark-delivered", response_model=GatePassModel)
+async def mark_gate_pass_delivered(
+    gate_pass_id: str,
+    payload: GatePassMarkDelivered,
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    """Complete a gate pass that was delivered but the delivery was never recorded.
+
+    Used when the manager forgot to record the dispatch on the delivery date.
+    Requires a mandatory note; stores the catch-up record on the gate pass so
+    it is treated as fully delivered while keeping an audit trail.
+    """
+    oid = _parse_object_id(gate_pass_id)
+    doc = await gatepasses_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
+        )
+
+    current_status = doc.get("status")
+    if current_status in ("DELIVERED", "CANCELLED"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Gate Pass is already {current_status} and cannot be marked delivered.",
+        )
+
+    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+    now = datetime.now(timezone.utc)
+    delivered_date = payload.delivered_date or now
+    if delivered_date.tzinfo is None:
+        delivered_date = delivered_date.replace(tzinfo=timezone.utc)
+
+    decrypted["status"] = "DELIVERED"
+    decrypted["marked_delivered"] = {
+        "note": payload.note,
+        "delivered_date": delivered_date,
+        "user_id": current_user.get("auth_id", "system"),
+        "at": now,
+    }
+    existing_notes = decrypted.get("notes") or ""
+    marker = f"Marked delivered: {payload.note}"
+    decrypted["notes"] = (
+        f"{existing_notes}\n{marker}".strip() if existing_notes else marker
+    )
+    decrypted["updated_at"] = now
+
+    encrypted_new = encrypt_dict(decrypted, SENSITIVE_FIELDS)
+    await gatepasses_collection.replace_one({"_id": oid}, encrypted_new)
+
+    updated_doc = await gatepasses_collection.find_one({"_id": oid})
+    serialized = _serialize(updated_doc)
+
+    new_version = await bump_version("gatepass", oid)
+    await enqueue_sync("gatepass", oid, new_version)
+    serialized = await attach_verification_to("gatepass", oid, serialized)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "RECEIVING_MARK_DELIVERED",
         "gatepass",
         serialized["id"],
     )

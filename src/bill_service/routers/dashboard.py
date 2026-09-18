@@ -599,7 +599,7 @@ async def _fetch_gate_passes(start: datetime, end: datetime):
     out = []
     cursor = gatepasses_collection.find(
         {"created_at": {"$gte": start, "$lte": end}},
-        {"client_name": 1, "items": 1, "gate_pass_number": 1, "created_at": 1, "encryption_metadata": 1, "_id": 1},
+        {"client_name": 1, "items": 1, "gate_pass_number": 1, "created_at": 1, "encryption_metadata": 1, "_id": 1, "status": 1, "marked_delivered": 1},
     )
     async for d in cursor:
         try:
@@ -615,6 +615,8 @@ async def _fetch_gate_passes(start: datetime, end: datetime):
                 "gate_pass_number": d.get("gate_pass_number"),
                 "client_name": client,
                 "created_at": _utc(d.get("created_at")),
+                "status": d.get("status"),
+                "marked_delivered": d.get("marked_delivered"),
                 "items": [
                     {
                         "item_name": it.get("item_name"),
@@ -699,6 +701,18 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_client=None):
         for it in d["items"]:
             m[it["item_name"]] = m.get(it["item_name"], 0) + it["quantity"]
     items_delivered = sum(it["quantity"] for d in deliveries for it in d["items"])
+
+    # Gate passes completed via catch-up mark-delivered (no item-level record)
+    # count as fully delivered for dashboard metrics and pending computations.
+    for gp in gate_passes:
+        if not gp.get("marked_delivered"):
+            continue
+        m = del_map.setdefault(gp["id"], {})
+        for it in gp["items"]:
+            rec = int(it["received_qty"] or 0)
+            if rec > m.get(it["item_name"], 0):
+                items_delivered += rec - m.get(it["item_name"], 0)
+            m[it["item_name"]] = max(m.get(it["item_name"], 0), rec)
 
     # Total returned items (need re-sending)
     total_returned = 0
