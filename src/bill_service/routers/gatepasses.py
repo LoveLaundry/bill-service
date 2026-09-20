@@ -34,6 +34,8 @@ def _serialize(doc: dict) -> dict:
 
     decrypted["id"] = str(decrypted["_id"])
     del decrypted["_id"]
+    if not isinstance(decrypted.get("items"), list):
+        decrypted["items"] = []
     return decrypted
 
 
