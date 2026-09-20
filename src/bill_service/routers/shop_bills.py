@@ -16,6 +16,7 @@ from ..database.main_db import (
     audit_collection,
     bill_templates_collection,
     shop_bills_collection,
+    legacy_invoices_collection,
 )
 from ..models import (
     BillTemplateCreate,
@@ -25,6 +26,7 @@ from ..models import (
     ShopBillSplit,
     ShopBillMerge,
     ShopBillUpdate,
+    LegacyInvoiceCreate,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..router_utils import log_audit, parse_object_id
@@ -171,6 +173,150 @@ def _build_bill_doc(body: dict, bill_number: str, now: datetime) -> dict:
         "created_at": now,
         "updated_at": now,
     }
+
+
+# ── Legacy invoices ──────────────────────────────────────────────────────────
+# Manual invoices aggregated from old paper bills. Always persisted so the
+# accountant has a durable record — the page is never a throwaway print-only
+# flow.
+LEGACY_SENSITIVE_FIELDS = ["shop_name", "description", "entries"]
+
+
+def _enc_legacy(doc: dict) -> dict:
+    """Encrypt a single legacy invoice document."""
+    return encrypt_dict(doc, LEGACY_SENSITIVE_FIELDS)
+
+
+def _dec_legacy(doc: dict) -> dict:
+    """Decrypt a legacy invoice document and normalize _id."""
+    try:
+        decrypted = decrypt_dict(doc, LEGACY_SENSITIVE_FIELDS)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to decrypt legacy invoice: {e}")
+    if "_id" in decrypted:
+        decrypted["id"] = str(decrypted["_id"])
+        del decrypted["_id"]
+    return decrypted
+
+
+async def _find_legacy_invoice(invoice_id: str) -> dict:
+    """Find a legacy invoice by id. Raises 404 if missing."""
+    oid = parse_object_id(invoice_id, "Invoice ID")
+    doc = await legacy_invoices_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Legacy invoice not found")
+    return doc
+
+
+def _generate_legacy_invoice_number(now: datetime) -> str:
+    """INV-YYYYMMDD-XXXXXX with a confusable-safe suffix."""
+    return f"INV-{now.strftime('%Y%m%d')}-" + "".join(random.choices(BILL_NUMBER_CHARS, k=6))
+
+
+def _calc_legacy_grand_total(entries: list) -> float:
+    """Sum entry amounts for a legacy invoice."""
+    return round(sum(float(e.get("amount", 0) or 0) for e in entries), 2)
+
+
+@router.post("/legacy", status_code=status.HTTP_201_CREATED)
+async def create_legacy_invoice(
+    payload: LegacyInvoiceCreate,
+    current_user: dict = Depends(require_capability("bill:write")),
+):
+    now = datetime.now(timezone.utc)
+    shop_name = (payload.shop_name or "").strip()
+    if not shop_name:
+        raise HTTPException(status_code=400, detail="Shop / Hotel name is required")
+
+    entries = [e.model_dump() for e in payload.entries]
+    for entry in entries:
+        if (entry.get("amount", 0) or 0) < 0:
+            raise HTTPException(status_code=400, detail="Amount cannot be negative")
+
+    grand_total = _calc_legacy_grand_total(entries)
+    if grand_total <= 0:
+        raise HTTPException(status_code=400, detail="Invoice total must be greater than zero")
+
+    invoice_number = _generate_legacy_invoice_number(now)
+    doc = {
+        "invoice_number": invoice_number,
+        "shop_name": shop_name,
+        "shop_name_search": get_search_token(shop_name),
+        "description": payload.description or "",
+        "entries": entries,
+        "total_entries": len([
+            e for e in entries
+            if e.get("bill_number") or (e.get("amount", 0) or 0) > 0
+        ]),
+        "grand_total": grand_total,
+        "created_by": current_user.get("auth_id", "system"),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    result = await legacy_invoices_collection.insert_one(_enc_legacy(doc))
+    doc["id"] = str(result.inserted_id)
+
+    new_version = await bump_version("legacy_invoice", result.inserted_id)
+    await enqueue_sync("legacy_invoice", result.inserted_id, new_version)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "LEGACY_INVOICE_CREATE",
+        "legacy_invoice",
+        doc["id"],
+        details={"invoice_number": invoice_number, "grand_total": grand_total},
+    )
+    return doc
+
+
+@router.get("/legacy")
+async def list_legacy_invoices(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=200),
+    search: Optional[str] = Query(None),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    query: dict = {}
+    if search:
+        query["shop_name_search"] = {"$regex": get_search_token(search), "$options": "i"}
+
+    total = await legacy_invoices_collection.count_documents(query)
+    items = []
+    async for doc in (
+        legacy_invoices_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    ):
+        items.append(_dec_legacy(doc))
+    return {"items": items, "total": total}
+
+
+@router.get("/legacy/{invoice_id}")
+async def get_legacy_invoice(
+    invoice_id: str,
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    doc = await _find_legacy_invoice(invoice_id)
+    return _dec_legacy(doc)
+
+
+@router.delete("/legacy/{invoice_id}")
+async def delete_legacy_invoice(
+    invoice_id: str,
+    current_user: dict = Depends(require_capability("bill:write")),
+):
+    raw = await _find_legacy_invoice(invoice_id)
+    await legacy_invoices_collection.delete_one({"_id": raw["_id"]})
+
+    new_version = await bump_version("legacy_invoice", raw["_id"])
+    await enqueue_sync("legacy_invoice", raw["_id"], new_version)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "LEGACY_INVOICE_DELETE",
+        "legacy_invoice",
+        str(raw["_id"]),
+    )
+    return {"message": "Legacy invoice deleted"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

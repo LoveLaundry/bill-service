@@ -21,6 +21,7 @@ linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
 linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
 shop_bills_collection: AsyncIOMotorCollection = _db.get_collection("shop_bills")
 bill_templates_collection: AsyncIOMotorCollection = _db.get_collection("bill_templates")
+legacy_invoices_collection: AsyncIOMotorCollection = _db.get_collection("legacy_invoices")
 
 # Sync metadata is mirrored too, so verification can compare records
 # entirely within the Secondary database.

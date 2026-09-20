@@ -23,6 +23,7 @@ linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_even
 returns_collection: AsyncIOMotorCollection = _db.get_collection("returns")
 shop_bills_collection: AsyncIOMotorCollection = _db.get_collection("shop_bills")
 bill_templates_collection: AsyncIOMotorCollection = _db.get_collection("bill_templates")
+legacy_invoices_collection: AsyncIOMotorCollection = _db.get_collection("legacy_invoices")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")
@@ -100,6 +101,11 @@ async def ensure_indexes():
     # Bill Templates indexes
     await bill_templates_collection.create_index("name")
     await bill_templates_collection.create_index("client_name_search")
+
+    # Legacy invoices indexes
+    await legacy_invoices_collection.create_index("invoice_number", unique=True)
+    await legacy_invoices_collection.create_index("shop_name_search")
+    await legacy_invoices_collection.create_index("created_at")
 
     # Sync infrastructure indexes
     await sync_status_collection.create_index([("entity", 1), ("record_id", 1)], unique=True)

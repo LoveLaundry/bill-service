@@ -553,6 +553,20 @@ class ShopBillPayment(BaseModel):
     notes: Optional[str] = None
 
 
+class LegacyInvoiceEntry(BaseModel):
+    """One old paper bill aggregated into a legacy invoice."""
+    date: Optional[str] = None  # ISO date (YYYY-MM-DD) as entered
+    bill_number: Optional[str] = None
+    amount: float = Field(default=0, ge=0)
+
+
+class LegacyInvoiceCreate(BaseModel):
+    """Request to persist a manual legacy invoice."""
+    shop_name: str
+    description: Optional[str] = None
+    entries: List[LegacyInvoiceEntry] = Field(min_length=1)
+
+
 class ShopBillModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 

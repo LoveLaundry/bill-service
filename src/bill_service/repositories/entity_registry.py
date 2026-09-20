@@ -18,6 +18,7 @@ COLLECTION_MAP: dict[str, tuple[AsyncIOMotorCollection, AsyncIOMotorCollection, 
     "linen": (main_db.linens_collection, secondary_db.linens_collection, local_db.linens_collection),
     "shop_bill": (main_db.shop_bills_collection, secondary_db.shop_bills_collection, local_db.shop_bills_collection),
     "bill_template": (main_db.bill_templates_collection, secondary_db.bill_templates_collection, local_db.bill_templates_collection),
+    "legacy_invoice": (main_db.legacy_invoices_collection, secondary_db.legacy_invoices_collection, local_db.legacy_invoices_collection),
 }
 
 
