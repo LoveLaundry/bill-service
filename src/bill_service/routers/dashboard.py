@@ -63,12 +63,18 @@ def _decrypt_shop_bill(doc: dict) -> dict:
     return dec
 
 
-async def _get_returned_items_by_client() -> Dict[str, Dict[str, int]]:
-    """Fetch all returns and build a map of client_name → {item_name → returned_qty}.
+def _key(name: str, spec: str = ""):
+    return f"{name}||{spec}" if spec else name
+
+
+async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
+    """Fetch all returns and build gate_pass_id → {item_key → returned_qty}.
 
     Only includes items with action RECEIVE_BACK/RE_WASH that haven't been
-    re-sent yet (resend_status != SENT). These count as pending items
-    because they must be sent back to the client.
+    re-sent yet (resend_status != SENT). These count as pending items because
+    they must be sent back to the client. Returns carry their own
+    gate_pass_id, so they are attributed to the exact gate pass they were
+    raised on — never to another pass of the same client.
     """
     returned: Dict[str, Dict[str, int]] = {}
     ret_cursor = returns_collection.find()
@@ -78,11 +84,11 @@ async def _get_returned_items_by_client() -> Dict[str, Dict[str, int]]:
                 ret = decrypt_dict(ret_doc, SENSITIVE_FIELDS_GP)
             except (ValueError, KeyError):
                 ret = ret_doc
-            client = ret.get("client_name", "").strip()
-            if not client:
+            gp_id = str(ret.get("gate_pass_id") or "")
+            if not gp_id:
                 continue
-            if client not in returned:
-                returned[client] = {}
+            if gp_id not in returned:
+                returned[gp_id] = {}
             for item in ret.get("items", []):
                 if not isinstance(item, dict):
                     continue
@@ -91,12 +97,23 @@ async def _get_returned_items_by_client() -> Dict[str, Dict[str, int]]:
                 if item.get("resend_status") == "SENT":
                     continue
                 name = item.get("item_name", "")
+                spec = item.get("specification") or ""
+                key = _key(name, spec)
                 qty = int(item.get("returned_qty", 0) or 0)
                 if qty > 0:
-                    returned[client][name] = returned[client].get(name, 0) + qty
+                    returned[gp_id][key] = returned[gp_id].get(key, 0) + qty
         except Exception:
             continue
     return returned
+
+
+def _flatten_returned_by_name(returned_by_gp: Dict[str, Dict[str, int]]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for _, items in returned_by_gp.items():
+        for key, qty in items.items():
+            name = key.split("||", 1)[0]
+            out[name] = out.get(name, 0) + qty
+    return out
 
 
 # --- 1. Client Dashboard Summary ---
@@ -194,24 +211,37 @@ async def get_client_summary(client_name: str = Query(...)):
                 balances_map[name] = {"received": 0, "delivered": 0, "pending": 0}
             balances_map[name]["delivered"] += qty
 
-    # Gate passes completed via catch-up mark-delivered count as fully delivered
+    # Gate passes completed via catch-up mark-delivered count as fully delivered.
+    # A marked GP might also have real delivery rows; only add the un-recorded
+    # remainder so those quantities are not double counted.
+    recorded_by_gp: Dict[str, Dict[str, int]] = {}
+    for dl in deliveries:
+        if dl.get("status") == "CANCELLED":
+            continue
+        gpid = dl.get("gate_pass_id") or ""
+        m = recorded_by_gp.setdefault(gpid, {})
+        for item in dl.get("items", []):
+            nm = item.get("item_name", "")
+            m[nm] = m.get(nm, 0) + item.get("quantity", 0)
+
     for gp in gps:
         if not gp.get("marked_delivered"):
             continue
+        recorded = recorded_by_gp.get(gp["id"], {})
         for item in gp.get("items", []):
             name = item["item_name"]
             qty = int(item.get("received_qty", 0) or 0)
-            total_delivered += qty
+            extra = max(0, qty - recorded.get(name, 0))
+            if extra <= 0:
+                continue
+            total_delivered += extra
             if name not in balances_map:
                 balances_map[name] = {"received": 0, "delivered": 0, "pending": 0}
-            balances_map[name]["delivered"] += qty
+            balances_map[name]["delivered"] += extra
 
     # Add returned items to pending — items returned by client need re-sending
-    returned_by_client = await _get_returned_items_by_client()
-    returned_global: Dict[str, int] = {}
-    for client_items in returned_by_client.values():
-        for name, qty in client_items.items():
-            returned_global[name] = returned_global.get(name, 0) + qty
+    returned_by_gp = await _get_returned_items_by_gate_pass()
+    returned_global = _flatten_returned_by_name(returned_by_gp)
 
     pending_items_sum = 0
     for name, item_bal in balances_map.items():
@@ -287,12 +317,13 @@ async def get_client_wise_report():
     gp_fut = gatepasses_collection.find().to_list(length=None)
     del_fut = deliveries_collection.find({"status": {"$ne": "CANCELLED"}}).to_list(length=None)
     md_fut = gatepasses_collection.find({"marked_delivered": {"$exists": True}}).to_list(length=None)
-    ret_fut = _get_returned_items_by_client()
-    gp_docs, del_docs, md_docs, returned_by_client = await asyncio.gather(
+    ret_fut = _get_returned_items_by_gate_pass()
+    gp_docs, del_docs, md_docs, returned_by_gp = await asyncio.gather(
         gp_fut, del_fut, md_fut, ret_fut
     )
 
     clients_map: Dict[str, dict] = {}
+    gp_client_map: Dict[str, str] = {}
 
     for doc in gp_docs:
         try:
@@ -315,6 +346,7 @@ async def get_client_wise_report():
                     "gate_passes": [],
                 }
             clients_map[c_label]["gate_pass_count"] += 1
+            gp_client_map[gp["id"]] = c_label
             gp_items = []
             for item in gp.get("items", []):
                 clients_map[c_label]["total_received"] += item.get("received_qty", 0)
@@ -360,7 +392,25 @@ async def get_client_wise_report():
         except Exception:
             continue
 
-    # Gate passes completed via catch-up mark-delivered count as fully delivered
+    recorded_by_gp: Dict[str, Dict[str, int]] = {}
+    for doc in del_docs:
+        try:
+            dl = _decrypt_del(doc)
+            if dl.get("status") == "CANCELLED":
+                continue
+            gpid = dl.get("gate_pass_id") or ""
+            m = recorded_by_gp.setdefault(gpid, {})
+            for item in dl.get("items", []):
+                ik_ = item.get("item_name", "")
+                sp_ = item.get("specification") or ""
+                key = f"{ik_}||{sp_}" if sp_ else ik_
+                m[key] = m.get(key, 0) + item.get("quantity", 0)
+        except Exception:
+            continue
+
+    # Gate passes completed via catch-up mark-delivered count as fully delivered.
+    # Only add the un-recorded remainder per item so recorded deliveries on the
+    # same gate pass are not double counted.
     for doc in md_docs:
         try:
             gp = _decrypt_gp(doc)
@@ -368,13 +418,18 @@ async def get_client_wise_report():
                 continue
             client = gp["client_name"].strip()
             if client in clients_map:
+                recorded = recorded_by_gp.get(gp["id"], {})
                 for item in gp.get("items", []):
-                    clients_map[client]["total_delivered"] += item.get("received_qty", 0)
+                    received = item.get("received_qty", 0)
                     item_key = item.get("item_name", "")
                     spec = item.get("specification") or ""
                     detail_key = f"{item_key}||{spec}" if spec else item_key
+                    extra = max(0, received - recorded.get(detail_key, 0))
+                    if extra <= 0:
+                        continue
+                    clients_map[client]["total_delivered"] += extra
                     if detail_key in clients_map[client]["items_detail"]:
-                        clients_map[client]["items_detail"][detail_key]["delivered"] += item.get("received_qty", 0)
+                        clients_map[client]["items_detail"][detail_key]["delivered"] += extra
         except Exception:
             continue
 
@@ -391,17 +446,29 @@ async def get_client_wise_report():
         except Exception:
             continue
 
+    # Aggregate returned items per client (spec-aware) via each return's own
+    # gate pass, so a return never leaks onto another pass of the same client.
+    client_returned: Dict[str, Dict[str, int]] = {}
+    for gp_id, gp_items_returned in returned_by_gp.items():
+        client_label = gp_client_map.get(gp_id)
+        if not client_label:
+            continue
+        target = client_returned.setdefault(client_label, {})
+        for key, qty in gp_items_returned.items():
+            target[key] = target.get(key, 0) + qty
+
     results = []
     for c_label, stats in clients_map.items():
-        client_returned = returned_by_client.get(c_label, {})
-        total_returned = sum(client_returned.values())
+        creturned = client_returned.get(c_label, {})
+        total_returned = sum(creturned.values())
         stats["total_pending"] = max(0, stats["total_received"] - stats["total_delivered"] + total_returned)
         stats["total_billed"] = round(stats["total_billed"], 2)
         stats["paid_amount"] = round(stats["paid_amount"], 2)
         stats["outstanding"] = round(stats["outstanding"], 2)
         items_list = list(stats.pop("items_detail").values())
         for it in items_list:
-            ret_qty = client_returned.get(it["item_name"], 0)
+            it_key = f"{it['item_name']}||{it['specification']}" if it["specification"] else it["item_name"]
+            ret_qty = creturned.get(it_key, 0)
             it["returned"] = ret_qty
             it["pending"] = max(0, it["received"] - it["delivered"] + ret_qty)
         stats["items"] = [it for it in items_list if it["pending"] > 0]
@@ -421,8 +488,8 @@ async def get_item_wise_report():
     gp_fut = gatepasses_collection.find().to_list(length=None)
     del_fut = deliveries_collection.find({"status": {"$ne": "CANCELLED"}}).to_list(length=None)
     md_fut = gatepasses_collection.find({"marked_delivered": {"$exists": True}}).to_list(length=None)
-    ret_fut = _get_returned_items_by_client()
-    gp_docs, del_docs, md_docs, returned_by_client = await asyncio.gather(
+    ret_fut = _get_returned_items_by_gate_pass()
+    gp_docs, del_docs, md_docs, returned_by_gp = await asyncio.gather(
         gp_fut, del_fut, md_fut, ret_fut
     )
 
@@ -459,24 +526,38 @@ async def get_item_wise_report():
         except Exception:
             pass
 
-    # Gate passes completed via catch-up mark-delivered count as fully delivered
+    # Gate passes completed via catch-up mark-delivered count as fully delivered.
+    # Only add the un-recorded remainder per item so recorded deliveries on the
+    # same gate pass are not double counted.
+    recorded_by_gp: Dict[str, Dict[str, int]] = {}
+    for doc in del_docs:
+        try:
+            dl = _decrypt_del(doc)
+            if dl.get("status") == "CANCELLED":
+                continue
+            gpid = dl.get("gate_pass_id") or ""
+            m = recorded_by_gp.setdefault(gpid, {})
+            for item in dl.get("items", []):
+                nm = item.get("item_name", "")
+                m[nm] = m.get(nm, 0) + item.get("quantity", 0)
+        except Exception:
+            continue
     for doc in md_docs:
         try:
             gp = _decrypt_gp(doc)
             if not gp.get("marked_delivered"):
                 continue
+            recorded = recorded_by_gp.get(gp["id"], {})
             for item in gp.get("items", []):
                 name = item["item_name"]
-                if name in items_map:
-                    items_map[name]["total_delivered"] += item.get("received_qty", 0)
+                extra = max(0, item.get("received_qty", 0) - recorded.get(name, 0))
+                if name in items_map and extra > 0:
+                    items_map[name]["total_delivered"] += extra
         except Exception:
             pass
 
     # Add returned items — returned by client, need re-sending
-    returned_global: Dict[str, int] = {}
-    for client_items in returned_by_client.values():
-        for name, qty in client_items.items():
-            returned_global[name] = returned_global.get(name, 0) + qty
+    returned_global = _flatten_returned_by_name(returned_by_gp)
 
     results = []
     for name, stats in items_map.items():
@@ -693,6 +774,7 @@ async def _fetch_gate_passes(start: datetime, end: datetime):
                 "items": [
                     {
                         "item_name": it.get("item_name"),
+                        "specification": it.get("specification") or "",
                         "received_qty": int(it.get("received_qty") or 0),
                     }
                     for it in items
@@ -722,6 +804,7 @@ async def _fetch_deliveries(gate_pass_ids: List[str]):
                 "items": [
                     {
                         "item_name": it.get("item_name"),
+                        "specification": it.get("specification") or "",
                         "quantity": int(it.get("quantity") or 0),
                     }
                     for it in items
@@ -750,7 +833,7 @@ def _outstanding(b):
     return max(0.0, b["grand_total"] - b["paid_amount"])
 
 
-def aggregate(bills, gate_passes, deliveries, period, returned_by_client=None):
+def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
     revenue = sum(b["grand_total"] for b in bills)
     collected = sum(b["paid_amount"] for b in bills)
     outstanding = sum(_outstanding(b) for b in bills)
@@ -765,33 +848,39 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_client=None):
     collection_rate = (collected / revenue * 100) if revenue else 0.0
     avg = (revenue / bill_count) if bill_count else 0.0
 
-    gp_count = len(gate_passes)
-    items_received = sum(it["received_qty"] for gp in gate_passes for it in gp["items"])
+    # Cancelled gate passes are void — never count as received or pending.
+    open_gps = [gp for gp in gate_passes if gp.get("status") != "CANCELLED"]
+    gp_count = len(open_gps)
+    items_received = sum(
+        it["received_qty"] for gp in open_gps for it in gp["items"]
+    )
 
     del_map = {}
     for d in deliveries:
         m = del_map.setdefault(d["gate_pass_id"], {})
         for it in d["items"]:
-            m[it["item_name"]] = m.get(it["item_name"], 0) + it["quantity"]
+            key = _key(it["item_name"], it.get("specification") or "")
+            m[key] = m.get(key, 0) + it["quantity"]
     items_delivered = sum(it["quantity"] for d in deliveries for it in d["items"])
 
     # Gate passes completed via catch-up mark-delivered (no item-level record)
     # count as fully delivered for dashboard metrics and pending computations.
-    for gp in gate_passes:
+    for gp in open_gps:
         if not gp.get("marked_delivered"):
             continue
         m = del_map.setdefault(gp["id"], {})
         for it in gp["items"]:
             rec = int(it["received_qty"] or 0)
-            if rec > m.get(it["item_name"], 0):
-                items_delivered += rec - m.get(it["item_name"], 0)
-            m[it["item_name"]] = max(m.get(it["item_name"], 0), rec)
+            key = _key(it["item_name"], it.get("specification") or "")
+            if rec > m.get(key, 0):
+                items_delivered += rec - m.get(key, 0)
+            m[key] = max(m.get(key, 0), rec)
 
     # Total returned items (need re-sending)
     total_returned = 0
-    if returned_by_client:
-        for client_items in returned_by_client.values():
-            total_returned += sum(client_items.values())
+    if returned_by_gp:
+        for gp_items in returned_by_gp.values():
+            total_returned += sum(gp_items.values())
 
     items_pending = max(0, items_received - items_delivered + total_returned)
 
@@ -840,14 +929,15 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_client=None):
     payment_status = [s for s in payment_status if s["value"] > 0]
 
     pending_gps = []
-    for gp in gate_passes:
+    for gp in open_gps:
         dm = del_map.get(gp["id"], {})
-        client_returned = (returned_by_client or {}).get(gp["client_name"], {})
+        ret_map = (returned_by_gp or {}).get(gp["id"], {})
         pending_detail = []
         total_pending = 0
         for it in gp["items"]:
-            delivered = dm.get(it["item_name"], 0)
-            ret_qty = client_returned.get(it["item_name"], 0)
+            key = _key(it["item_name"], it.get("specification") or "")
+            delivered = dm.get(key, 0)
+            ret_qty = ret_map.get(key, 0)
             p = max(0, it["received_qty"] - delivered + ret_qty)
             if p > 0:
                 total_pending += p
@@ -908,10 +998,10 @@ async def get_dashboard_summary(
     prev_gps = await _fetch_gate_passes(prev_start, prev_end)
     prev_dels = await _fetch_deliveries([gp["id"] for gp in prev_gps])
 
-    returned_by_client = await _get_returned_items_by_client()
+    returned_by_gp = await _get_returned_items_by_gate_pass()
 
-    current = aggregate(cur_bills, cur_gps, cur_dels, period, returned_by_client)
-    previous = aggregate(prev_bills, prev_gps, prev_dels, period, returned_by_client)
+    current = aggregate(cur_bills, cur_gps, cur_dels, period, returned_by_gp)
+    previous = aggregate(prev_bills, prev_gps, prev_dels, period, returned_by_gp)
 
     cur_clients = {b["client_name"] for b in cur_bills}
     prev_clients = {b["client_name"] for b in prev_bills}

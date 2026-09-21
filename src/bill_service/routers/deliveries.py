@@ -239,14 +239,16 @@ async def pending_gatepasses(
             key = f"{item.get('item_name', '')}||{item.get('specification') or ''}"
             delivered_by_gp[gp_id][key] = delivered_by_gp[gp_id].get(key, 0) + item.get("quantity", 0)
 
-    # Build returned map: client_name → {item_key → qty} for RECEIVE_BACK/RE_WASH not SENT
-    returned_by_client: Dict[str, Dict[str, int]] = {}
+    # Build returned map: gate_pass_id → {item_key → qty} for RECEIVE_BACK/RE_WASH not SENT.
+    # Returns carry their own gate_pass_id, so they only count for the pass they
+    # were raised on — never for another pass of the same client.
+    returned_by_gp: Dict[str, Dict[str, int]] = {}
     for ret in all_returns:
-        client = (ret.get("client_name") or "").strip()
-        if not client:
+        gp_id = ret.get("gate_pass_id") or ""
+        if not gp_id:
             continue
-        if client not in returned_by_client:
-            returned_by_client[client] = {}
+        if gp_id not in returned_by_gp:
+            returned_by_gp[gp_id] = {}
         for item in ret.get("items", []):
             if not isinstance(item, dict):
                 continue
@@ -259,7 +261,7 @@ async def pending_gatepasses(
             qty = int(item.get("returned_qty", 0) or 0)
             if qty > 0:
                 key = f"{name}||{spec}"
-                returned_by_client[client][key] = returned_by_client[client].get(key, 0) + qty
+                returned_by_gp[gp_id][key] = returned_by_gp[gp_id].get(key, 0) + qty
 
     # Process gate passes
     gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
@@ -273,7 +275,7 @@ async def pending_gatepasses(
         gp_id = gp.get("id") or str(doc["_id"])
         client = (gp.get("client_name") or "").strip()
         del_map = delivered_by_gp.get(gp_id, {})
-        ret_map = returned_by_client.get(client, {})
+        ret_map = returned_by_gp.get(gp_id, {})
 
         items_with_pending = []
         for gp_item in gp.get("items", []):
