@@ -267,3 +267,40 @@ def test_balance_after_correction():
     assert item["received_qty"] == 45
     assert item["outstanding_delivery_qty"] == 15
     assert be.derive_gate_pass_status(bal_after, "PARTIALLY_DELIVERED") == "PARTIALLY_DELIVERED"
+
+
+# --- Received-basis billing helper ---
+def test_billable_received_by_name():
+    gp = [_gp_item("Duvet Cover", 47, 50), _gp_item("Towel", 10, 10, spec="Large"), _gp_item("Towel", 5, 5, spec="Small")]
+    billed = {"Duvet Cover": 20, "Towel": 3}
+    billable = be.compute_billable_received_by_name(gp, billed)
+    assert billable["Duvet Cover"] == 27
+    assert billable["Towel"] == 12  # 10 + 5 across specs, minus 3 already billed
+
+
+# --- Reconciliation issue detection (pure) ---
+def test_detect_issues_closed_with_outstanding():
+    gp = [_gp_item("Duvet Cover", 50, 50)]
+    bal = be.compute_gate_pass_balance(
+        gp, be.compute_delivered_by_item([_delivery([_del_item("Duvet Cover", 30)])]), {}
+    )
+    issues = {i["code"] for i in be.detect_reconciliation_issues(bal, "DELIVERED", False)}
+    assert "CLOSED_WITH_OUTSTANDING" in issues
+
+
+def test_detect_issues_legacy_and_over_delivered():
+    gp = [_gp_item("Duvet Cover", 50, 50)]
+    deliveries = [_delivery([_del_item("Duvet Cover", 60)])]  # more than received
+    bal = be.compute_gate_pass_balance(gp, be.compute_delivered_by_item(deliveries), {})
+    issues = {i["code"] for i in be.detect_reconciliation_issues(bal, "DELIVERED", True)}
+    assert "LEGACY_NOTE_CLOSURE" in issues
+    assert "OVER_DELIVERED" in issues
+    assert "CLOSED_WITH_OUTSTANDING" not in issues  # legacy skips that check
+
+
+def test_detect_issues_bill_exceeds_received():
+    gp = [_gp_item("Duvet Cover", 40, 50)]
+    bal = be.compute_gate_pass_balance(gp, {}, {})
+    issues = {i["code"] for i in be.detect_reconciliation_issues(bal, "RECEIVED", False, {"Duvet Cover": 45})}
+    assert "SHORT_RECEIVED" in issues
+    assert "BILL_EXCEEDS_RECEIVED" in issues

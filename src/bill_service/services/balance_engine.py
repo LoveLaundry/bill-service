@@ -208,6 +208,108 @@ def compute_billable_on_received(
     return out
 
 
+def compute_billable_received_by_name(
+    gp_items_list: List[dict],
+    billed_by_name: Optional[Dict[str, int]] = None,
+) -> Dict[str, int]:
+    """Billable quantities for billing, aggregated by item NAME.
+
+    Billing lines are item-name based (spec is not part of a bill line), so
+    received quantities across specs of the same item are summed before the
+    already-billed quantities are subtracted.
+    """
+    billed_by_name = billed_by_name or {}
+    received_by_name: Dict[str, int] = {}
+    for it in gp_items_list:
+        name = it.get("item_name", "")
+        received_by_name[name] = received_by_name.get(name, 0) + int(it.get("received_qty", 0) or 0)
+    return {
+        name: max(0, received_by_name[name] - billed_by_name.get(name, 0))
+        for name in received_by_name
+    }
+
+
+def detect_reconciliation_issues(
+    balance: dict,
+    status: str,
+    legacy_marked: bool,
+    billed_by_name: Optional[Dict[str, int]] = None,
+) -> List[dict]:
+    """Detect reconciliation issues for one gate pass (pure, DB-free).
+
+    Categories:
+      LEGACY_NOTE_CLOSURE        marked delivered by note with no records
+      CLOSED_WITH_OUTSTANDING    closed but still has pieces to deliver
+      OVER_DELIVERED             delivered more than received for an item
+      SHORT_RECEIVED             received less than the waybill expected
+      BILL_EXCEEDS_RECEIVED      billed more of an item than was received
+    """
+    issues: List[dict] = []
+    if legacy_marked:
+        issues.append(
+            {
+                "code": "LEGACY_NOTE_CLOSURE",
+                "severity": "info",
+                "detail": "Closed by the old mark-delivered note, not by recorded delivery records.",
+            }
+        )
+
+    totals = balance.get("totals", {})
+    if (
+        (status in ("DELIVERED", "CLOSED"))
+        and not legacy_marked
+        and (totals.get("outstanding_delivery_qty") or 0) > 0
+    ):
+        issues.append(
+            {
+                "code": "CLOSED_WITH_OUTSTANDING",
+                "severity": "high",
+                "detail": f"Pass is {status} but {totals.get('outstanding_delivery_qty')} piece(s) are still not recorded as delivered.",
+            }
+        )
+
+    billed_by_name = billed_by_name or {}
+    received_by_name: Dict[str, int] = {}
+    delivered_by_name: Dict[str, int] = {}
+    expected_by_name: Dict[str, int] = {}
+    for it in (balance.get("items") or {}).values():
+        name = it.get("item_name", "")
+        received_by_name[name] = received_by_name.get(name, 0) + it.get("received_qty", 0)
+        delivered_by_name[name] = delivered_by_name.get(name, 0) + it.get("delivered_qty", 0)
+        expected_by_name[name] = expected_by_name.get(name, 0) + it.get("expected_qty", 0)
+
+    for name in sorted(set(received_by_name) | set(delivered_by_name) | set(expected_by_name)):
+        received = received_by_name.get(name, 0)
+        delivered = delivered_by_name.get(name, 0)
+        expected = expected_by_name.get(name, 0)
+        if delivered > received:
+            issues.append(
+                {
+                    "code": "OVER_DELIVERED",
+                    "severity": "high",
+                    "detail": f"{name}: delivered {delivered} but only {received} received (both should never happen).",
+                }
+            )
+        if received < expected:
+            issues.append(
+                {
+                    "code": "SHORT_RECEIVED",
+                    "severity": "info",
+                    "detail": f"{name}: received {received} of the {expected} the waybill expected.",
+                }
+            )
+        billed = billed_by_name.get(name, 0)
+        if billed > received:
+            issues.append(
+                {
+                    "code": "BILL_EXCEEDS_RECEIVED",
+                    "severity": "high",
+                    "detail": f"{name}: billed {billed} but only {received} received.",
+                }
+            )
+    return issues
+
+
 def apply_received_correction(
     gp_items: List[dict],
     item_name: str,

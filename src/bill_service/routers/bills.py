@@ -14,6 +14,7 @@ from ..database.main_db import (
     payments_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services import balance_engine as be
 from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
 from pydantic import BaseModel
@@ -164,8 +165,10 @@ async def create_bill(
     del_ids_to_save = payload.delivery_ids or []
 
     if del_ids_to_save:
-        # Map item_name -> total delivered quantity in inputs
-        delivered_map = {}
+        # The billable event is the RECEIVED quantity (business decision).
+        # Gather the gate passes these deliveries belong to, then compute
+        # what is still billable = received - already billed per item name.
+        gp_ids_for_del = []
         for d_id in del_ids_to_save:
             d_oid = ObjectId(d_id)
             d_doc = await deliveries_collection.find_one({"_id": d_oid})
@@ -176,18 +179,34 @@ async def create_bill(
                 )
 
             d_dec = decrypt_dict(d_doc, DELIVERY_SENSITIVE_FIELDS)
-            for item in d_dec.get("items", []):
-                name = item["item_name"]
-                delivered_map[name] = delivered_map.get(name, 0) + item["quantity"]
+            gpid = d_dec.get("gate_pass_id")
+            if gpid and gpid not in gp_ids_for_del:
+                gp_ids_for_del.append(gpid)
 
-        # Map item_name -> already billed quantity for these deliveries
+        gp_items_list = []
+        for gpid in gp_ids_for_del:
+            try:
+                g_obj = ObjectId(gpid)
+            except InvalidId:
+                continue
+            g_doc = await gatepasses_collection.find_one({"_id": g_obj})
+            if not g_doc:
+                continue
+            g_dec = decrypt_dict(g_doc, GATEPASS_SENSITIVE_FIELDS)
+            gp_items_list.extend(g_dec.get("items", []))
+
+        # Map item_name -> already billed quantity for these deliveries AND
+        # for the gate passes they belong to (GP-leg bills store no delivery ids).
         already_billed_map = {}
-        prev_bills_cursor = bills_collection.find(
-            {
-                "delivery_ids": {"$in": del_ids_to_save},
-                "payment_status": {"$ne": "CANCELLED"},
-            }
-        )
+        billed_filter: dict = {
+            "payment_status": {"$ne": "CANCELLED"},
+            "$or": [
+                {"delivery_ids": {"$in": del_ids_to_save}},
+            ],
+        }
+        if gp_ids_for_del:
+            billed_filter["$or"].append({"gate_pass_id": {"$in": gp_ids_for_del}})
+        prev_bills_cursor = bills_collection.find(billed_filter)
         async for pb_doc in prev_bills_cursor:
             pb_dec = decrypt_dict(pb_doc, SENSITIVE_FIELDS)
             for item in pb_dec.get("items", []):
@@ -196,11 +215,8 @@ async def create_bill(
                     already_billed_map.get(name, 0) + item["quantity"]
                 )
 
-        # Compute remaining billable quantities
-        billable_map = {}
-        for name, del_qty in delivered_map.items():
-            billed = already_billed_map.get(name, 0)
-            billable_map[name] = max(0, del_qty - billed)
+        # Compute remaining billable quantities on the received basis
+        billable_map = be.compute_billable_received_by_name(gp_items_list, already_billed_map)
 
         if payload.items:
             # Validate input quantities against remaining billable balance
@@ -253,24 +269,33 @@ async def create_bill(
                     }
                 )
     elif payload.gate_pass_id and gp_doc:
-        # Derive billable items from the gate pass received quantities
-        existing = await bills_collection.count_documents(
-            {
-                "gate_pass_id": payload.gate_pass_id,
-                "payment_status": {"$ne": "CANCELLED"},
-            }
+        # Derive billable items from the gate pass RECEIVED quantities,
+        # minus whatever has already been billed for the pass (GP-leg bills
+        # reference gate_pass_id; delivery-leg bills reference its deliveries).
+        gp_del_ids = []
+        gp_del_cursor = deliveries_collection.find(
+            {"gate_pass_id": payload.gate_pass_id, "status": {"$ne": "CANCELLED"}}
         )
-        if existing > 0:
-            raise HTTPException(
-                status_code=400,
-                detail="A bill already exists for this gate pass.",
-            )
+        async for del_doc in gp_del_cursor:
+            gp_del_ids.append(str(del_doc["_id"]))
 
-        gp_map = {}
-        for item in gp_dec.get("items", []):
-            name = item["item_name"]
-            qty = item.get("received_qty", 0)
-            gp_map[name] = gp_map.get(name, 0) + qty
+        already_billed_map = {}
+        billed_filter: dict = {
+            "payment_status": {"$ne": "CANCELLED"},
+            "$or": [{"gate_pass_id": payload.gate_pass_id}],
+        }
+        if gp_del_ids:
+            billed_filter["$or"].append({"delivery_ids": {"$in": gp_del_ids}})
+        prev_bills_cursor = bills_collection.find(billed_filter)
+        async for pb_doc in prev_bills_cursor:
+            pb_dec = decrypt_dict(pb_doc, SENSITIVE_FIELDS)
+            for item in pb_dec.get("items", []):
+                name = item["item_name"]
+                already_billed_map[name] = (
+                    already_billed_map.get(name, 0) + item["quantity"]
+                )
+
+        gp_map = be.compute_billable_received_by_name(gp_dec.get("items", []), already_billed_map)
 
         if payload.items:
             for input_item in payload.items:
@@ -565,56 +590,58 @@ async def get_unbilled_gatepasses(
 ):
     """
     Returns gate passes that have items ready to be billed.
+    The billable event is the RECEIVED quantity (business decision), so a
+    pass is listed as soon as it is received — delivery is not required.
     Optionally filter by client name.
     """
     from ..database.main_db import gatepasses_collection
-    
+
     query = {"status": {"$nin": ["CANCELLED"]}}
-    
+
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
-    
+
     gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
-    
+
     unbilled_gatepasses = []
-    
+
     async for gp_doc in gp_cursor:
         try:
             gp = decrypt_dict(gp_doc, ["client_name", "items", "notes"])
             gp["id"] = str(gp_doc["_id"])
             gp_id = gp["id"]
-            
-            # Get all deliveries for this gate pass
+
+            # Identify this pass's (non-cancelled) delivery records
             del_cursor = deliveries_collection.find(
                 {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
             )
-            
+
             delivery_ids = []
             delivered_items = {}
-            
+
             async for del_doc in del_cursor:
                 try:
                     delivery = decrypt_dict(del_doc, DELIVERY_SENSITIVE_FIELDS)
                     delivery_id = str(del_doc["_id"])
                     delivery_ids.append(delivery_id)
-                    
+
                     for item in delivery.get("items", []):
                         item_name = item["item_name"]
                         qty = item.get("quantity", 0)
                         delivered_items[item_name] = delivered_items.get(item_name, 0) + qty
                 except Exception:
                     pass
-            
-            if not delivery_ids:
-                continue
-            
-            # Check what's already billed from these deliveries
+
+            # What's already billed against this pass (either leg)
             billed_items = {}
-            bills_cursor = bills_collection.find({
-                "delivery_ids": {"$in": delivery_ids},
-                "payment_status": {"$ne": "CANCELLED"}
-            })
-            
+            billed_filter = {
+                "payment_status": {"$ne": "CANCELLED"},
+                "$or": [{"gate_pass_id": gp_id}],
+            }
+            if delivery_ids:
+                billed_filter["$or"].append({"delivery_ids": {"$in": delivery_ids}})
+            bills_cursor = bills_collection.find(billed_filter)
+
             async for bill_doc in bills_cursor:
                 try:
                     bill = decrypt_dict(bill_doc, SENSITIVE_FIELDS)
@@ -624,30 +651,39 @@ async def get_unbilled_gatepasses(
                         billed_items[item_name] = billed_items.get(item_name, 0) + qty
                 except Exception:
                     pass
-            
-            # Calculate unbilled quantities
+
+            # Calculate unbilled quantities on the received basis
             unbilled_items = []
             total_unbilled_qty = 0
-            
-            for item_name, delivered_qty in delivered_items.items():
+
+            received_by_name: dict = {}
+            for gp_item in gp.get("items", []):
+                name = gp_item.get("item_name", "")
+                received_by_name[name] = received_by_name.get(name, 0) + int(
+                    gp_item.get("received_qty", 0) or 0
+                )
+
+            for item_name, received_qty in received_by_name.items():
                 billed_qty = billed_items.get(item_name, 0)
-                unbilled_qty = delivered_qty - billed_qty
-                
+                unbilled_qty = max(0, received_qty - billed_qty)
+                delivered_qty = delivered_items.get(item_name, 0)
+
                 if unbilled_qty > 0:
                     gp_item = next(
                         (item for item in gp.get("items", []) if item["item_name"] == item_name),
-                        {}
+                        {},
                     )
-                    
+
                     unbilled_items.append({
                         "item_name": item_name,
                         "category": gp_item.get("category"),
+                        "received_qty": received_qty,
                         "delivered_qty": delivered_qty,
                         "billed_qty": billed_qty,
-                        "unbilled_qty": unbilled_qty
+                        "unbilled_qty": unbilled_qty,
                     })
                     total_unbilled_qty += unbilled_qty
-            
+
             if unbilled_items:
                 unbilled_gatepasses.append({
                     "id": gp_id,
@@ -657,12 +693,12 @@ async def get_unbilled_gatepasses(
                     "quotation_id": gp.get("quotation_id"),
                     "delivery_ids": delivery_ids,
                     "unbilled_items": unbilled_items,
-                    "total_unbilled_qty": total_unbilled_qty
+                    "total_unbilled_qty": total_unbilled_qty,
                 })
-                
+
         except Exception:
             pass
-    
+
     return unbilled_gatepasses
 
 
