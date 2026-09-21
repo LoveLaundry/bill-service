@@ -13,6 +13,7 @@ from ..database.main_db import (
     returns_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services.transaction_events import build_item_delta, record_event, EVENT_DELIVERY_CREATED
 from ..services.verification_service import attach_verification_to
 from ..models import DeliveryCreate, DeliveryModel
 
@@ -188,6 +189,23 @@ async def create_delivery(
 
     gp_new_version = await bump_version("gatepass", gp_oid)
     await enqueue_sync("gatepass", gp_oid, gp_new_version)
+
+    await record_event(
+        entity_type="delivery",
+        entity_id=serialized["id"],
+        event_type=EVENT_DELIVERY_CREATED,
+        gate_pass_id=payload.gate_pass_id,
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        item_deltas=[
+            build_item_delta(item["item_name"], item.get("specification"), 0, item["quantity"])
+            for item in new_delivery_items
+        ],
+        reason=payload.notes,
+        prev_status=gp_decrypted.get("status"),
+        new_status=new_gp_status,
+        meta={"delivery_date": payload.delivery_date.isoformat(), "fully_delivered": fully_delivered},
+    )
 
     await log_audit(
         current_user.get("auth_id", "system"),

@@ -9,6 +9,13 @@ from ..auth_helper import require_capability
 from ..database.main_db import returns_collection, gatepasses_collection, deliveries_collection
 from ..models import ReturnCreate, ReturnUpdate, RETURN_STATUSES
 from ..router_utils import parse_object_id, log_audit
+from ..services.transaction_events import (
+    build_item_delta,
+    record_event,
+    EVENT_RETURN_CREATED,
+    EVENT_RETURN_RESENT,
+    EVENT_RETURN_UPDATED,
+)
 from ..crypto_helper import get_search_token, encrypt_dict, decrypt_dict
 
 router = APIRouter(tags=["Returns"])
@@ -88,6 +95,21 @@ async def create_return(
         "return",
         str(result.inserted_id),
         details={"return_id": return_id, "client": payload.client_name, "items": len(payload.items)},
+    )
+
+    await record_event(
+        entity_type="return",
+        entity_id=str(result.inserted_id),
+        event_type=EVENT_RETURN_CREATED,
+        gate_pass_id=payload.gate_pass_id,
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        reason=payload.notes,
+        item_deltas=[
+            build_item_delta(item.get("item_name"), item.get("specification"), 0, item.get("returned_qty", 0))
+            for item in payload.items
+        ],
+        meta={"return_id": return_id, "delivery_id": payload.delivery_id, "status": "PENDING"},
     )
 
     return _dec(doc)
@@ -228,6 +250,17 @@ async def update_return(
         details={"return_id": return_id, "changes": list(update_fields.keys())},
     )
 
+    await record_event(
+        entity_type="return",
+        entity_id=str(raw_doc["_id"]),
+        event_type=EVENT_RETURN_UPDATED,
+        gate_pass_id=doc.get("gate_pass_id"),
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        reason=payload.notes,
+        meta={"return_id": return_id, "changes": list(update_fields.keys())},
+    )
+
     updated = await returns_collection.find_one({"return_id": return_id})
     return _dec(updated)
 
@@ -279,6 +312,19 @@ async def mark_item_resent(
         "return",
         str(raw_doc["_id"]),
         details={"return_id": return_id, "item": item_name, "spec": specification},
+    )
+
+    await record_event(
+        entity_type="return",
+        entity_id=str(raw_doc["_id"]),
+        event_type=EVENT_RETURN_RESENT,
+        gate_pass_id=doc.get("gate_pass_id"),
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        item_deltas=[
+            build_item_delta(item_name, specification, 0, 0)
+        ],
+        meta={"return_id": return_id, "resent_at": now.isoformat()},
     )
 
     updated = await returns_collection.find_one({"return_id": return_id})

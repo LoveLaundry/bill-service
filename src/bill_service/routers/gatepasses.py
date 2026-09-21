@@ -9,6 +9,16 @@ from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import audit_collection, gatepasses_collection
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..error_responses import NotFoundError, ValidationError, ConflictError, ForbiddenError
+from ..services.transaction_events import (
+    build_item_delta,
+    record_event,
+    EVENT_ADJUSTMENT_REQUESTED,
+    EVENT_GATE_PASS_CREATED,
+    EVENT_LEGACY_NOTE_CLOSURE,
+    EVENT_RECEIVING_DATE_CHANGED,
+    EVENT_RECEIVING_EDITED,
+    EVENT_STATUS_CHANGED,
+)
 from ..services.verification_service import attach_verification_to
 from ..models import (
     GatePassAdjustment,
@@ -121,6 +131,20 @@ async def create_gate_pass(
     await enqueue_sync("gatepass", result.inserted_id, new_version)
     serialized = await attach_verification_to("gatepass", result.inserted_id, serialized)
 
+    await record_event(
+        entity_type="gatepass",
+        entity_id=serialized["id"],
+        event_type=EVENT_GATE_PASS_CREATED,
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        new_status="RECEIVED",
+        item_deltas=[
+            build_item_delta(item["item_name"], item.get("specification"), 0, item["received_qty"])
+            for item in processed_items
+        ],
+        meta={"gate_pass_number": payload.gate_pass_number},
+    )
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_CREATE",
@@ -208,6 +232,8 @@ async def update_gate_pass_status(
             status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
         )
 
+    previous_status = doc.get("status")
+
     # Update status field
     await gatepasses_collection.update_one(
         {"_id": oid},
@@ -225,6 +251,18 @@ async def update_gate_pass_status(
     new_version = await bump_version("gatepass", oid)
     await enqueue_sync("gatepass", oid, new_version)
     serialized = await attach_verification_to("gatepass", oid, serialized)
+
+    await record_event(
+        entity_type="gatepass",
+        entity_id=serialized["id"],
+        event_type=EVENT_STATUS_CHANGED,
+        gate_pass_id=serialized["id"],
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        prev_status=previous_status,
+        new_status=status_update,
+        meta={"endpoint": "status_patch"},
+    )
 
     await log_audit(
         current_user.get("auth_id", "system"),
@@ -291,6 +329,19 @@ async def mark_gate_pass_delivered(
     await enqueue_sync("gatepass", oid, new_version)
     serialized = await attach_verification_to("gatepass", oid, serialized)
 
+    await record_event(
+        entity_type="gatepass",
+        entity_id=serialized["id"],
+        event_type=EVENT_LEGACY_NOTE_CLOSURE,
+        gate_pass_id=serialized["id"],
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        prev_status=current_status,
+        new_status="DELIVERED",
+        reason=payload.note,
+        meta={"delivered_date": delivered_date, "legacy": True, "quantity_based": False},
+    )
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_MARK_DELIVERED",
@@ -330,6 +381,17 @@ async def update_gate_pass_date(
     await enqueue_sync("gatepass", oid, new_version)
     serialized = await attach_verification_to("gatepass", oid, serialized)
 
+    await record_event(
+        entity_type="gatepass",
+        entity_id=serialized["id"],
+        event_type=EVENT_RECEIVING_DATE_CHANGED,
+        gate_pass_id=serialized["id"],
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        reason=payload.reason,
+        meta={"receiving_date": payload.receiving_date.isoformat()},
+    )
+
     await log_audit(
         current_user.get("auth_id", "system"),
         "RECEIVING_DATE_UPDATE",
@@ -361,6 +423,7 @@ async def update_gate_pass(
 
         decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
         update_data = payload.model_dump(exclude_unset=True)
+        previous_items = {i["item_name"]: i.get("received_qty", 0) for i in decrypted.get("items", [])}
 
         if "items" in update_data and update_data["items"]:
             processed_items = []
@@ -397,6 +460,41 @@ async def update_gate_pass(
         new_version = await bump_version("gatepass", oid)
         await enqueue_sync("gatepass", oid, new_version)
         serialized = await attach_verification_to("gatepass", oid, serialized)
+
+        old_items = previous_items
+        if "items" in update_data and update_data["items"]:
+            deltas = [
+                build_item_delta(
+                    item["item_name"],
+                    item.get("specification"),
+                    old_items.get(item["item_name"], 0),
+                    item["received_qty"],
+                )
+                for item in processed_items
+                if old_items.get(item["item_name"], 0) != item["received_qty"]
+            ]
+            await record_event(
+                entity_type="gatepass",
+                entity_id=serialized["id"],
+                event_type=EVENT_RECEIVING_EDITED,
+                gate_pass_id=serialized["id"],
+                user_id=current_user.get("auth_id", "system"),
+                user_name=current_user.get("user_name"),
+                item_deltas=deltas or None,
+                reason=update_data.get("notes"),
+                meta={"changed_fields": [k for k in update_data if k != "items"]} or {"items": True},
+            )
+        else:
+            await record_event(
+                entity_type="gatepass",
+                entity_id=serialized["id"],
+                event_type=EVENT_RECEIVING_EDITED,
+                gate_pass_id=serialized["id"],
+                user_id=current_user.get("auth_id", "system"),
+                user_name=current_user.get("user_name"),
+                reason=update_data.get("notes"),
+                meta={"changed_fields": [k for k in update_data if k != "items"]},
+            )
 
         await log_audit(
             current_user.get("auth_id", "system"),
@@ -475,6 +573,20 @@ async def adjust_gate_pass(
     new_version = await bump_version("gatepass", oid)
     await enqueue_sync("gatepass", oid, new_version)
     serialized = await attach_verification_to("gatepass", oid, serialized)
+
+    await record_event(
+        entity_type="gatepass",
+        entity_id=serialized["id"],
+        event_type=EVENT_ADJUSTMENT_REQUESTED,
+        gate_pass_id=serialized["id"],
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        reason=payload.reason,
+        item_deltas=[
+            build_item_delta(payload.item_name, None, original_val, payload.corrected_qty)
+        ],
+        meta={"legacy_in_place_adjust": True, "corrected_value": payload.corrected_qty},
+    )
 
     await log_audit(
         current_user.get("auth_id", "system"),

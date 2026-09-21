@@ -81,6 +81,9 @@ async def ensure_indexes():
     await linen_events_collection.create_index("linen_id")
     await linen_events_collection.create_index("timestamp")
     await linen_events_collection.create_index([("linen_id", 1), ("timestamp", -1)])
+    # Transaction/entity journal indexes
+    await linen_events_collection.create_index([("entity_type", 1), ("entity_id", 1), ("occurred_at", -1)])
+    await linen_events_collection.create_index("gate_pass_id")
 
     # Returns indexes
     await returns_collection.create_index("return_id", unique=True)

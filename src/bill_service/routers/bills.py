@@ -14,6 +14,7 @@ from ..database.main_db import (
     payments_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
 from pydantic import BaseModel
 from ..models import (
@@ -405,6 +406,23 @@ async def create_bill(
     new_version = await bump_version("bill", result.inserted_id)
     await enqueue_sync("bill", result.inserted_id, new_version)
     serialized = await attach_verification_to("bill", result.inserted_id, serialized)
+
+    await record_event(
+        entity_type="bill",
+        entity_id=serialized["id"],
+        event_type=EVENT_BILL_CREATED,
+        gate_pass_id=payload.gate_pass_id,
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        item_deltas=[
+            build_item_delta(it["item_name"], None, 0, it["quantity"]) for it in bill_items_to_save
+        ],
+        meta={
+            "delivery_ids": del_ids_to_save,
+            "payment_status": payment_status,
+            "grand_total": grand_total,
+        },
+    )
 
     await log_audit(
         current_user.get("auth_id", "system"),
