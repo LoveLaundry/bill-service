@@ -1256,6 +1256,7 @@ async def today_deliveries(
 
         # Get ALL delivered qty for this client across ALL gate passes
         delivered_map: Dict[str, int] = {}
+        recorded_by_gp: Dict[str, Dict[str, int]] = {}
         del_cursor2 = deliveries_collection.find({
             "client_name_search": get_search_token(client),
             "status": {"$ne": "CANCELLED"},
@@ -1263,6 +1264,14 @@ async def today_deliveries(
         async for doc in del_cursor2:
             try:
                 dl = _decrypt_del(doc)
+                gpid = dl.get("gate_pass_id") or ""
+                if gpid:
+                    m = recorded_by_gp.setdefault(gpid, {})
+                    for item in dl.get("items", []):
+                        item_name = item.get("item_name", "")
+                        spec = item.get("specification") or ""
+                        detail_key = f"{item_name}||{spec}" if spec else item_name
+                        m[detail_key] = m.get(detail_key, 0) + item.get("quantity", 0)
                 for item in dl.get("items", []):
                     item_name = item.get("item_name", "")
                     spec = item.get("specification") or ""
@@ -1272,7 +1281,10 @@ async def today_deliveries(
             except Exception:
                 continue
 
-        # Mark-delivered gate passes count as fully delivered for pending math
+        # Mark-delivered gate passes count as fully delivered for pending math.
+        # Only add the un-recorded remainder per gate pass so a marked pass that
+        # shares an item name with other passes of the same client is not under
+        # or over counted.
         md_cursor2 = gatepasses_collection.find({
             "client_name_search": get_search_token(client),
             "marked_delivered": {"$exists": True},
@@ -1282,13 +1294,15 @@ async def today_deliveries(
                 gp = _decrypt_gp(doc)
                 if not gp.get("marked_delivered"):
                     continue
+                recorded = recorded_by_gp.get(gp["id"], {})
                 for item in gp.get("items", []):
                     item_name = item.get("item_name", "")
                     spec = item.get("specification") or ""
                     qty = int(item.get("received_qty", 0) or 0)
                     detail_key = f"{item_name}||{spec}" if spec else item_name
-                    if qty > delivered_map.get(detail_key, 0):
-                        delivered_map[detail_key] = qty
+                    extra = max(0, qty - recorded.get(detail_key, 0))
+                    if extra > 0:
+                        delivered_map[detail_key] = delivered_map.get(detail_key, 0) + extra
             except Exception:
                 continue
 
