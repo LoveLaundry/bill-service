@@ -6,7 +6,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
-from ..database.main_db import audit_collection, gatepasses_collection
+from ..database.main_db import (
+    audit_collection,
+    deliveries_collection,
+    gatepasses_collection,
+    returns_collection,
+)
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..error_responses import NotFoundError, ValidationError, ConflictError, ForbiddenError
 from ..services.transaction_events import (
@@ -203,6 +208,67 @@ async def get_gate_pass(
         )
     serialized = _serialize(doc)
     return await attach_verification_to("gatepass", oid, serialized)
+
+
+@router.get("/{gate_pass_id}/balance")
+async def get_gate_pass_balance(
+    gate_pass_id: str,
+    current_user: dict = Depends(require_capability("gatepass:read")),
+):
+    """Canonical per-gate-pass balance computed by the balance engine.
+
+    Every screen that renders pending/remaining/delivered for a gate pass
+    should consume this endpoint instead of re-calculating locally.
+    """
+    from ..services import balance_engine as be
+
+    oid = _parse_object_id(gate_pass_id)
+    doc = await gatepasses_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
+        )
+    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+
+    deliveries: List[dict] = []
+    dl_cursor = deliveries_collection.find(
+        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
+    )
+    async for dl_doc in dl_cursor:
+        try:
+            deliveries.append(decrypt_dict(dl_doc, SENSITIVE_FIELDS))
+        except Exception:
+            continue
+
+    returns: List[dict] = []
+    ret_cursor = returns_collection.find({"gate_pass_id": gate_pass_id})
+    async for ret_doc in ret_cursor:
+        try:
+            returns.append(decrypt_dict(ret_doc, SENSITIVE_FIELDS))
+        except Exception:
+            continue
+
+    balance = be.compute_gate_pass_balance(
+        decrypted.get("items", []),
+        be.compute_delivered_by_item(deliveries),
+        be.compute_returned_by_item(returns),
+        marked_delivered=bool(decrypted.get("marked_delivered")),
+    )
+
+    derived_status = be.derive_gate_pass_status(balance, decrypted.get("status", ""))
+
+    return {
+        "gate_pass_id": gate_pass_id,
+        "gate_pass_number": decrypted.get("gate_pass_number"),
+        "client_name": decrypted.get("client_name"),
+        "receiving_date": decrypted.get("receiving_date"),
+        "status": decrypted.get("status"),
+        "derived_status": derived_status,
+        "marked_delivered": bool(decrypted.get("marked_delivered")),
+        "items": list(balance["items"].values()),
+        "totals": balance["totals"],
+        "flags": balance["flags"],
+    }
 
 
 @router.patch("/{gate_pass_id}/status", response_model=GatePassModel)

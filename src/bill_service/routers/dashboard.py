@@ -116,6 +116,110 @@ def _flatten_returned_by_name(returned_by_gp: Dict[str, Dict[str, int]]) -> Dict
     return out
 
 
+@router.get("/balances/client")
+async def get_client_balances(
+    client_name: str = Query(..., min_length=1),
+    include_closed: bool = Query(False),
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
+    """Single authoritative source for a client's linen balances.
+
+    Computed entirely by the balance engine from the raw gate pass,
+    delivery and return documents. Nothing on the frontend should
+    calculate these numbers independently.
+    """
+    from ..services import balance_engine as be
+
+    query: dict = {"client_name_search": get_search_token(client_name)}
+    if not include_closed:
+        query["status"] = {"$nin": ["CANCELLED"]}
+    gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
+
+    gp_ids: List[str] = []
+    gp_docs: List[dict] = []
+    for gd in await gp_cursor.to_list(length=None):
+        try:
+            decced = _decrypt_gp(gd)
+        except Exception:
+            continue
+        gp_docs.append(decced)
+        gp_ids.append(decced["id"])
+
+    # deliveries for these GPs
+    delivered_by_gp: Dict[str, Dict[str, int]] = {}
+    dl_cursor = deliveries_collection.find(
+        {"gate_pass_id": {"$in": gp_ids}, "status": {"$ne": "CANCELLED"}}
+    )
+    async for dl_doc in dl_cursor:
+        try:
+            dl = decrypt_dict(dl_doc, SENSITIVE_FIELDS_DEL)
+        except Exception:
+            continue
+        dm = be.compute_delivered_by_item([dl])
+        cur = delivered_by_gp.setdefault(dl["gate_pass_id"], {})
+        for k, v in dm.items():
+            cur[k] = cur.get(k, 0) + v
+
+    # returns on these GPs
+    returned_by_gp: Dict[str, Dict[str, int]] = {}
+    ret_cursor = returns_collection.find({"gate_pass_id": {"$in": gp_ids}})
+    async for ret_doc in ret_cursor:
+        try:
+            try:
+                ret = decrypt_dict(ret_doc, SENSITIVE_FIELDS_GP)
+            except (ValueError, KeyError):
+                ret = ret_doc
+        except Exception:
+            continue
+        gp_id = str(ret.get("gate_pass_id") or "")
+        if not gp_id:
+            continue
+        rm = be.compute_returned_by_item([ret])
+        cur = returned_by_gp.setdefault(gp_id, {})
+        for k, v in rm.items():
+            cur[k] = cur.get(k, 0) + v
+
+    result_gps = []
+    totals = {
+        "expected_qty": 0,
+        "received_qty": 0,
+        "delivered_qty": 0,
+        "effective_delivered_qty": 0,
+        "outstanding_delivery_qty": 0,
+        "returned_back_qty": 0,
+        "not_received_qty": 0,
+    }
+    for gp in gp_docs:
+        balance = be.compute_gate_pass_balance(
+            gp["items"],
+            delivered_by_gp.get(gp["id"], {}),
+            returned_by_gp.get(gp["id"], {}),
+            marked_delivered=bool(gp.get("marked_delivered")),
+        )
+        derived = be.derive_gate_pass_status(balance, gp.get("status", ""))
+        for k, v in balance["totals"].items():
+            totals[k] = totals.get(k, 0) + v
+        result_gps.append(
+            {
+                "gate_pass_id": gp["id"],
+                "gate_pass_number": gp.get("gate_pass_number"),
+                "receiving_date": gp.get("receiving_date"),
+                "status": gp.get("status"),
+                "derived_status": derived,
+                "marked_delivered": bool(gp.get("marked_delivered")),
+                "items": list(balance["items"].values()),
+                "totals": balance["totals"],
+                "flags": balance["flags"],
+            }
+        )
+
+    return {
+        "client_name": client_name,
+        "gate_passes": result_gps,
+        "totals": totals,
+    }
+
+
 # --- 1. Client Dashboard Summary ---
 @router.get(
     "/dashboard/client-summary",
@@ -851,36 +955,34 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
     # Cancelled gate passes are void — never count as received or pending.
     open_gps = [gp for gp in gate_passes if gp.get("status") != "CANCELLED"]
     gp_count = len(open_gps)
-    items_received = sum(
-        it["received_qty"] for gp in open_gps for it in gp["items"]
-    )
 
-    del_map = {}
+    # Single authoritative balance engine. All delivered/outstanding numbers
+    # below come from balance_engine so no other page can compute them differently.
+    from ..services import balance_engine as be
+
+    delivered_by_gp: Dict[str, Dict[str, int]] = {}
     for d in deliveries:
-        m = del_map.setdefault(d["gate_pass_id"], {})
-        for it in d["items"]:
-            key = _key(it["item_name"], it.get("specification") or "")
-            m[key] = m.get(key, 0) + it["quantity"]
-    items_delivered = sum(it["quantity"] for d in deliveries for it in d["items"])
+        dm = be.compute_delivered_by_item([d])
+        cur = delivered_by_gp.setdefault(d["gate_pass_id"], {})
+        for k, v in dm.items():
+            cur[k] = cur.get(k, 0) + v
 
-    # Gate passes completed via catch-up mark-delivered (no item-level record)
-    # count as fully delivered for dashboard metrics and pending computations.
-    for gp in open_gps:
-        if not gp.get("marked_delivered"):
-            continue
-        m = del_map.setdefault(gp["id"], {})
-        for it in gp["items"]:
-            rec = int(it["received_qty"] or 0)
-            key = _key(it["item_name"], it.get("specification") or "")
-            if rec > m.get(key, 0):
-                items_delivered += rec - m.get(key, 0)
-            m[key] = max(m.get(key, 0), rec)
-
-    # Total returned items (need re-sending)
+    balances = []
+    items_received = 0
+    items_delivered = 0
     total_returned = 0
-    if returned_by_gp:
-        for gp_items in returned_by_gp.values():
-            total_returned += sum(gp_items.values())
+    for gp in open_gps:
+        gp_id = gp["id"]
+        bal = be.compute_gate_pass_balance(
+            gp["items"],
+            delivered_by_gp.get(gp_id, {}),
+            (returned_by_gp or {}).get(gp_id, {}),
+            marked_delivered=bool(gp.get("marked_delivered")),
+        )
+        balances.append((gp, bal))
+        items_received += bal["totals"]["received_qty"]
+        items_delivered += bal["totals"]["effective_delivered_qty"]
+        total_returned += bal["totals"]["returned_back_qty"]
 
     items_pending = max(0, items_received - items_delivered + total_returned)
 
@@ -929,34 +1031,27 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
     payment_status = [s for s in payment_status if s["value"] > 0]
 
     pending_gps = []
-    for gp in open_gps:
-        dm = del_map.get(gp["id"], {})
-        ret_map = (returned_by_gp or {}).get(gp["id"], {})
-        pending_detail = []
-        total_pending = 0
-        for it in gp["items"]:
-            key = _key(it["item_name"], it.get("specification") or "")
-            delivered = dm.get(key, 0)
-            ret_qty = ret_map.get(key, 0)
-            p = max(0, it["received_qty"] - delivered + ret_qty)
-            if p > 0:
-                total_pending += p
-                pending_detail.append({
-                    "item_name": it["item_name"],
-                    "specification": it.get("specification") or "",
-                    "category": it.get("category") or "",
-                    "received": it["received_qty"],
-                    "delivered": delivered,
-                    "returned": ret_qty,
-                    "pending": p,
-                })
+    for gp, bal in balances:
+        pending_rows = be.compute_outstanding_per_item(gp["items"], bal)
+        total_pending = sum(r["pending_qty"] for r in pending_rows)
         if total_pending > 0:
             pending_gps.append(
                 {
                     "gate_pass_number": gp["gate_pass_number"],
                     "client_name": gp["client_name"],
                     "pending": total_pending,
-                    "items": pending_detail,
+                    "items": [
+                        {
+                            "item_name": r["item_name"],
+                            "specification": r["specification"],
+                            "category": r["category"],
+                            "received": r["received_qty"],
+                            "delivered": r["delivered_qty"],
+                            "returned": r["returned_qty"],
+                            "pending": r["pending_qty"],
+                        }
+                        for r in pending_rows
+                    ],
                 }
             )
     pending_gps.sort(key=lambda x: -x["pending"])

@@ -239,47 +239,31 @@ async def pending_gatepasses(
         except Exception:
             continue
 
-    ret_cursor = returns_collection.find()
-    all_returns: List[dict] = []
-    async for doc in ret_cursor:
-        try:
-            all_returns.append(decrypt_dict(doc, GATEPASS_SENSITIVE_FIELDS))
-        except Exception:
-            continue
+    # Build delivered map: gate_pass_id → {item_key → qty} via the canonical engine.
+    from ..services import balance_engine as be
 
-    # Build delivered map: gate_pass_id → {item_key → qty}
     delivered_by_gp: Dict[str, Dict[str, int]] = {}
     for dl in all_deliveries:
-        gp_id = dl.get("gate_pass_id", "")
-        if gp_id not in delivered_by_gp:
-            delivered_by_gp[gp_id] = {}
-        for item in dl.get("items", []):
-            key = f"{item.get('item_name', '')}||{item.get('specification') or ''}"
-            delivered_by_gp[gp_id][key] = delivered_by_gp[gp_id].get(key, 0) + item.get("quantity", 0)
+        dm = be.compute_delivered_by_item([dl])
+        cur = delivered_by_gp.setdefault(dl.get("gate_pass_id", ""), {})
+        for k, v in dm.items():
+            cur[k] = cur.get(k, 0) + v
 
-    # Build returned map: gate_pass_id → {item_key → qty} for RECEIVE_BACK/RE_WASH not SENT.
-    # Returns carry their own gate_pass_id, so they only count for the pass they
-    # were raised on — never for another pass of the same client.
+    # Build returned map via the canonical engine (only RECEIVE_BACK/RE_WASH not SENT).
+    ret_cursor = returns_collection.find()
     returned_by_gp: Dict[str, Dict[str, int]] = {}
-    for ret in all_returns:
+    async for doc in ret_cursor:
+        try:
+            ret = decrypt_dict(doc, GATEPASS_SENSITIVE_FIELDS)
+        except Exception:
+            continue
         gp_id = ret.get("gate_pass_id") or ""
         if not gp_id:
             continue
-        if gp_id not in returned_by_gp:
-            returned_by_gp[gp_id] = {}
-        for item in ret.get("items", []):
-            if not isinstance(item, dict):
-                continue
-            if item.get("action") not in ("RECEIVE_BACK", "RE_WASH"):
-                continue
-            if item.get("resend_status") == "SENT":
-                continue
-            name = item.get("item_name", "")
-            spec = item.get("specification") or ""
-            qty = int(item.get("returned_qty", 0) or 0)
-            if qty > 0:
-                key = f"{name}||{spec}"
-                returned_by_gp[gp_id][key] = returned_by_gp[gp_id].get(key, 0) + qty
+        rm = be.compute_returned_by_item([ret])
+        cur = returned_by_gp.setdefault(gp_id, {})
+        for k, v in rm.items():
+            cur[k] = cur.get(k, 0) + v
 
     # Process gate passes
     gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
@@ -292,28 +276,30 @@ async def pending_gatepasses(
 
         gp_id = gp.get("id") or str(doc["_id"])
         client = (gp.get("client_name") or "").strip()
-        del_map = delivered_by_gp.get(gp_id, {})
-        ret_map = returned_by_gp.get(gp_id, {})
 
-        items_with_pending = []
-        for gp_item in gp.get("items", []):
-            name = gp_item.get("item_name", "")
-            spec = gp_item.get("specification") or ""
-            key = f"{name}||{spec}"
-            received = gp_item.get("received_qty", 0)
-            delivered = del_map.get(key, 0)
-            returned = ret_map.get(key, 0)
-            pending = max(0, received - delivered + returned)
-            if pending > 0:
-                items_with_pending.append({
-                    "item_name": name,
-                    "specification": spec,
-                    "category": gp_item.get("category") or "",
-                    "received_qty": received,
-                    "delivered_qty": delivered,
-                    "returned_qty": returned,
-                    "pending_qty": pending,
-                })
+        balance = be.compute_gate_pass_balance(
+            gp.get("items", []),
+            delivered_by_gp.get(gp_id, {}),
+            returned_by_gp.get(gp_id, {}),
+            marked_delivered=bool(gp.get("marked_delivered")),
+        )
+
+        items_with_pending = be.compute_outstanding_per_item(
+            gp.get("items", []), balance
+        )
+        # Keep the endpoint's canonical output field names.
+        items_with_pending = [
+            {
+                "item_name": r["item_name"],
+                "specification": r["specification"],
+                "category": r["category"],
+                "received_qty": r["received_qty"],
+                "delivered_qty": r["delivered_qty"],
+                "returned_qty": r["returned_qty"],
+                "pending_qty": r["pending_qty"],
+            }
+            for r in items_with_pending
+        ]
 
         if items_with_pending:
             total_pending = sum(i["pending_qty"] for i in items_with_pending)
