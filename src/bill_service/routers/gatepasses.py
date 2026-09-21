@@ -1,8 +1,8 @@
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
@@ -13,6 +13,7 @@ from ..database.main_db import (
     returns_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services import idempotency
 from ..error_responses import NotFoundError, ValidationError, ConflictError, ForbiddenError
 from ..services.transaction_events import (
     build_item_delta,
@@ -82,7 +83,16 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str):
 async def create_gate_pass(
     payload: GatePassCreate,
     current_user: dict = Depends(require_capability("gatepass:write")),
+    request: Request = None,
 ):
+    auth_id = current_user.get("auth_id", "system")
+
+    # Idempotent create: a retry with the same X-Idempotency-Key returns the
+    # previously created gate pass instead of duplicating it.
+    existing_created = await idempotency.find_previous(request, auth_id, gatepasses_collection)
+    if existing_created:
+        return _serialize(existing_created)
+
     # Check if uniqueness constraint violates
     existing = await gatepasses_collection.find_one(
         {"gate_pass_number": payload.gate_pass_number}
@@ -157,6 +167,7 @@ async def create_gate_pass(
         "gatepass",
         serialized["id"],
     )
+    await idempotency.record_created(request, auth_id, "gatepass", serialized["id"])
     return serialized
 
 

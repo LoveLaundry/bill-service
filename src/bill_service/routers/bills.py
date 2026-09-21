@@ -2,7 +2,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
@@ -14,6 +14,7 @@ from ..database.main_db import (
     payments_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services import idempotency
 from ..services import balance_engine as be
 from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
@@ -137,7 +138,17 @@ async def get_quotation_prices(quotation_id: str) -> dict:
 async def create_bill(
     payload: BillCreate,
     current_user: dict = Depends(require_capability("bill:write")),
+    request: Request = None,
 ):
+    auth_id = current_user.get("auth_id", "system")
+
+    # Idempotent create: retried requests reuse the previously created bill.
+    existing_created = await idempotency.find_previous(request, auth_id, bills_collection)
+    if existing_created:
+        return await attach_verification_to(
+            "bill", existing_created["_id"], _serialize(existing_created)
+        )
+
     # 0. Resolve gate pass (optional) and its quotation for pricing
     gp_doc = None
     gp_dec = None
@@ -455,6 +466,7 @@ async def create_bill(
         "bill",
         serialized["id"],
     )
+    await idempotency.record_created(request, auth_id, "bill", serialized["id"])
     return serialized
 
 
@@ -899,7 +911,15 @@ async def create_payment(
     bill_id: str,
     payload: PaymentCreate,
     current_user: dict = Depends(require_capability("payment:write")),
+    request: Request = None,
 ):
+    auth_id = current_user.get("auth_id", "system")
+
+    # Idempotent create: retried payment posts reuse the previous payment.
+    existing_created = await idempotency.find_previous(request, auth_id, payments_collection)
+    if existing_created:
+        return _serialize_payment(existing_created)
+
     oid = _parse_object_id(bill_id)
     doc = await bills_collection.find_one({"_id": oid})
     if not doc:
@@ -975,6 +995,7 @@ async def create_payment(
         "payment",
         serialized_pay["id"],
     )
+    await idempotency.record_created(request, auth_id, "payment", serialized_pay["id"])
     return serialized_pay
 
 

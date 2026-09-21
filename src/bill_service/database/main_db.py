@@ -22,6 +22,7 @@ linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
 linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
 returns_collection: AsyncIOMotorCollection = _db.get_collection("returns")
 adjustments_collection: AsyncIOMotorCollection = _db.get_collection("adjustments")
+idempotency_collection: AsyncIOMotorCollection = _db.get_collection("idempotency_keys")
 shop_bills_collection: AsyncIOMotorCollection = _db.get_collection("shop_bills")
 bill_templates_collection: AsyncIOMotorCollection = _db.get_collection("bill_templates")
 legacy_invoices_collection: AsyncIOMotorCollection = _db.get_collection("legacy_invoices")
@@ -97,6 +98,10 @@ async def ensure_indexes():
     await adjustments_collection.create_index("gate_pass_id")
     await adjustments_collection.create_index("status")
     await adjustments_collection.create_index("created_at")
+
+    # Idempotency keys (unique per user:key)
+    await idempotency_collection.create_index("key", unique=True)
+    await idempotency_collection.create_index("created_at")
 
     # Shop Bills indexes
     await shop_bills_collection.create_index("bill_number", unique=True)

@@ -11,6 +11,7 @@ from .routers.admin_database import router as admin_database_router
 from .routers.adjustments import router as adjustments_router
 from .routers.bills import router as bills_router
 from .routers.deliveries import router as deliveries_router
+from .routers.events import router as events_router
 from .routers.dispatch import router as dispatch_router
 from .routers.loyalty import router as loyalty_router
 from .routers.dashboard import router as dashboard_router
@@ -96,6 +97,7 @@ app.include_router(bills_router)
 app.include_router(gatepasses_router)
 app.include_router(adjustments_router)
 app.include_router(deliveries_router)
+app.include_router(events_router)
 app.include_router(dispatch_router)
 app.include_router(loyalty_router)
 app.include_router(dashboard_router)

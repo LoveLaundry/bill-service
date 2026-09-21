@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
@@ -13,6 +13,7 @@ from ..database.main_db import (
     returns_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
+from ..services import idempotency
 from ..services.transaction_events import build_item_delta, record_event, EVENT_DELIVERY_CREATED
 from ..services.verification_service import attach_verification_to
 from ..models import DeliveryCreate, DeliveryModel
@@ -61,7 +62,16 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str):
 async def create_delivery(
     payload: DeliveryCreate,
     current_user: dict = Depends(require_capability("delivery:write")),
+    request: Request = None,
 ):
+    auth_id = current_user.get("auth_id", "system")
+
+    # Idempotent create: a retry with the same X-Idempotency-Key returns the
+    # previously created delivery instead of duplicating it.
+    existing_created = await idempotency.find_previous(request, auth_id, deliveries_collection)
+    if existing_created:
+        return _serialize(existing_created)
+
     gp_oid = _parse_object_id(payload.gate_pass_id)
 
     # 1. Fetch and decrypt Gate Pass
@@ -213,6 +223,7 @@ async def create_delivery(
         "delivery",
         serialized["id"],
     )
+    await idempotency.record_created(request, auth_id, "delivery", serialized["id"])
     return serialized
 
 
@@ -320,6 +331,8 @@ async def pending_gatepasses(
 async def list_deliveries(
     client_name: Optional[str] = Query(None),
     gate_pass_id: Optional[str] = Query(None),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
     current_user: dict = Depends(require_capability("delivery:read")),
 ):
     query = {}
@@ -329,6 +342,14 @@ async def list_deliveries(
 
     if gate_pass_id:
         query["gate_pass_id"] = gate_pass_id
+
+    if date_from or date_to:
+        date_query = {}
+        if date_from:
+            date_query["$gte"] = date_from.replace(tzinfo=timezone.utc)
+        if date_to:
+            date_query["$lte"] = date_to.replace(tzinfo=timezone.utc)
+        query["delivery_date"] = date_query
 
     cursor = deliveries_collection.find(query).sort("delivery_date", -1)
     results = []
