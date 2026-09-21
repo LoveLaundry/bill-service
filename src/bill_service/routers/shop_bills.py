@@ -99,6 +99,19 @@ def _get_search_token(name: str) -> str:
     return get_search_token(name)
 
 
+def _as_dt(value):
+    """Coerce a stored date value to a timezone-aware datetime, or None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
 def _calc_item_line_total(item: dict) -> float:
     """Compute line total for a single bill item."""
     unit_price = item.get("unit_price", 0)
@@ -387,29 +400,38 @@ async def list_bills(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=500),
     status_filter: Optional[str] = Query(None, alias="status"),
+    payment_status: Optional[str] = Query(None),
+    client_name: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     query: dict = {}
     if status_filter:
         query["status"] = status_filter
+    if payment_status:
+        query["payment_status"] = payment_status
+    if client_name:
+        query["client_name_search"] = _get_search_token(client_name)
+    if search:
+        query["$or"] = [
+            {"bill_number": {"$regex": search, "$options": "i"}},
+            {"client_name_search": {"$regex": _get_search_token(search), "$options": "i"}},
+            {"notes": {"$regex": search, "$options": "i"}},
+        ]
+
+    sort_field = sort_by if sort_by in ("created_at", "updated_at", "grand_total", "bill_number") else "created_at"
+    direction = 1 if str(sort_order).lower() == "asc" else -1
 
     total = await shop_bills_collection.count_documents(query)
     items = []
     async for doc in (
-        shop_bills_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        shop_bills_collection.find(query).sort(sort_field, direction).skip(skip).limit(limit)
     ):
         items.append(_dec(doc))
 
     return {"items": items, "total": total}
-
-
-@router.get("/{bill_id}")
-async def get_bill(
-    bill_id: str,
-    current_user: dict = Depends(require_capability("bill:read")),
-):
-    doc = await _find_bill(bill_id)
-    return _dec(doc)
 
 
 @router.patch("/{bill_id}")
@@ -948,7 +970,13 @@ async def quick_bill(
     now = datetime.now(timezone.utc)
     bn = _generate_bill_number()
 
-    items = body.get("items", []) or []
+    items = [dict(i) for i in (body.get("items", []) or [])]
+    if not items and body.get("template_id"):
+        tpl_raw = await bill_templates_collection.find_one({"_id": parse_object_id(body["template_id"], "Template ID")})
+        if tpl_raw:
+            tpl = _dec_template(tpl_raw)
+            items = [dict(i) for i in tpl.get("items", [])]
+            await bill_templates_collection.update_one({"_id": tpl_raw["_id"]}, {"$inc": {"use_count": 1}})
     _prepare_items(items)
     totals = _calc_totals(items)
     grand_total = totals["grand_total"]
@@ -1241,7 +1269,7 @@ async def stats_by_status(
     result = []
     async for doc in shop_bills_collection.aggregate([{"$group": {"_id": "$status", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}}]):
         result.append({"status": doc["_id"], "count": doc["count"], "total": round(doc["total"], 2)})
-    return {"items": result}
+    return {"items": result, "counts": result}
 
 
 @router.get("/stats/by-client")
@@ -1312,8 +1340,9 @@ async def payment_summary(
             "count": doc["count"],
             "total": round(doc["total"], 2),
             "paid": round(doc["paid"], 2),
+            "total_outstanding": round(doc["total"] - doc["paid"], 2),
         })
-    return {"items": result}
+    return {"items": result, "summary": result}
 
 
 @router.get("/export/csv")
@@ -1489,6 +1518,29 @@ async def mark_delivered(
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 
+@router.get("/clients/search")
+async def search_clients(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    needle = q.strip().lower()
+    found: dict = {}
+    async for raw in shop_bills_collection.find({}).sort("created_at", -1).limit(500):
+        d = _dec(raw)
+        name = (d.get("client_name") or "").strip()
+        if needle and needle in name.lower():
+            key = name.lower()
+            if key not in found:
+                found[key] = {"client_name": name, "bill_count": 0, "total_revenue": 0.0}
+            found[key]["bill_count"] += 1
+            found[key]["total_revenue"] += d.get("grand_total", 0)
+    items = sorted(found.values(), key=lambda x: x["total_revenue"], reverse=True)[:limit]
+    for it in items:
+        it["total_revenue"] = round(it["total_revenue"], 2)
+    return {"items": items, "total": len(items)}
+
+
 @router.get("/clients/{client_name}")
 async def bills_by_client(
     client_name: str,
@@ -1592,45 +1644,69 @@ async def recent_activity(
 
 @router.get("/dashboard/summary")
 async def dashboard_summary(
+    days: int = Query(30, ge=1, le=3650),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    period_start = now - timedelta(days=days)
 
     total_bills = await shop_bills_collection.count_documents({})
 
-    today_count = await shop_bills_collection.count_documents({"created_at": {"$gte": today_start}})
-    today_revenue = 0.0
-    async for doc in shop_bills_collection.find({"created_at": {"$gte": today_start}}):
-        today_revenue += _dec(doc).get("grand_total", 0)
-
-    week_count = await shop_bills_collection.count_documents({"created_at": {"$gte": week_start}})
-    week_revenue = 0.0
-    async for doc in shop_bills_collection.find({"created_at": {"$gte": week_start}}):
-        week_revenue += _dec(doc).get("grand_total", 0)
-
-    month_count = await shop_bills_collection.count_documents({"created_at": {"$gte": month_start}})
-    month_revenue = 0.0
-    async for doc in shop_bills_collection.find({"created_at": {"$gte": month_start}}):
-        month_revenue += _dec(doc).get("grand_total", 0)
+    total_revenue = 0.0
+    period_count = 0
+    period_revenue = 0.0
+    today_count = today_revenue = 0.0
+    week_count = week_revenue = 0.0
+    month_count = month_revenue = 0.0
+    async for doc in shop_bills_collection.find({}):
+        d = _dec(doc)
+        gt = d.get("grand_total", 0) or 0
+        total_revenue += gt
+        created = d.get("created_at")
+        if created is not None:
+            try:
+                if created >= period_start:
+                    period_count += 1
+                    period_revenue += gt
+                if created >= today_start:
+                    today_count += 1
+                    today_revenue += gt
+                if created >= week_start:
+                    week_count += 1
+                    week_revenue += gt
+                if created >= month_start:
+                    month_count += 1
+                    month_revenue += gt
+            except TypeError:
+                pass
 
     outstanding = 0.0
     overdue_count = 0
+    overdue_amount = 0.0
     async for doc in shop_bills_collection.find({"outstanding_amount": {"$gt": 0}, "status": {"$ne": "CANCELLED"}}):
         d = _dec(doc)
-        outstanding += d.get("outstanding_amount", 0)
+        out = d.get("outstanding_amount", 0) or 0
+        outstanding += out
         if d.get("payment_status") in ("OVERDUE", "PENDING"):
             overdue_count += 1
+            overdue_amount += out
 
     return {
         "total_bills": total_bills,
-        "today": {"count": today_count, "revenue": round(today_revenue, 2)},
-        "this_week": {"count": week_count, "revenue": round(week_revenue, 2)},
-        "this_month": {"count": month_count, "revenue": round(month_revenue, 2)},
-        "outstanding": round(outstanding, 2),
+        "total_revenue": round(total_revenue, 2),
+        "total_outstanding": round(outstanding, 2),
+        "period_days": days,
+        "period_bills": period_count,
+        "period_revenue": round(period_revenue, 2),
         "overdue_count": overdue_count,
+        "overdue_amount": round(overdue_amount, 2),
+        "today": {"count": int(today_count), "revenue": round(today_revenue, 2)},
+        "this_week": {"count": int(week_count), "revenue": round(week_revenue, 2)},
+        "this_month": {"count": int(month_count), "revenue": round(month_revenue, 2)},
+        "outstanding": round(outstanding, 2),
     }
 
 
@@ -2080,3 +2156,426 @@ async def due_v2(current_user: dict = Depends(require_capability("bill:read"))):
         next_due = ld + dm.get(interval, timedelta(days=30))
         if next_due <= now: due.append({"bill_number": doc.get("bill_number"), "client_name": doc.get("client_name"), "interval": interval, "grand_total": doc.get("grand_total", 0), "next_due": next_due.isoformat()})
     return {"items": due, "total": len(due)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Templates, lifecycle, and derived reports
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/templates")
+async def list_templates(
+    search: Optional[str] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    query: dict = {}
+    if search:
+        query["name"] = {"$regex": search, "$options": "i"}
+    total = await bill_templates_collection.count_documents(query)
+    items = []
+    async for doc in bill_templates_collection.find(query).sort("created_at", -1).skip(skip).limit(limit):
+        items.append(_dec_template(doc))
+    return {"items": items, "total": total}
+
+
+@router.get("/templates/{template_id}")
+async def get_template(
+    template_id: str,
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
+    if not raw:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return _dec_template(raw)
+
+
+@router.post("/templates", status_code=status.HTTP_201_CREATED)
+async def create_template(
+    payload: BillTemplateCreate,
+    current_user: dict = Depends(require_capability("bill:write")),
+):
+    now = datetime.now(timezone.utc)
+    items = [i.model_dump() for i in payload.items]
+    _prepare_items(items)
+    doc = {
+        "name": payload.name,
+        "client_name": payload.client_name,
+        "items": items,
+        "discounts": payload.discounts or 0,
+        "transport_fee": payload.transport_fee or 0,
+        "taxes": payload.taxes or 0,
+        "notes": payload.notes,
+        "use_count": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = await bill_templates_collection.insert_one(_enc_template(doc))
+    doc["id"] = str(result.inserted_id)
+    new_version = await bump_version("bill_template", result.inserted_id)
+    await enqueue_sync("bill_template", result.inserted_id, new_version)
+    await log_audit(current_user.get("auth_id", "system"), "TEMPLATE_CREATE", "bill_template", doc["id"])
+    return _dec_template(doc)
+
+
+@router.delete("/templates/{template_id}")
+async def delete_template(
+    template_id: str,
+    current_user: dict = Depends(require_capability("bill:write")),
+):
+    raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
+    if not raw:
+        raise HTTPException(status_code=404, detail="Template not found")
+    await bill_templates_collection.delete_one({"_id": raw["_id"]})
+    v = await bump_version("bill_template", raw["_id"])
+    await enqueue_sync("bill_template", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "TEMPLATE_DELETE", "bill_template", str(raw["_id"]))
+    return {"message": "Template deleted"}
+
+
+@router.get("/expiring")
+async def expiring_bills(
+    days: int = Query(7, ge=1, le=365),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=days)
+    items = []
+    async for doc in shop_bills_collection.find({"status": {"$nin": ["DELIVERED", "CANCELLED"]}}):
+        d = _dec(doc)
+        dd = d.get("delivery_date")
+        if dd is None:
+            continue
+        try:
+            if isinstance(dd, str):
+                dd = datetime.fromisoformat(dd)
+            if dd.tzinfo is None:
+                dd = dd.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        if now <= dd <= horizon:
+            items.append(d)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/attention-needed")
+async def attention_needed(
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    now = datetime.now(timezone.utc)
+    items = []
+    async for doc in shop_bills_collection.find({"outstanding_amount": {"$gt": 0}, "status": {"$ne": "CANCELLED"}}):
+        d = _dec(doc)
+        reasons = []
+        if d.get("payment_status") == "OVERDUE":
+            reasons.append("OVERDUE")
+        dd = d.get("delivery_date")
+        try:
+            if isinstance(dd, str):
+                dd = datetime.fromisoformat(dd)
+            if dd is not None and dd.tzinfo is None:
+                dd = dd.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            dd = None
+        if dd is not None and dd < now and d.get("status") not in ("DELIVERED",):
+            reasons.append("DELIVERY_OVERDUE")
+        if (d.get("outstanding_amount", 0) or 0) > 0:
+            reasons.append("UNPAID")
+        if reasons:
+            d["reasons"] = reasons
+            items.append(d)
+    return {"items": items, "total": len(items)}
+
+
+@router.post("/{bill_id}/archive")
+async def archive_bill(bill_id: str, current_user: dict = Depends(require_capability("bill:write"))):
+    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+    merged["archived"] = True; merged["updated_at"] = now
+    await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+    v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
+
+
+@router.post("/{bill_id}/restore")
+async def restore_bill(bill_id: str, current_user: dict = Depends(require_capability("bill:write"))):
+    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+    merged["archived"] = False; merged["updated_at"] = now
+    await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+    v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
+
+
+@router.get("/archived")
+async def list_archived(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    query = {"archived": True}
+    total = await shop_bills_collection.count_documents(query)
+    items = []
+    async for doc in shop_bills_collection.find(query).sort("updated_at", -1).skip(skip).limit(limit):
+        items.append(_dec(doc))
+    return {"items": items, "total": total}
+
+
+@router.post("/bulk-mark-paid")
+async def bulk_mark_paid(body: dict = Body(...), current_user: dict = Depends(require_capability("payment:write"))):
+    now = datetime.now(timezone.utc); updated = 0
+    for bid in body.get("bill_ids", []):
+        raw = await shop_bills_collection.find_one({"_id": parse_object_id(bid, "Bill ID")})
+        if not raw:
+            continue
+        doc = _dec(raw)
+        if doc.get("locked"):
+            continue
+        merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+        merged["paid_amount"] = doc.get("grand_total", 0)
+        merged["outstanding_amount"] = 0.0
+        merged["payment_status"] = "PAID"
+        merged["updated_at"] = now
+        await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+        v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+        updated += 1
+    await log_audit(current_user.get("auth_id", "system"), "BILL_BULK_MARK_PAID", "shop_bill", "multiple", details={"count": updated})
+    return {"updated": updated}
+
+
+@router.get("/stats/collection-rate")
+async def collection_rate(current_user: dict = Depends(require_capability("bill:read"))):
+    total_revenue = 0.0; total_paid = 0.0
+    async for doc in shop_bills_collection.find({}):
+        d = _dec(doc); total_revenue += d.get("grand_total", 0) or 0; total_paid += d.get("paid_amount", 0) or 0
+    rate = round((total_paid / total_revenue) * 100, 2) if total_revenue > 0 else 0.0
+    return {"total_revenue": round(total_revenue, 2), "total_paid": round(total_paid, 2), "collection_rate": rate}
+
+
+@router.get("/stats/monthly-trends")
+async def monthly_trends(
+    months: int = Query(12, ge=1, le=60),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    now = datetime.now(timezone.utc)
+    buckets: dict = {}
+    async for doc in shop_bills_collection.find({}):
+        d = _dec(doc); created = _as_dt(d.get("created_at"))
+        if created is None:
+            continue
+        key = f"{created.year:04d}-{created.month:02d}"
+        b = buckets.setdefault(key, {"month": key, "count": 0, "revenue": 0.0, "paid": 0.0})
+        b["count"] += 1
+        b["revenue"] += d.get("grand_total", 0) or 0
+        b["paid"] += d.get("paid_amount", 0) or 0
+    ordered = sorted(buckets.values(), key=lambda x: x["month"], reverse=True)[:months]
+    for b in ordered:
+        b["revenue"] = round(b["revenue"], 2); b["paid"] = round(b["paid"], 2)
+    return {"items": ordered, "total": len(ordered)}
+
+
+@router.get("/stats/top-items")
+async def top_items(
+    limit: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    agg: dict = {}
+    async for doc in shop_bills_collection.find({}):
+        for item in _dec(doc).get("items", []):
+            name = item.get("item_name") or "(unnamed)"
+            a = agg.setdefault(name, {"item_name": name, "quantity": 0, "revenue": 0.0, "bill_count": 0})
+            a["quantity"] += item.get("quantity", 0) or 0
+            a["revenue"] += item.get("line_total", 0) or 0
+            a["bill_count"] += 1
+    items = sorted(agg.values(), key=lambda x: x["revenue"], reverse=True)[:limit]
+    for it in items:
+        it["revenue"] = round(it["revenue"], 2)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/stats/tag-summary")
+async def tag_summary(current_user: dict = Depends(require_capability("bill:read"))):
+    agg: dict = {}
+    async for doc in shop_bills_collection.find({"tags": {"$exists": True, "$ne": []}}, {"tags": 1, "grand_total": 1}):
+        gt = doc.get("grand_total", 0) or 0
+        for t in doc.get("tags", []):
+            a = agg.setdefault(t, {"tag": t, "count": 0, "total": 0.0})
+            a["count"] += 1; a["total"] += gt
+    items = sorted(agg.values(), key=lambda x: x["count"], reverse=True)
+    for it in items:
+        it["total"] = round(it["total"], 2)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/stats/avg-value")
+async def avg_value(
+    days: int = Query(30, ge=1, le=3650),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    start = datetime.now(timezone.utc) - timedelta(days=days)
+    count = 0; total = 0.0
+    async for doc in shop_bills_collection.find({}):
+        d = _dec(doc); created = _as_dt(d.get("created_at"))
+        if created is not None and created >= start:
+            count += 1; total += d.get("grand_total", 0) or 0
+    return {"days": days, "bill_count": count, "total": round(total, 2), "avg_value": round(total / count, 2) if count else 0.0}
+
+
+@router.get("/stats/date-range")
+async def date_range_stats(
+    start_date: str = Query(...),
+    end_date: str = Query(...),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+    end = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    count = 0; revenue = 0.0; paid = 0.0
+    async for doc in shop_bills_collection.find({}):
+        d = _dec(doc); created = _as_dt(d.get("created_at"))
+        if created is not None and start <= created < end:
+            count += 1; revenue += d.get("grand_total", 0) or 0; paid += d.get("paid_amount", 0) or 0
+    return {"start_date": start_date, "end_date": end_date, "total_bills": count, "total_revenue": round(revenue, 2), "total_paid": round(paid, 2), "outstanding": round(revenue - paid, 2)}
+
+
+@router.get("/reports/tax")
+async def tax_report(
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc) if start_date else None
+    end = (datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)) if end_date else None
+    taxes = 0.0; revenue = 0.0; count = 0
+    async for doc in shop_bills_collection.find({}):
+        d = _dec(doc); created = _as_dt(d.get("created_at"))
+        if start is not None and (created is None or created < start):
+            continue
+        if end is not None and (created is None or created >= end):
+            continue
+        taxes += d.get("taxes", 0) or 0; revenue += d.get("grand_total", 0) or 0; count += 1
+    return {"start_date": start_date, "end_date": end_date, "bill_count": count, "total_tax": round(taxes, 2), "total_revenue": round(revenue, 2)}
+
+
+@router.get("/count")
+async def bill_count(
+    status: Optional[str] = Query(None),
+    payment_status: Optional[str] = Query(None),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    query: dict = {}
+    if status:
+        query["status"] = status
+    if payment_status:
+        query["payment_status"] = payment_status
+    return {"count": await shop_bills_collection.count_documents(query)}
+
+
+@router.get("/by-number/{bill_number}")
+async def by_number(bill_number: str, current_user: dict = Depends(require_capability("bill:read"))):
+    raw = await shop_bills_collection.find_one({"bill_number": bill_number})
+    if not raw:
+        raise HTTPException(status_code=404, detail="Shop bill not found")
+    return _dec(raw)
+
+
+@router.get("/{bill_id}/timeline")
+async def bill_timeline(bill_id: str, current_user: dict = Depends(require_capability("bill:read"))):
+    events = []
+    async for doc in audit_collection.find({"entity_id": bill_id}).sort("timestamp", 1).limit(200):
+        doc["id"] = str(doc.pop("_id", ""))
+        events.append(doc)
+    return {"bill_id": bill_id, "items": events, "total": len(events)}
+
+
+@router.get("/{bill_id}/payment-history")
+async def payment_history(bill_id: str, current_user: dict = Depends(require_capability("bill:read"))):
+    raw = await _find_bill(bill_id)
+    doc = _dec(raw)
+    history = [
+        h for h in doc.get("notes_history", [])
+        if "payment" in str(h.get("category", "")).lower() or "payment" in str(h.get("new_notes", "")).lower()
+    ]
+    return {"bill_id": bill_id, "paid_amount": doc.get("paid_amount", 0), "items": history, "total": len(history)}
+
+
+@router.patch("/{bill_id}/discount")
+async def update_discount(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
+    raw = await _find_bill(bill_id); doc = _dec(raw)
+    if doc.get("locked"):
+        raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
+    now = datetime.now(timezone.utc); new_discount = body.get("discount", 0)
+    totals = _calc_totals(doc.get("items", []), new_discount, doc.get("transport_fee", 0), doc.get("taxes", 0))
+    merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+    merged["discounts"] = new_discount; merged.update(totals)
+    merged["outstanding_amount"] = round(totals["grand_total"] - doc.get("paid_amount", 0), 2); merged["updated_at"] = now
+    await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+    v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
+
+
+@router.patch("/{bill_id}/delivery-date")
+async def change_delivery_date(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
+    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+    merged["delivery_date"] = body.get("delivery_date"); merged["updated_at"] = now
+    await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+    v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
+
+
+@router.post("/{bill_id}/transfer-client")
+async def transfer_client(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
+    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    new_name = (body.get("client_name") or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="client_name is required")
+    merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+    merged["client_name"] = new_name; merged["client_name_search"] = _get_search_token(new_name); merged["updated_at"] = now
+    await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+    v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
+
+
+@router.post("/{bill_id}/void")
+async def void_bill(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
+    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+    merged["status"] = "CANCELLED"; merged["payment_status"] = "CANCELLED"; merged["locked"] = True
+    reason = body.get("reason", "")
+    if reason:
+        merged["notes"] = (merged.get("notes") or "") + f"\n[VOID] {reason}"
+    merged["updated_at"] = now
+    await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+    v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_VOID", "shop_bill", str(raw["_id"]), details={"reason": reason})
+    return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
+
+
+@router.post("/expire-old")
+async def expire_old(
+    max_days: int = Query(30, ge=1, le=3650),
+    current_user: dict = Depends(require_capability("bill:write")),
+):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_days)
+    expired = 0
+    async for raw in shop_bills_collection.find({"outstanding_amount": {"$gt": 0}, "payment_status": {"$in": ["PENDING", "PARTIALLY_PAID"]}}):
+        doc = _dec(raw); created = _as_dt(doc.get("created_at"))
+        if created is not None and created < cutoff:
+            merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
+            merged["payment_status"] = "OVERDUE"
+            await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+            v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+            expired += 1
+    return {"expired": expired}
+
+
+# NOTE: This catch-all dynamic route MUST stay last. Any single-segment static
+# GET route declared after it would be shadowed by it (Starlette matches in
+# declaration order).
+@router.get("/{bill_id}")
+async def get_bill(
+    bill_id: str,
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    doc = await _find_bill(bill_id)
+    return _dec(doc)
