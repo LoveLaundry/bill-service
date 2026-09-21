@@ -21,6 +21,7 @@ audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
 linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
 linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
 returns_collection: AsyncIOMotorCollection = _db.get_collection("returns")
+adjustments_collection: AsyncIOMotorCollection = _db.get_collection("adjustments")
 shop_bills_collection: AsyncIOMotorCollection = _db.get_collection("shop_bills")
 bill_templates_collection: AsyncIOMotorCollection = _db.get_collection("bill_templates")
 legacy_invoices_collection: AsyncIOMotorCollection = _db.get_collection("legacy_invoices")
@@ -91,6 +92,11 @@ async def ensure_indexes():
     await returns_collection.create_index("client_name_search")
     await returns_collection.create_index("status")
     await returns_collection.create_index("created_at")
+
+    # Adjustments indexes
+    await adjustments_collection.create_index("gate_pass_id")
+    await adjustments_collection.create_index("status")
+    await adjustments_collection.create_index("created_at")
 
     # Shop Bills indexes
     await shop_bills_collection.create_index("bill_number", unique=True)

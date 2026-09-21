@@ -49,14 +49,49 @@ class GatePassUpdate(BaseModel):
 
 
 class GatePassMarkDelivered(BaseModel):
-    """Catch-up delivery: manager forgot to record the delivery on the dispatch date.
+    """DEPRECATED — legacy note-based closure endpoint.
 
-    The gate pass is completed (status -> DELIVERED) directly with a mandatory
-    note instead of a dated item-level delivery record.
+    Kept only so old clients get a clear 400 directing them to the
+    quantity-based catch-up delivery flow. A note can never close a gate
+    pass anymore (see ``GatePassCatchUpDelivery``).
     """
 
     note: str = Field(min_length=1, description="Required note explaining the delivery")
     delivered_date: Optional[datetime] = None
+
+
+class CatchUpDeliveryItem(BaseModel):
+    item_name: str
+    specification: Optional[str] = None
+    quantity: int = Field(gt=0)
+
+
+class GatePassCatchUpDelivery(BaseModel):
+    """Quantity-based catch-up delivery.
+
+    Replaces the old note-only mark-delivered. Creates a REAL delivery
+    record with explicit item quantities plus the explanatory note.
+    """
+
+    note: str = Field(min_length=1, description="Required note explaining the catch-up")
+    delivered_date: Optional[datetime] = None
+    items: List[CatchUpDeliveryItem] = Field(min_length=1)
+
+
+class AdjustmentItem(BaseModel):
+    item_name: str
+    specification: Optional[str] = None
+
+
+class GatePassAdjustmentRequest(BaseModel):
+    """Controlled adjustment request. Approved adjustments modify balances;
+    the original recorded events are preserved in the journal."""
+
+    gate_pass_id: str
+    item_name: str
+    specification: Optional[str] = None
+    corrected_qty: int = Field(ge=0)
+    reason: str = Field(min_length=1, description="Reason is mandatory")
 
 
 class GatePassModel(BaseModel):

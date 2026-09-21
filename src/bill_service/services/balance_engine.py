@@ -206,3 +206,39 @@ def compute_billable_on_received(
         billed = int(billed_by_item.get(key, 0) or 0)
         out[key] = max(0, received - billed)
     return out
+
+
+def apply_received_correction(
+    gp_items: List[dict],
+    item_name: str,
+    specification: Optional[str],
+    corrected_qty: int,
+):
+    """Apply an APPROVED received-quantity correction without mutating history.
+
+    Returns ``(updated_items, original_qty)`` or ``(None, None)`` when the
+    item does not exist on the gate pass. The caller persists the original
+    record in the journal; the source documents themselves are never edited.
+    """
+    updated: List[dict] = []
+    original: Optional[int] = None
+    found = False
+    for it in gp_items:
+        if (
+            it.get("item_name") == item_name
+            and (it.get("specification") or "") == (specification or "")
+        ):
+            original = int(it.get("received_qty", 0) or 0)
+            new_item = dict(it)
+            new_item["received_qty"] = corrected_qty
+            try:
+                new_item["difference"] = corrected_qty - int(it.get("client_qty", 0) or 0)
+            except Exception:
+                new_item["difference"] = 0
+            updated.append(new_item)
+            found = True
+        else:
+            updated.append(it)
+    if not found:
+        return None, None
+    return updated, original

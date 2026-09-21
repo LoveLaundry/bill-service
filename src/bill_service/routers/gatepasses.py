@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -18,8 +18,8 @@ from ..services.transaction_events import (
     build_item_delta,
     record_event,
     EVENT_ADJUSTMENT_REQUESTED,
+    EVENT_CATCH_UP_DELIVERY,
     EVENT_GATE_PASS_CREATED,
-    EVENT_LEGACY_NOTE_CLOSURE,
     EVENT_RECEIVING_DATE_CHANGED,
     EVENT_RECEIVING_EDITED,
     EVENT_STATUS_CHANGED,
@@ -27,6 +27,7 @@ from ..services.transaction_events import (
 from ..services.verification_service import attach_verification_to
 from ..models import (
     GatePassAdjustment,
+    GatePassCatchUpDelivery,
     GatePassCreate,
     GatePassDateUpdate,
     GatePassMarkDelivered,
@@ -277,19 +278,30 @@ async def update_gate_pass_status(
     status_update: str = Query(...),
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
-    valid_statuses = [
-        "RECEIVED",
-        "PROCESSING",
-        "READY_FOR_DELIVERY",
-        "PARTIALLY_DELIVERED",
-        "DELIVERED",
-        "CANCELLED",
-    ]
-    if status_update not in valid_statuses:
+    """Guarded status transition.
+
+    Only the open workflow states can be moved manually:
+      RECEIVED -> PROCESSING -> READY_FOR_DELIVERY (and back to PROCESSING)
+      any open state -> CANCELLED (only if no deliveries were recorded)
+    DELIVERED / PARTIALLY_DELIVERED / CLOSED are DERIVED from recorded
+    quantities and can never be set by hand; reversing them requires the
+    controlled reversal flow.
+    """
+    if status_update in ("DELIVERED", "CLOSED", "PARTIALLY_DELIVERED"):
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid status. Must be one of {valid_statuses}",
+            detail=(
+                "DELIVERED / PARTIALLY_DELIVERED / CLOSED are derived from actual "
+                "recorded quantities and cannot be set manually. Use a real "
+                "quantity-based delivery (or catch-up delivery) instead."
+            ),
         )
+
+    allowed_transitions = {
+        "RECEIVED": ["PROCESSING", "CANCELLED"],
+        "PROCESSING": ["READY_FOR_DELIVERY", "CANCELLED"],
+        "READY_FOR_DELIVERY": ["PROCESSING", "CANCELLED"],
+    }
 
     oid = _parse_object_id(gate_pass_id)
     doc = await gatepasses_collection.find_one({"_id": oid})
@@ -299,6 +311,30 @@ async def update_gate_pass_status(
         )
 
     previous_status = doc.get("status")
+    if previous_status not in allowed_transitions:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Gate Pass is '{previous_status}' which cannot be moved manually. "
+                "Open/derived states must change through recorded quantities."
+            ),
+        )
+    if status_update not in allowed_transitions[previous_status]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid transition {previous_status} -> {status_update}.",
+        )
+
+    if status_update == "CANCELLED":
+        existing_deliveries = await deliveries_collection.count_documents(
+            {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
+        )
+        if existing_deliveries > 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot cancel a gate pass that already has delivery records. "
+                "Record a reversal instead.",
+            )
 
     # Update status field
     await gatepasses_collection.update_one(
@@ -365,56 +401,159 @@ async def mark_gate_pass_delivered(
             detail=f"Gate Pass is already {current_status} and cannot be marked delivered.",
         )
 
-    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "Note-based delivery confirmation is no longer allowed. A note "
+            "cannot create a delivery or close a balance. Use "
+            "POST /gatepasses/{id}/catch-up-delivery with explicit item "
+            "quantities so the delivered quantities are recorded."
+        ),
+    )
+
+
+@router.post("/{gate_pass_id}/catch-up-delivery", response_model=GatePassModel)
+async def catch_up_delivery(
+    gate_pass_id: str,
+    payload: GatePassCatchUpDelivery,
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    """Quantity-based catch-up delivery (replaces the mark-delivered note flow).
+
+    Creates a REAL delivery record with explicit per-item quantities. The
+    gate pass status is then DERIVED from the recorded quantities — a note
+    alone can never close it.
+    """
+    from ..services import balance_engine as be
+
+    oid = _parse_object_id(gate_pass_id)
+    gp_doc = await gatepasses_collection.find_one({"_id": oid})
+    if not gp_doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
+        )
+    decrypted = decrypt_dict(gp_doc, SENSITIVE_FIELDS)
+    current_status = decrypted.get("status")
+    if current_status in ("DELIVERED", "CANCELLED"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Gate Pass is already {current_status}. Already-closed passes "
+                "need a controlled reversal, not another delivery."
+            ),
+        )
+
+    # Load existing deliveries to validate the catch-up quantities per item.
+    existing_deliveries: List[dict] = []
+    dl_cursor = deliveries_collection.find(
+        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
+    )
+    async for dl_doc in dl_cursor:
+        try:
+            existing_deliveries.append(decrypt_dict(dl_doc, SENSITIVE_FIELDS))
+        except Exception:
+            continue
+
+    delivered_map = be.compute_delivered_by_item(existing_deliveries)
+    received_map: Dict[str, int] = {}
+    for it in decrypted.get("items", []):
+        key = be.item_key(it["item_name"], it.get("specification"))
+        received_map[key] = received_map.get(key, 0) + it["received_qty"]
+
     now = datetime.now(timezone.utc)
     delivered_date = payload.delivered_date or now
     if delivered_date.tzinfo is None:
         delivered_date = delivered_date.replace(tzinfo=timezone.utc)
 
-    decrypted["status"] = "DELIVERED"
-    decrypted["marked_delivered"] = {
-        "note": payload.note,
-        "delivered_date": delivered_date,
-        "user_id": current_user.get("auth_id", "system"),
-        "at": now,
-    }
+    # Validate quantities against available balance (received - already delivered).
+    item_records = []
+    for item in payload.items:
+        key = be.item_key(item.item_name, item.specification)
+        received = received_map.get(key, 0)
+        if received <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{item.item_name}' was never received on this gate pass.",
+            )
+        already = delivered_map.get(key, 0)
+        remaining = max(0, received - already)
+        if item.quantity > remaining:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Catch-up quantity {item.quantity} for '{item.item_name}' "
+                    f"exceeds available {remaining} (received {received}, already "
+                    f"delivered {already})."
+                ),
+            )
+        item_records.append(
+            {"item_name": item.item_name, "specification": item.specification, "quantity": item.quantity}
+        )
+
+    marker = f"Catch-up delivery: {payload.note}"
     existing_notes = decrypted.get("notes") or ""
-    marker = f"Marked delivered: {payload.note}"
-    decrypted["notes"] = (
-        f"{existing_notes}\n{marker}".strip() if existing_notes else marker
+    delivery_doc = {
+        "gate_pass_id": gate_pass_id,
+        "client_name": decrypted.get("client_name"),
+        "delivery_date": delivered_date,
+        "delivered_by": current_user.get("user_name", "system"),
+        "received_by": current_user.get("user_name", "system"),
+        "items": item_records,
+        "status": "DELIVERED",
+        "notes": marker,
+        "created_at": now,
+        "catch_up": {"note": payload.note, "at": now, "user_id": current_user.get("auth_id", "system")},
+    }
+    encrypted_delivery = encrypt_dict(delivery_doc, SENSITIVE_FIELDS)
+    dl_result = await deliveries_collection.insert_one(encrypted_delivery)
+
+    # Derive new gate pass status from the recorded quantities.
+    delivered_map = be.compute_delivered_by_item(existing_deliveries + [delivery_doc])
+    balance = be.compute_gate_pass_balance(
+        decrypted.get("items", []), delivered_map, {}, marked_delivered=False
     )
-    decrypted["updated_at"] = now
+    new_gp_status = be.derive_gate_pass_status(balance, current_status)
 
-    encrypted_new = encrypt_dict(decrypted, SENSITIVE_FIELDS)
-    await gatepasses_collection.replace_one({"_id": oid}, encrypted_new)
+    updated_gp = dict(decrypted)
+    updated_gp["status"] = new_gp_status
+    updated_gp["notes"] = f"{existing_notes}\n{marker}".strip() if existing_notes else marker
+    updated_gp["updated_at"] = now
+    encrypted_gp = encrypt_dict(updated_gp, SENSITIVE_FIELDS)
+    await gatepasses_collection.replace_one({"_id": oid}, encrypted_gp)
 
-    updated_doc = await gatepasses_collection.find_one({"_id": oid})
-    serialized = _serialize(updated_doc)
-
-    new_version = await bump_version("gatepass", oid)
-    await enqueue_sync("gatepass", oid, new_version)
-    serialized = await attach_verification_to("gatepass", oid, serialized)
+    # Bump + sync both entities.
+    dl_id = str(dl_result.inserted_id)
+    dl_version = await bump_version("delivery", dl_result.inserted_id)
+    await enqueue_sync("delivery", dl_result.inserted_id, dl_version)
+    gp_version = await bump_version("gatepass", oid)
+    await enqueue_sync("gatepass", oid, gp_version)
 
     await record_event(
-        entity_type="gatepass",
-        entity_id=serialized["id"],
-        event_type=EVENT_LEGACY_NOTE_CLOSURE,
-        gate_pass_id=serialized["id"],
+        entity_type="delivery",
+        entity_id=dl_id,
+        event_type=EVENT_CATCH_UP_DELIVERY,
+        gate_pass_id=gate_pass_id,
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
-        prev_status=current_status,
-        new_status="DELIVERED",
         reason=payload.note,
-        meta={"delivered_date": delivered_date, "legacy": True, "quantity_based": False},
+        item_deltas=[
+            build_item_delta(it["item_name"], it.get("specification"), 0, it["quantity"])
+            for it in item_records
+        ],
+        prev_status=current_status,
+        new_status=new_gp_status,
+        meta={"delivered_date": delivered_date.isoformat(), "catch_up": True},
     )
 
     await log_audit(
         current_user.get("auth_id", "system"),
-        "RECEIVING_MARK_DELIVERED",
-        "gatepass",
-        serialized["id"],
+        "RECEIVING_CATCH_UP_DELIVERY",
+        "delivery",
+        dl_id,
     )
-    return serialized
+
+    serialized = _serialize(await gatepasses_collection.find_one({"_id": oid}))
+    return await attach_verification_to("gatepass", oid, serialized)
 
 
 @router.patch("/{gate_pass_id}/date", response_model=GatePassModel)
@@ -481,7 +620,7 @@ async def update_gate_pass(
                 status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
             )
 
-        if doc.get("status") in ("DELIVERED", "CANCELLED"):
+        if doc.get("status") in ("DELIVERED", "PARTIALLY_DELIVERED", "CANCELLED"):
             raise HTTPException(
                 status_code=409,
                 detail=f"Gate Pass cannot be edited once it is {doc.get('status')}.",
@@ -489,6 +628,32 @@ async def update_gate_pass(
 
         decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
         update_data = payload.model_dump(exclude_unset=True)
+
+        # Quantities are controlled: received/client quantities may never be
+        # rewritten once deliveries or returns exist — use the adjustment flow.
+        if "items" in update_data and update_data["items"]:
+            has_movement = (
+                await deliveries_collection.count_documents(
+                    {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
+                )
+                > 0
+            ) or (
+                await returns_collection.count_documents(
+                    {"gate_pass_id": gate_pass_id}
+                )
+                > 0
+            )
+            if has_movement:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This gate pass already has delivery/return records. "
+                        "Quantity changes must go through the controlled "
+                        "adjustment workflow (POST /adjustments) so the original "
+                        "record and history are preserved."
+                    ),
+                )
+
         previous_items = {i["item_name"]: i.get("received_qty", 0) for i in decrypted.get("items", [])}
 
         if "items" in update_data and update_data["items"]:

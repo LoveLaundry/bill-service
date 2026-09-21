@@ -233,3 +233,37 @@ def test_outstanding_rows():
     assert len(rows) == 1
     assert rows[0]["item_name"] == "Duvet Cover"
     assert rows[0]["pending_qty"] == 17
+
+
+# --- Approved received correction (adjustment) application ---
+def test_apply_received_correction():
+    gp = [_gp_item("Duvet Cover", 50, 50), _gp_item("Towel", 10, 10, spec="Large")]
+    updated, original = be.apply_received_correction(gp, "Duvet Cover", None, 47)
+    assert original == 50
+    assert updated[0]["received_qty"] == 47
+    assert updated[0]["difference"] == -3  # 47 - 50 expected
+    assert updated[1]["received_qty"] == 10  # untouched item preserved
+    # Non-existent item
+    updated2, original2 = be.apply_received_correction(gp, "Nope", None, 5)
+    assert updated2 is None and original2 is None
+    # Spec-aware matching
+    updated3, original3 = be.apply_received_correction(gp, "Towel", "Large", 8)
+    assert original3 == 10
+    assert updated3[1]["received_qty"] == 8
+
+
+# --- Balance recomputed after a corrected received quantity ---
+def test_balance_after_correction():
+    gp = [_gp_item("Duvet Cover", 50, 50)]
+    deliveries = [_delivery([_del_item("Duvet Cover", 30)])]
+    bal_before = _balance(gp, deliveries=deliveries)
+    assert bal_before["items"][be.item_key("Duvet Cover")]["outstanding_delivery_qty"] == 20
+
+    updated, _ = be.apply_received_correction(gp, "Duvet Cover", None, 45)
+    bal_after = be.compute_gate_pass_balance(
+        updated, be.compute_delivered_by_item(deliveries), {}
+    )
+    item = bal_after["items"][be.item_key("Duvet Cover")]
+    assert item["received_qty"] == 45
+    assert item["outstanding_delivery_qty"] == 15
+    assert be.derive_gate_pass_status(bal_after, "PARTIALLY_DELIVERED") == "PARTIALLY_DELIVERED"
