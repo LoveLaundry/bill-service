@@ -14,9 +14,14 @@ from ..database.main_db import (
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
-from ..services.transaction_events import build_item_delta, record_event, EVENT_DELIVERY_CREATED
+from ..services.transaction_events import (
+    build_item_delta,
+    record_event,
+    EVENT_DELIVERY_CREATED,
+    EVENT_DELIVERY_DATE_CHANGED,
+)
 from ..services.verification_service import attach_verification_to
-from ..models import DeliveryCreate, DeliveryModel
+from ..models import DeliveryCreate, DeliveryDateUpdate, DeliveryModel
 
 router = APIRouter(prefix="/deliveries", tags=["deliveries"])
 
@@ -224,6 +229,70 @@ async def create_delivery(
         serialized["id"],
     )
     await idempotency.record_created(request, auth_id, "delivery", serialized["id"])
+    return serialized
+
+
+@router.patch("/{delivery_id}/date", response_model=DeliveryModel)
+async def update_delivery_date(
+    delivery_id: str,
+    payload: DeliveryDateUpdate,
+    current_user: dict = Depends(require_capability("delivery:write")),
+):
+    """Correct the dispatch date on a recorded delivery (special-case correction).
+
+    Allowed regardless of the gate pass status: a date is a record correction,
+    not a quantity change, so balances are never affected. A reason is kept for
+    the audit trail and the change is journaled as DELIVERY_DATE_CHANGED.
+    """
+    oid = _parse_object_id(delivery_id)
+    doc = await deliveries_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
+        )
+
+    previous_date = doc.get("delivery_date")
+    new_date = payload.delivery_date
+    if new_date.tzinfo is None:
+        new_date = new_date.replace(tzinfo=timezone.utc)
+
+    await deliveries_collection.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "delivery_date": new_date,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+
+    updated_doc = await deliveries_collection.find_one({"_id": oid})
+    serialized = _serialize(updated_doc)
+
+    new_version = await bump_version("delivery", oid)
+    await enqueue_sync("delivery", oid, new_version)
+    serialized = await attach_verification_to("delivery", oid, serialized)
+
+    await record_event(
+        entity_type="delivery",
+        entity_id=serialized["id"],
+        event_type=EVENT_DELIVERY_DATE_CHANGED,
+        gate_pass_id=serialized.get("gate_pass_id"),
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        reason=payload.reason,
+        meta={
+            "delivery_date_before": previous_date.isoformat() if previous_date else None,
+            "delivery_date_after": new_date.isoformat(),
+        },
+    )
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "DELIVERY_DATE_UPDATE",
+        "delivery",
+        serialized["id"],
+    )
     return serialized
 
 

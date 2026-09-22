@@ -132,6 +132,12 @@ class DeliveryCreate(BaseModel):
     notes: Optional[str] = None
 
 
+class DeliveryDateUpdate(BaseModel):
+    """Special-case correction of a recorded delivery's dispatch date."""
+    delivery_date: datetime
+    reason: Optional[str] = None
+
+
 class DeliveryModel(BaseModel):
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
@@ -148,6 +154,7 @@ class DeliveryModel(BaseModel):
     status: str  # DELIVERED, CANCELLED
     notes: Optional[str] = None
     created_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 # --- Dispatch (pickup / delivery scheduling) ---
