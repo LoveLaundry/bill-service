@@ -16,6 +16,7 @@ from .routers.dispatch import router as dispatch_router
 from .routers.loyalty import router as loyalty_router
 from .routers.dashboard import router as dashboard_router
 from .routers.day_close import router as day_close_router
+from .routers.day_money import router as day_money_router
 from .routers.gatepasses import router as gatepasses_router
 from .routers.linens import router as linens_router
 from .routers.reconciliation import router as reconciliation_router
@@ -103,6 +104,7 @@ app.include_router(dispatch_router)
 app.include_router(loyalty_router)
 app.include_router(dashboard_router)
 app.include_router(day_close_router)
+app.include_router(day_money_router)
 app.include_router(linens_router)
 app.include_router(returns_router)
 app.include_router(reconciliation_router)
