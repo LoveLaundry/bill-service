@@ -29,6 +29,7 @@ EVENT_ADJUSTMENT_REJECTED = "ADJUSTMENT_REJECTED"
 EVENT_CATCH_UP_DELIVERY = "CATCH_UP_DELIVERY"
 EVENT_LEGACY_FLAG = "LEGACY_FLAG"
 EVENT_BILL_CREATED = "BILL_CREATED"
+EVENT_DAY_CLOSED = "DAY_CLOSED"
 # Historical, non-quantity closure. Kept for migration visibility only;
 # new closures MUST go through EVENT_CATCH_UP_DELIVERY with real quantities.
 EVENT_LEGACY_NOTE_CLOSURE = "LEGACY_NOTE_CLOSURE"
@@ -77,7 +78,8 @@ async def record_event(
     if new_status:
         event_doc["new_status"] = new_status
 
-    await linen_events_collection.insert_one(event_doc)
+    result = await linen_events_collection.insert_one(event_doc)
+    return result.inserted_id
 
 
 def build_item_delta(
