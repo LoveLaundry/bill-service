@@ -568,6 +568,104 @@ async def catch_up_delivery(
     return await attach_verification_to("gatepass", oid, serialized)
 
 
+async def _reopen_legacy_doc(gp_doc: dict, current_user: dict) -> dict:
+    """Reopen one legacy note-closed pass.
+
+    Never raises for a specific pass; returns a result dict for callers to
+    surface per-pass (single endpoint) or aggregate (batch endpoint).
+    """
+    oid = gp_doc["_id"]
+    gp_id = str(oid)
+    try:
+        decrypted = decrypt_dict(gp_doc, SENSITIVE_FIELDS)
+
+        marked = decrypted.get("marked_delivered")
+        if not marked:
+            return {"gate_pass_id": gp_id, "reopened": False, "reason": "no legacy note closure"}
+
+        dl_cursor = deliveries_collection.find(
+            {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
+        )
+        delivery_count = 0
+        async for _dl in dl_cursor:
+            delivery_count += 1
+        if delivery_count > 0:
+            return {
+                "gate_pass_id": gp_id,
+                "reopened": False,
+                "reason": "has recorded deliveries (use a controlled reversal)",
+            }
+
+        current_status = decrypted.get("status", "RECEIVED")
+        now = datetime.now(timezone.utc)
+        legacy_date = None
+        legacy_note = ""
+        if isinstance(marked, dict):
+            legacy_date = marked.get("delivered_date") or marked.get("at")
+            legacy_note = str(marked.get("note") or "")
+        elif isinstance(marked, bool) or isinstance(marked, int):
+            # Older docs may have stored True with the note on the doc itself.
+            legacy_note = str(decrypted.get("notes") or "")
+
+        marker = (
+            "Reopened for proper delivery recording (was closed by a legacy note"
+            + (f" on {legacy_date}" if legacy_date else "")
+            + "): "
+            + (legacy_note or "no note was recorded")
+        ).strip()
+
+        updated_gp = dict(decrypted)
+        updated_gp.pop("marked_delivered", None)
+        updated_gp["status"] = "RECEIVED"
+        existing_notes = decrypted.get("notes") or ""
+        updated_gp["notes"] = f"{existing_notes}\n{marker}".strip() if existing_notes else marker
+        updated_gp["updated_at"] = now
+        encrypted_gp = encrypt_dict(updated_gp, SENSITIVE_FIELDS)
+        await gatepasses_collection.replace_one({"_id": oid}, encrypted_gp)
+
+        gp_version = await bump_version("gatepass", oid)
+        await enqueue_sync("gatepass", oid, gp_version)
+
+        await record_event(
+            entity_type="gatepass",
+            entity_id=gp_id,
+            event_type=EVENT_LEGACY_FLAG,
+            gate_pass_id=gp_id,
+            user_id=current_user.get("auth_id", "system"),
+            user_name=current_user.get("user_name"),
+            reason="LEGACY_CLOSED_WITHOUT_DELIVERY",
+            prev_status=current_status,
+            new_status="RECEIVED",
+            meta={
+                "reopened": True,
+                "legacy": True,
+                "legacy_note": legacy_note,
+                "legacy_date": legacy_date,
+            },
+        )
+
+        await log_audit(
+            current_user.get("auth_id", "system"),
+            "REOPENED_LEGACY_GATEPASS",
+            "gatepass",
+            gp_id,
+        )
+
+        return {
+            "gate_pass_id": gp_id,
+            "gate_pass_number": decrypted.get("gate_pass_number"),
+            "client_name": decrypted.get("client_name"),
+            "reopened": True,
+            "reason": None,
+        }
+    except Exception as exc:  # never let one bad pass fail the whole batch
+        return {
+            "gate_pass_id": gp_id,
+            "reopened": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+
 @router.post("/{gate_pass_id}/reopen", response_model=GatePassModel)
 async def reopen_legacy_gate_pass(
     gate_pass_id: str,
@@ -589,88 +687,36 @@ async def reopen_legacy_gate_pass(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
         )
-    decrypted = decrypt_dict(gp_doc, SENSITIVE_FIELDS)
-
-    marked = decrypted.get("marked_delivered")
-    if not marked:
+    result = await _reopen_legacy_doc(gp_doc, current_user)
+    if not result["reopened"]:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This gate pass has no legacy mark-delivered closure to reopen.",
+            status_code=status.HTTP_409_CONFLICT, detail=result["reason"]
         )
-
-    dl_cursor = deliveries_collection.find(
-        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
-    )
-    delivery_count = 0
-    async for _dl in dl_cursor:
-        delivery_count += 1
-    if delivery_count > 0:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "This pass already has recorded deliveries; reopening would "
-                "contradict real dispatch history. Use a controlled reversal "
-                "instead."
-            ),
-        )
-
-    current_status = decrypted.get("status", "RECEIVED")
-    now = datetime.now(timezone.utc)
-    legacy_date = None
-    legacy_note = ""
-    if isinstance(marked, dict):
-        legacy_date = marked.get("delivered_date") or marked.get("at")
-        legacy_note = str(marked.get("note") or "")
-    elif isinstance(marked, bool) or isinstance(marked, int):
-        # Older docs may have stored True with the note on the doc itself.
-        legacy_note = str(decrypted.get("notes") or "")
-
-    marker = (
-        "Reopened for proper delivery recording (was closed by a legacy note"
-        + (f" on {legacy_date}" if legacy_date else "")
-        + "): "
-        + (legacy_note or "no note was recorded")
-    ).strip()
-
-    updated_gp = dict(decrypted)
-    updated_gp.pop("marked_delivered", None)
-    updated_gp["status"] = "RECEIVED"
-    existing_notes = decrypted.get("notes") or ""
-    updated_gp["notes"] = f"{existing_notes}\n{marker}".strip() if existing_notes else marker
-    updated_gp["updated_at"] = now
-    encrypted_gp = encrypt_dict(updated_gp, SENSITIVE_FIELDS)
-    await gatepasses_collection.replace_one({"_id": oid}, encrypted_gp)
-
-    gp_version = await bump_version("gatepass", oid)
-    await enqueue_sync("gatepass", oid, gp_version)
-
-    await record_event(
-        entity_type="gatepass",
-        entity_id=gate_pass_id,
-        event_type=EVENT_LEGACY_FLAG,
-        gate_pass_id=gate_pass_id,
-        user_id=current_user.get("auth_id", "system"),
-        user_name=current_user.get("user_name"),
-        reason="LEGACY_CLOSED_WITHOUT_DELIVERY",
-        prev_status=current_status,
-        new_status="RECEIVED",
-        meta={
-            "reopened": True,
-            "legacy": True,
-            "legacy_note": legacy_note,
-            "legacy_date": legacy_date,
-        },
-    )
-
-    await log_audit(
-        current_user.get("auth_id", "system"),
-        "REOPENED_LEGACY_GATEPASS",
-        "gatepass",
-        gate_pass_id,
-    )
-
     serialized = _serialize(await gatepasses_collection.find_one({"_id": oid}))
     return await attach_verification_to("gatepass", oid, serialized)
+
+
+@router.post("/reopen-legacy")
+async def reopen_all_legacy_gate_passes(
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    """Batch migration: reopen every legacy note-closed pass that is eligible.
+
+    Idempotent and safe — only passes with a ``marked_delivered`` closure and
+    no recorded deliveries change; everything else is skipped and reported.
+    """
+    reopened = []
+    skipped = []
+    gp_cursor = gatepasses_collection.find({})
+    async for gp_doc in gp_cursor:
+        if gp_doc.get("status") == "CANCELLED":
+            continue
+        result = await _reopen_legacy_doc(gp_doc, current_user)
+        if result["reopened"]:
+            reopened.append(result)
+        else:
+            skipped.append(result)
+    return {"reopened": reopened, "skipped": skipped}
 
 
 @router.patch("/{gate_pass_id}/date", response_model=GatePassModel)
