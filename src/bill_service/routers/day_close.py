@@ -10,7 +10,7 @@ The event is timestamped at the end of the business day (UTC) so it appears
 at the end of that day's timeline; the real wall-clock close time is kept in
 ``meta.closed_at``.
 """
-from datetime import datetime, time, timezone
+from datetime import datetime, date, time, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
@@ -29,11 +29,28 @@ class DayCloseRequest(BaseModel):
     note: Optional[str] = None
 
 
-def _validate_date(value: str) -> datetime:
+def _parse_day(value: str) -> date:
     try:
-        return datetime.strptime(value, "%Y-%m-%d")
+        return datetime.strptime(value, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(status_code=422, detail="date must be YYYY-MM-DD")
+
+
+def ensure_not_future(day: date, today: date) -> None:
+    """Guardrail: never close a business day that is ahead of "today".
+
+    ``today`` is compared with one day of headroom because the service runs
+    on UTC while the caller operates on a local calendar day (e.g. +5:30).
+    A genuinely future date (next week) is always rejected.
+    """
+    if day > today + timedelta(days=1):
+        raise HTTPException(
+            status_code=409, detail=f"Cannot close a future day ({day.isoformat()})."
+        )
+
+
+def _validate_date(value: str) -> datetime:
+    return datetime.combine(_parse_day(value), time(hour=23, minute=59, second=59, tzinfo=timezone.utc))
 
 
 @router.get("")
@@ -59,13 +76,29 @@ async def close_day(
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     """Record an end-of-day snapshot. Append-only; safe to run repeatedly."""
-    _validate_date(payload.date)
+    day_end = _validate_date(payload.date)
+    ensure_not_future(day_end.date(), datetime.now(timezone.utc).date())
+
+    # Guardrail: never close a day out of order. If a later day already has a
+    # snapshot, closing this one would silently imply an un-closed gap exists.
+    out_of_order = await linen_events_collection.find_one(
+        {
+            "entity_type": "day",
+            "event_type": EVENT_DAY_CLOSED,
+            "occurred_at": {"$gt": day_end},
+        },
+        sort=[("occurred_at", 1)],
+    )
+    if out_of_order:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"A later day ({out_of_order.get('entity_id')}) is already closed. "
+                "Close days in order, or re-close the later day first."
+            ),
+        )
 
     now = datetime.now(timezone.utc)
-    day_end = datetime.combine(
-        _validate_date(payload.date).date(),
-        time(hour=23, minute=59, second=59, tzinfo=timezone.utc),
-    )
 
     event_id = await record_event(
         entity_type="day",
