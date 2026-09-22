@@ -1,0 +1,13 @@
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.git
+.env
+uv.lock
+api
+tests
+README.md
+LICENSE
+vercel.json
+.vercelignore
