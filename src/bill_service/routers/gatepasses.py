@@ -21,6 +21,7 @@ from ..services.transaction_events import (
     EVENT_ADJUSTMENT_REQUESTED,
     EVENT_CATCH_UP_DELIVERY,
     EVENT_GATE_PASS_CREATED,
+    EVENT_LEGACY_FLAG,
     EVENT_RECEIVING_DATE_CHANGED,
     EVENT_RECEIVING_EDITED,
     EVENT_STATUS_CHANGED,
@@ -561,6 +562,111 @@ async def catch_up_delivery(
         "RECEIVING_CATCH_UP_DELIVERY",
         "delivery",
         dl_id,
+    )
+
+    serialized = _serialize(await gatepasses_collection.find_one({"_id": oid}))
+    return await attach_verification_to("gatepass", oid, serialized)
+
+
+@router.post("/{gate_pass_id}/reopen", response_model=GatePassModel)
+async def reopen_legacy_gate_pass(
+    gate_pass_id: str,
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    """Reopen a pass that was closed by the OLD mark-delivered note.
+
+    Only eligible when the pass:
+      * has a ``marked_delivered`` legacy note closure, AND
+      * has ZERO real delivery records (so no recorded history is at risk).
+
+    The legacy closure is flagged in the journal (LEGACY_FLAG with reason
+    LEGACY_CLOSED_WITHOUT_DELIVERY) and the pass is moved back to RECEIVED so
+    it re-enters the pending-to-deliver list. No quantities are fabricated.
+    """
+    oid = _parse_object_id(gate_pass_id)
+    gp_doc = await gatepasses_collection.find_one({"_id": oid})
+    if not gp_doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
+        )
+    decrypted = decrypt_dict(gp_doc, SENSITIVE_FIELDS)
+
+    marked = decrypted.get("marked_delivered")
+    if not marked:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This gate pass has no legacy mark-delivered closure to reopen.",
+        )
+
+    dl_cursor = deliveries_collection.find(
+        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
+    )
+    delivery_count = 0
+    async for _dl in dl_cursor:
+        delivery_count += 1
+    if delivery_count > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This pass already has recorded deliveries; reopening would "
+                "contradict real dispatch history. Use a controlled reversal "
+                "instead."
+            ),
+        )
+
+    current_status = decrypted.get("status", "RECEIVED")
+    now = datetime.now(timezone.utc)
+    legacy_date = None
+    legacy_note = ""
+    if isinstance(marked, dict):
+        legacy_date = marked.get("delivered_date") or marked.get("at")
+        legacy_note = str(marked.get("note") or "")
+    elif isinstance(marked, bool) or isinstance(marked, int):
+        # Older docs may have stored True with the note on the doc itself.
+        legacy_note = str(decrypted.get("notes") or "")
+
+    marker = (
+        "Reopened for proper delivery recording (was closed by a legacy note"
+        + (f" on {legacy_date}" if legacy_date else "")
+        + "): "
+        + (legacy_note or "no note was recorded")
+    ).strip()
+
+    updated_gp = dict(decrypted)
+    updated_gp.pop("marked_delivered", None)
+    updated_gp["status"] = "RECEIVED"
+    existing_notes = decrypted.get("notes") or ""
+    updated_gp["notes"] = f"{existing_notes}\n{marker}".strip() if existing_notes else marker
+    updated_gp["updated_at"] = now
+    encrypted_gp = encrypt_dict(updated_gp, SENSITIVE_FIELDS)
+    await gatepasses_collection.replace_one({"_id": oid}, encrypted_gp)
+
+    gp_version = await bump_version("gatepass", oid)
+    await enqueue_sync("gatepass", oid, gp_version)
+
+    await record_event(
+        entity_type="gatepass",
+        entity_id=gate_pass_id,
+        event_type=EVENT_LEGACY_FLAG,
+        gate_pass_id=gate_pass_id,
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        reason="LEGACY_CLOSED_WITHOUT_DELIVERY",
+        prev_status=current_status,
+        new_status="RECEIVED",
+        meta={
+            "reopened": True,
+            "legacy": True,
+            "legacy_note": legacy_note,
+            "legacy_date": legacy_date,
+        },
+    )
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "REOPENED_LEGACY_GATEPASS",
+        "gatepass",
+        gate_pass_id,
     )
 
     serialized = _serialize(await gatepasses_collection.find_one({"_id": oid}))
