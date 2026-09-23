@@ -17,6 +17,7 @@ from ..database.main_db import adjustments_collection, gatepasses_collection
 from ..models import GatePassAdjustmentRequest
 from ..router_utils import parse_object_id
 from ..services import balance_engine as be
+from ..services.bill_sync import sync_bills_to_gate_pass
 from ..services.transaction_events import (
     build_item_delta,
     record_event,
@@ -187,6 +188,22 @@ async def approve_adjustment(
 
     encrypted_gp = encrypt_dict(new_gp, SENSITIVE_FIELDS)
     await gatepasses_collection.replace_one({"_id": gp_oid}, encrypted_gp)
+
+    # Automatic propagation: any linked, still-editable bill is re-clamped to
+    # the corrected received quantities; paid bills are flagged, never rewritten.
+    try:
+        await sync_bills_to_gate_pass(
+            str(gp_oid),
+            updated_items,
+            user_id=current_user.get("auth_id", "system"),
+            user_name=current_user.get("user_name"),
+            reason=adj_doc.get("reason"),
+        )
+    except Exception:
+        import logging
+        logging.getLogger("bill_service").exception(
+            "bill_sync failed after adjustment approval %s", oid
+        )
 
     await adjustments_collection.update_one(
         {"_id": oid},

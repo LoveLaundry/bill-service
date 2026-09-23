@@ -15,6 +15,7 @@ from ..database.main_db import (
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..error_responses import NotFoundError, ValidationError, ConflictError, ForbiddenError
+from ..services.bill_sync import sync_bills_to_gate_pass
 from ..services.transaction_events import (
     build_item_delta,
     record_event,
@@ -854,6 +855,24 @@ async def update_gate_pass(
         new_version = await bump_version("gatepass", oid)
         await enqueue_sync("gatepass", oid, new_version)
         serialized = await attach_verification_to("gatepass", oid, serialized)
+
+        # Automatic propagation: any linked, still-editable bill is re-clamped
+        # to the corrected received quantities (GP-leg bills may exist even
+        # while no deliveries/returns block this edit).
+        if "items" in update_data and update_data["items"]:
+            try:
+                await sync_bills_to_gate_pass(
+                    serialized["id"],
+                    processed_items,
+                    user_id=current_user.get("auth_id", "system"),
+                    user_name=current_user.get("user_name"),
+                    reason=update_data.get("notes"),
+                )
+            except Exception:
+                import logging
+                logging.getLogger("bill_service").exception(
+                    "bill_sync failed after gate pass item edit %s", oid
+                )
 
         old_items = previous_items
         if "items" in update_data and update_data["items"]:
