@@ -19,7 +19,6 @@ from ..services.bill_sync import sync_bills_to_gate_pass
 from ..services.transaction_events import (
     build_item_delta,
     record_event,
-    EVENT_ADJUSTMENT_REQUESTED,
     EVENT_CATCH_UP_DELIVERY,
     EVENT_GATE_PASS_CREATED,
     EVENT_LEGACY_FLAG,
@@ -30,6 +29,7 @@ from ..services.transaction_events import (
 from ..services.verification_service import attach_verification_to
 from ..models import (
     GatePassAdjustment,
+    GatePassAdjustmentRequest,
     GatePassCatchUpDelivery,
     GatePassCreate,
     GatePassDateUpdate,
@@ -37,6 +37,7 @@ from ..models import (
     GatePassModel,
     GatePassUpdate,
 )
+from .adjustments import create_adjustment_request
 
 router = APIRouter(prefix="/gatepasses", tags=["gatepasses"])
 
@@ -818,7 +819,12 @@ async def update_gate_pass(
                     ),
                 )
 
-        previous_items = {i["item_name"]: i.get("received_qty", 0) for i in decrypted.get("items", [])}
+        previous_items = {
+            f"{i.get('item_name', '')}||{i.get('specification') or ''}": int(
+                i.get("received_qty", 0) or 0
+            )
+            for i in decrypted.get("items", [])
+        }
 
         if "items" in update_data and update_data["items"]:
             processed_items = []
@@ -880,11 +886,16 @@ async def update_gate_pass(
                 build_item_delta(
                     item["item_name"],
                     item.get("specification"),
-                    old_items.get(item["item_name"], 0),
+                    old_items.get(
+                        f"{item['item_name']}||{item.get('specification') or ''}", 0
+                    ),
                     item["received_qty"],
                 )
                 for item in processed_items
-                if old_items.get(item["item_name"], 0) != item["received_qty"]
+                if old_items.get(
+                    f"{item['item_name']}||{item.get('specification') or ''}", 0
+                )
+                != item["received_qty"]
             ]
             await record_event(
                 entity_type="gatepass",
@@ -933,6 +944,15 @@ async def adjust_gate_pass(
     payload: GatePassAdjustment,
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
+    """Request an item-quantity correction on a gate pass.
+
+    This endpoint NEVER rewrites quantities in place — the previous version
+    mutated the pass immediately, skipped the second-user approval gate, was
+    unaware of item specifications, and never re-synced linked bills. It now
+    stages a REQUESTED adjustment through the same controlled workflow as
+    ``POST /adjustments``; the gate pass is returned UNCHANGED until another
+    user approves the request (approved corrections re-sync linked bills).
+    """
     oid = _parse_object_id(gate_pass_id)
     doc = await gatepasses_collection.find_one({"_id": oid})
     if not doc:
@@ -940,71 +960,15 @@ async def adjust_gate_pass(
             status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
         )
 
-    # Decrypt original
-    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
-
-    # Locate the item to adjust
-    items = decrypted.get("items", [])
-    found = False
-    original_val = None
-    for item in items:
-        if item["item_name"] == payload.item_name:
-            original_val = item["received_qty"]
-            item["received_qty"] = payload.corrected_qty
-            item["difference"] = payload.corrected_qty - item["client_qty"]
-            found = True
-            break
-
-    if not found:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Item '{payload.item_name}' not found in Gate Pass items.",
-        )
-
-    # Add adjustment record
-    adjustments = decrypted.get("adjustments", [])
-    adjustments.append(
-        {
-            "user_id": current_user.get("auth_id", "system"),
-            "timestamp": datetime.now(timezone.utc),
-            "item_name": payload.item_name,
-            "original_value": original_val,
-            "corrected_value": payload.corrected_qty,
-            "reason": payload.reason,
-        }
+    request = GatePassAdjustmentRequest(
+        gate_pass_id=gate_pass_id,
+        item_name=payload.item_name,
+        specification=payload.specification,
+        corrected_qty=payload.corrected_qty,
+        reason=payload.reason,
     )
-    decrypted["adjustments"] = adjustments
-    decrypted["updated_at"] = datetime.now(timezone.utc)
-
-    # Re-encrypt and save
-    encrypted_new = encrypt_dict(decrypted, SENSITIVE_FIELDS)
-    await gatepasses_collection.replace_one({"_id": oid}, encrypted_new)
+    await create_adjustment_request(request, current_user)
 
     updated_doc = await gatepasses_collection.find_one({"_id": oid})
     serialized = _serialize(updated_doc)
-
-    new_version = await bump_version("gatepass", oid)
-    await enqueue_sync("gatepass", oid, new_version)
-    serialized = await attach_verification_to("gatepass", oid, serialized)
-
-    await record_event(
-        entity_type="gatepass",
-        entity_id=serialized["id"],
-        event_type=EVENT_ADJUSTMENT_REQUESTED,
-        gate_pass_id=serialized["id"],
-        user_id=current_user.get("auth_id", "system"),
-        user_name=current_user.get("user_name"),
-        reason=payload.reason,
-        item_deltas=[
-            build_item_delta(payload.item_name, None, original_val, payload.corrected_qty)
-        ],
-        meta={"legacy_in_place_adjust": True, "corrected_value": payload.corrected_qty},
-    )
-
-    await log_audit(
-        current_user.get("auth_id", "system"),
-        "RECEIVING_ADJUST",
-        "gatepass",
-        serialized["id"],
-    )
-    return serialized
+    return await attach_verification_to("gatepass", oid, serialized)

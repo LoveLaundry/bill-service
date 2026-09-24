@@ -153,6 +153,24 @@ def compute_gate_pass_balance(
     }
 
 
+def recompute_status_with_movements(
+    gp_items: List[dict],
+    delivery_docs: List[dict],
+    return_docs: List[dict],
+    current_status: str,
+) -> str:
+    """Derive the real status after a quantity correction, INCLUDING movements.
+
+    The approval of a gate-pass adjustment must never re-derive status from an
+    empty movement set — that would downgrade a fully-delivered pass to
+    PARTIALLY_DELIVERED/RECEIVED because recorded deliveries were ignored.
+    """
+    delivered = compute_delivered_by_item(delivery_docs)
+    returned = compute_returned_by_item(return_docs)
+    balance = compute_gate_pass_balance(gp_items, delivered, returned)
+    return derive_gate_pass_status(balance, current_status)
+
+
 def derive_gate_pass_status(balance: dict, current_status: str) -> str:
     """Derive the correct status from quantities, not from a manual label.
 

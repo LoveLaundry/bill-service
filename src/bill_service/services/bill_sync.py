@@ -41,21 +41,31 @@ BILL_SENSITIVE_FIELDS = ["client_name", "quotation_title", "notes", "items"]
 NON_EDITABLE_STATUSES = ("PAID", "CANCELLED")
 
 
-def _item_key(name: str, spec: Optional[str]) -> str:
-    return f"{name}::{spec or ''}"
-
-
 def _snapshot_received(gp_items: list[dict]) -> dict:
-    """Map item key -> corrected received quantity on the gate pass."""
-    out = {}
+    """Map item NAME -> corrected received quantity on the gate pass.
+
+    Bills are item-name based: ``create_bill`` aggregates specification
+    variants through ``compute_billable_received_by_name`` and a bill line
+    never carries a ``specification``. Keying this snapshot with
+    ``name::spec`` therefore silently zeroed every spec'd bill line on
+    re-sync — the snapshot must be aggregated by name exactly like the
+    biller does.
+    """
+    out: dict = {}
     for it in gp_items or []:
-        key = _item_key(it.get("item_name", ""), it.get("specification"))
-        out[key] = {
-            "item_name": it.get("item_name", ""),
-            "specification": it.get("specification"),
+        name = it.get("item_name", "")
+        spec_item = {
+            "item_name": name,
             "category": it.get("category"),
             "received_qty": int(it.get("received_qty", 0) or 0),
         }
+        cur = out.get(name)
+        if cur is None:
+            out[name] = spec_item
+        else:
+            cur["received_qty"] += spec_item["received_qty"]
+            if cur["category"] is None and spec_item["category"]:
+                cur["category"] = spec_item["category"]
     return out
 
 
@@ -182,7 +192,7 @@ async def sync_bills_to_gate_pass(
             name = old.get("item_name", "")
             spec = old.get("specification")
             old_qty = int(old.get("quantity", 0) or 0)
-            rec = received.get(_item_key(name, spec))
+            rec = received.get(name)
             new_qty = min(old_qty, rec["received_qty"]) if rec is not None else 0
             if new_qty != old_qty:
                 deltas.append(build_item_delta(name, spec, old_qty, new_qty))
@@ -198,11 +208,10 @@ async def sync_bills_to_gate_pass(
 
         # Items now received on the corrected gate pass but never billed on
         # this bill — reported, never auto-added (avoid over-billing).
-        billed_keys = {_item_key(i["item_name"], i.get("specification")) for i in old_items}
+        billed_keys = {i.get("item_name", "") for i in old_items}
         missing_on_bill = sorted({
-            rec["item_name"]
-            for key, rec in received.items()
-            if rec["received_qty"] > 0 and key not in billed_keys
+            name for name, rec in received.items()
+            if rec["received_qty"] > 0 and name not in billed_keys
         })
 
         if status in NON_EDITABLE_STATUSES:
@@ -225,7 +234,7 @@ async def sync_bills_to_gate_pass(
                     "action": "flag_paid_bill",
                     "payment_status": status,
                     "corrected_received_by_item": {
-                        k.split("::")[0]: rec["received_qty"] for k, rec in received.items()
+                        name: rec["received_qty"] for name, rec in received.items()
                     },
                 },
             )

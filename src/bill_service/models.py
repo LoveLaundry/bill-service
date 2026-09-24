@@ -29,9 +29,17 @@ class GatePassCreate(BaseModel):
 
 
 class GatePassAdjustment(BaseModel):
+    """Legacy quick-adjust body (POST /gatepasses/{id}/adjust).
+
+    Quantities are never mutated inline anymore — the endpoint stages a
+    controlled adjustment request. ``specification`` is optional so a request
+    always targets the correct variant of an item on the gate pass.
+    """
+
     item_name: str
+    specification: Optional[str] = None
     corrected_qty: int = Field(ge=0)
-    reason: str
+    reason: str = Field(min_length=1, description="Reason is mandatory")
 
 
 class GatePassDateUpdate(BaseModel):

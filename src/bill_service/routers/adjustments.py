@@ -13,7 +13,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth_helper import require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict
-from ..database.main_db import adjustments_collection, gatepasses_collection
+from ..database.main_db import (
+    adjustments_collection,
+    deliveries_collection,
+    gatepasses_collection,
+    returns_collection,
+)
 from ..models import GatePassAdjustmentRequest
 from ..router_utils import parse_object_id
 from ..services import balance_engine as be
@@ -44,11 +49,10 @@ async def _get_open_gp(gate_pass_id: str):
     return oid, decrypt_dict(gp_doc, SENSITIVE_FIELDS)
 
 
-@router.post("")
 async def create_adjustment_request(
     payload: GatePassAdjustmentRequest,
-    current_user: dict = Depends(require_capability("gatepass:write")),
-):
+    current_user: dict,
+) -> dict:
     """Create an adjustment request. Does NOT change any quantity."""
     gp_oid, decrypted = await _get_open_gp(payload.gate_pass_id)
 
@@ -97,6 +101,15 @@ async def create_adjustment_request(
         meta={"status": "REQUESTED"},
     )
     return adj_doc
+
+
+@router.post("")
+async def create_adjustment_route(
+    payload: GatePassAdjustmentRequest,
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    """POST /adjustments — stage an adjustment request (no quantity change)."""
+    return await create_adjustment_request(payload, current_user)
 
 
 @router.get("")
@@ -182,9 +195,25 @@ async def approve_adjustment(
     new_gp["adjustments"] = history
     new_gp["updated_at"] = now
 
-    # Re-derive gate pass status from the corrected quantities.
-    balance = be.compute_gate_pass_balance(updated_items, {}, {})
-    new_gp["status"] = be.derive_gate_pass_status(balance, new_gp.get("status", "RECEIVED"))
+    # Re-derive gate pass status from the corrected quantities INCLUDING all
+    # real movements — ignoring recorded deliveries/returns downgraded a fully
+    # delivered pass (e.g. 50 received, 50 delivered, corrected to 47) to
+    # PARTIALLY_DELIVERED/RECEIVED.
+    delivered_docs = []
+    async for dl in deliveries_collection.find(
+        {"gate_pass_id": str(gp_oid), "status": {"$ne": "CANCELLED"}}
+    ):
+        delivered_docs.append(dl)
+    return_docs = []
+    async for rt in returns_collection.find({"gate_pass_id": str(gp_oid)}):
+        return_docs.append(rt)
+
+    new_gp["status"] = be.recompute_status_with_movements(
+        updated_items,
+        [decrypt_dict(x, SENSITIVE_FIELDS) for x in delivered_docs],
+        [decrypt_dict(x, SENSITIVE_FIELDS) for x in return_docs],
+        new_gp.get("status", "RECEIVED"),
+    )
 
     encrypted_gp = encrypt_dict(new_gp, SENSITIVE_FIELDS)
     await gatepasses_collection.replace_one({"_id": gp_oid}, encrypted_gp)
