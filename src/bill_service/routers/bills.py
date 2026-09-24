@@ -670,6 +670,8 @@ async def get_unbilled_gatepasses(
 
             received_by_name: dict = {}
             for gp_item in gp.get("items", []):
+                if gp_item.get("rewashed"):
+                    continue  # free re-washes are never billed
                 name = gp_item.get("item_name", "")
                 received_by_name[name] = received_by_name.get(name, 0) + int(
                     gp_item.get("received_qty", 0) or 0
@@ -682,7 +684,8 @@ async def get_unbilled_gatepasses(
 
                 if unbilled_qty > 0:
                     gp_item = next(
-                        (item for item in gp.get("items", []) if item["item_name"] == item_name),
+                        (item for item in gp.get("items", [])
+                         if item["item_name"] == item_name and not item.get("rewashed")),
                         {},
                     )
 

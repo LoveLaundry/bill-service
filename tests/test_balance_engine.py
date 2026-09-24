@@ -5,13 +5,14 @@ Run with:  uv run --no-sync --with pytest python -m pytest tests -q
 from bill_service.services import balance_engine as be
 
 
-def _gp_item(name, received, expected=0, spec=None):
+def _gp_item(name, received, expected=0, spec=None, rewashed=False):
     return {
         "item_name": name,
         "specification": spec,
         "client_qty": expected,
         "received_qty": received,
         "category": "HOTEL",
+        "rewashed": rewashed,
     }
 
 
@@ -276,6 +277,56 @@ def test_billable_received_by_name():
     billable = be.compute_billable_received_by_name(gp, billed)
     assert billable["Duvet Cover"] == 27
     assert billable["Towel"] == 12  # 10 + 5 across specs, minus 3 already billed
+
+
+# --- Rewashed items are never billable ---
+def test_rewashed_items_never_billable_by_name():
+    # Mixed pass: normal + rewashed rows of the same item name.
+    gp = [
+        _gp_item("Bed Sheet", 20, 20),
+        _gp_item("Bed Sheet", 10, 10, rewashed=True),
+        _gp_item("Pillow", 5, 5),
+        _gp_item("Pillow", 3, 3, rewashed=True),
+    ]
+    billable = be.compute_billable_received_by_name(gp, {})
+    assert billable["Bed Sheet"] == 20  # rewashed 10 excluded
+    assert billable["Pillow"] == 5      # rewashed 3 excluded
+
+
+def test_rewashed_items_never_billable_on_received():
+    gp = [
+        _gp_item("Towel", 10, 10),
+        _gp_item("Duvet Cover", 5, 5, rewashed=True),
+    ]
+    billables = be.compute_billable_on_received(gp)
+    assert be.item_key("Towel") in billables
+    assert billables[be.item_key("Towel")] == 10
+    assert be.item_key("Duvet Cover") not in billables
+    assert not any(k.startswith("Duvet Cover") for k in billables)
+
+
+def test_rewashed_only_pass_has_zero_billables():
+    gp = [_gp_item("Towel", 10, 10, rewashed=True)]
+    assert be.compute_billable_received_by_name(gp, {}) == {}
+    assert be.compute_billable_on_received(gp) == {}
+
+
+def test_rewashed_flag_survives_balance_and_flags():
+    gp = [_gp_item("Towel", 10, 10, rewashed=True)]
+    bal = _balance(gp)
+    item = bal["items"][be.item_key("Towel")]
+    assert item["rewashed"] is True
+    assert "REWASHED_FREE" in item["flags"]
+    # Still physically received / tracked for delivery, just not billed.
+    assert item["received_qty"] == 10
+
+
+def test_rewashed_balance_still_tracks_delivery():
+    gp = [_gp_item("Towel", 10, 10, rewashed=True)]
+    bal = _balance(gp, deliveries=[_delivery([_del_item("Towel", 4)])])
+    item = bal["items"][be.item_key("Towel")]
+    assert item["delivered_qty"] == 4
+    assert item["outstanding_delivery_qty"] == 6  # still pending for delivery
 
 
 # --- Reconciliation issue detection (pure) ---

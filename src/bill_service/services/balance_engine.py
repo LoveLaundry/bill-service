@@ -26,6 +26,11 @@ def item_key(name: str, spec: Optional[str] = None) -> str:
     return f"{name}||{spec or ''}"
 
 
+def is_rewashed(it: dict) -> bool:
+    """True when an item is tagged as a free re-wash (never billed)."""
+    return bool(it.get("rewashed"))
+
+
 def flatten_name(key: str) -> str:
     """Recover item name from a canonical key."""
     return key.split("||", 1)[0]
@@ -112,6 +117,8 @@ def compute_gate_pass_balance(
         extra_received = max(0, received - expected)
 
         item_flags: List[str] = []
+        if is_rewashed(it):
+            item_flags.append("REWASHED_FREE")
         if delivered > received:
             item_flags.append("DELIVERED_EXCEEDS_RECEIVED")
         if received < expected:
@@ -126,6 +133,7 @@ def compute_gate_pass_balance(
             "item_name": name,
             "specification": spec or "",
             "category": it.get("category") or "",
+            "rewashed": is_rewashed(it),
             "expected_qty": expected,
             "received_qty": received,
             "rejected_qty": rejected,
@@ -215,10 +223,14 @@ def compute_billable_on_received(
 
     The billable event is the received quantity (business decision). Billable
     per item = received_qty - already billed quantity. Never negative.
+    Items tagged ``rewashed`` are free re-washes and are NEVER billable — they
+    are skipped entirely so they can never leak into a bill.
     """
     billed_by_item = billed_by_item or {}
     out: Dict[str, int] = {}
     for it in gp_items:
+        if is_rewashed(it):
+            continue
         key = item_key(it.get("item_name", ""), it.get("specification"))
         received = int(it.get("received_qty", 0) or 0)
         billed = int(billed_by_item.get(key, 0) or 0)
@@ -234,11 +246,14 @@ def compute_billable_received_by_name(
 
     Billing lines are item-name based (spec is not part of a bill line), so
     received quantities across specs of the same item are summed before the
-    already-billed quantities are subtracted.
+    already-billed quantities are subtracted. Rewashed tags (free re-washes)
+    are excluded so they are never billed.
     """
     billed_by_name = billed_by_name or {}
     received_by_name: Dict[str, int] = {}
     for it in gp_items_list:
+        if is_rewashed(it):
+            continue
         name = it.get("item_name", "")
         received_by_name[name] = received_by_name.get(name, 0) + int(it.get("received_qty", 0) or 0)
     return {

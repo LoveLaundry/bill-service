@@ -120,6 +120,7 @@ async def create_gate_pass(
                 "difference": diff,
                 "mismatch_reason": item.mismatch_reason,
                 "mismatch_notes": item.mismatch_notes,
+                "rewashed": bool(getattr(item, "rewashed", False)),
             }
         )
 
@@ -839,6 +840,7 @@ async def update_gate_pass(
                         "difference": item["received_qty"] - item["client_qty"],
                         "mismatch_reason": item.get("mismatch_reason"),
                         "mismatch_notes": item.get("mismatch_notes"),
+                        "rewashed": bool(item.get("rewashed", False)),
                     }
                 )
             decrypted["items"] = processed_items

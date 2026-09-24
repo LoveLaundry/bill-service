@@ -53,6 +53,8 @@ def _snapshot_received(gp_items: list[dict]) -> dict:
     """
     out: dict = {}
     for it in gp_items or []:
+        if it.get("rewashed"):
+            continue  # free re-washes are never billed, so never re-synced
         name = it.get("item_name", "")
         spec_item = {
             "item_name": name,

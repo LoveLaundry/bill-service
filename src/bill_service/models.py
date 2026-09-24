@@ -16,6 +16,7 @@ class GatePassItem(BaseModel):
     difference: int = 0
     mismatch_reason: Optional[str] = None  # MISSING, EXTRA, COUNTING_ERROR, DAMAGED, OTHER
     mismatch_notes: Optional[str] = None
+    rewashed: bool = Field(default=False, description="Tagged as a free re-wash; never billed")
 
 
 class GatePassCreate(BaseModel):
