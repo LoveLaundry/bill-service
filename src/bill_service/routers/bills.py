@@ -206,6 +206,17 @@ async def create_bill(
             g_dec = decrypt_dict(g_doc, GATEPASS_SENSITIVE_FIELDS)
             gp_items_list.extend(g_dec.get("items", []))
 
+        # Free re-washes are never billed — reject them explicitly with a clear
+        # message (the billable map already excludes them, so this is a clearer
+        # 400 than the generic "only X remaining" error).
+        rewashed_names = {
+            it.get("item_name")
+            for it in gp_items_list
+            if it.get("rewashed")
+        }
+        if rewashed_names:
+            rewashed_names = {n for n in rewashed_names if n}
+
         # Map item_name -> already billed quantity for these deliveries AND
         # for the gate passes they belong to (GP-leg bills store no delivery ids).
         already_billed_map = {}
@@ -236,6 +247,14 @@ async def create_bill(
                 qty = input_item.quantity
                 allowed = billable_map.get(name, 0)
 
+                if name in rewashed_names and allowed <= 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Item '{name}' is tagged as a free re-wash on "
+                            "this gate pass and cannot be billed."
+                        ),
+                    )
                 if qty > allowed:
                     raise HTTPException(
                         status_code=400,
@@ -308,11 +327,25 @@ async def create_bill(
 
         gp_map = be.compute_billable_received_by_name(gp_dec.get("items", []), already_billed_map)
 
+        rewashed_names = {
+            it.get("item_name")
+            for it in (gp_dec.get("items") or [])
+            if it.get("rewashed") and it.get("item_name")
+        }
+
         if payload.items:
             for input_item in payload.items:
                 name = input_item.item_name
                 qty = input_item.quantity
                 allowed = gp_map.get(name, 0)
+                if name in rewashed_names and allowed <= 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Item '{name}' is tagged as a free re-wash on "
+                            "this gate pass and cannot be billed."
+                        ),
+                    )
                 if qty > allowed:
                     raise HTTPException(
                         status_code=400,
@@ -667,10 +700,19 @@ async def get_unbilled_gatepasses(
             # Calculate unbilled quantities on the received basis
             unbilled_items = []
             total_unbilled_qty = 0
+            rewashed_items = []
+            total_rewashed_qty = 0
 
             received_by_name: dict = {}
             for gp_item in gp.get("items", []):
                 if gp_item.get("rewashed"):
+                    received = int(gp_item.get("received_qty", 0) or 0)
+                    rewashed_items.append({
+                        "item_name": gp_item.get("item_name", ""),
+                        "specification": gp_item.get("specification") or "",
+                        "received_qty": received,
+                    })
+                    total_rewashed_qty += received
                     continue  # free re-washes are never billed
                 name = gp_item.get("item_name", "")
                 received_by_name[name] = received_by_name.get(name, 0) + int(
@@ -709,6 +751,8 @@ async def get_unbilled_gatepasses(
                     "delivery_ids": delivery_ids,
                     "unbilled_items": unbilled_items,
                     "total_unbilled_qty": total_unbilled_qty,
+                    "rewashed_items": rewashed_items,
+                    "total_rewashed_qty": total_rewashed_qty,
                 })
 
         except Exception:
