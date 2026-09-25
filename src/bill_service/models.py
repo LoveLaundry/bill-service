@@ -6,6 +6,21 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 PyObjectId = Annotated[str, BeforeValidator(str)]
 
 
+class Verification(BaseModel):
+    """Replication-fidelity state for a record, attached by the sync service.
+
+    Mirrors the payload returned by
+    `services.verification_service.get_verification`.
+    """
+
+    status: str = "PENDING"
+    verified: bool = False
+    last_verified_at: Optional[datetime] = None
+    main_version: Optional[int] = None
+    secondary_version: Optional[int] = None
+    error: Optional[str] = None
+
+
 # --- Gate Pass / Receiving ---
 class GatePassItem(BaseModel):
     item_name: str
@@ -110,6 +125,8 @@ class GatePassModel(BaseModel):
         validation_alias=AliasChoices("_id", "id"),
         serialization_alias="id",
     )
+
+    verification: Optional[Verification] = None
     gate_pass_number: str
     client_name: str
     receiving_date: datetime
@@ -154,6 +171,8 @@ class DeliveryModel(BaseModel):
         validation_alias=AliasChoices("_id", "id"),
         serialization_alias="id",
     )
+
+    verification: Optional[Verification] = None
     gate_pass_id: str
     client_name: str
     delivery_date: datetime
@@ -202,6 +221,8 @@ class DispatchModel(BaseModel):
         validation_alias=AliasChoices("_id", "id"),
         serialization_alias="id",
     )
+
+    verification: Optional[Verification] = None
     job_type: str
     order_id: Optional[str] = None
     client_name: str
@@ -254,6 +275,8 @@ class BillModel(BaseModel):
         validation_alias=AliasChoices("_id", "id"),
         serialization_alias="id",
     )
+
+    verification: Optional[Verification] = None
     quotation_id: str
     client_name: str
     quotation_title: Optional[str] = None
@@ -327,6 +350,8 @@ class PaymentModel(BaseModel):
         validation_alias=AliasChoices("_id", "id"),
         serialization_alias="id",
     )
+
+    verification: Optional[Verification] = None
     bill_id: str
     client_name: str
     amount: float

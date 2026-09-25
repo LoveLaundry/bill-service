@@ -10,7 +10,7 @@ from ..database.main_db import (
     audit_collection,
     dispatch_jobs_collection,
 )
-from ..repositories.main_repository import bump_version, enqueue_sync
+from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..services.verification_service import attach_verification_to
 from ..models import DispatchCreate, DispatchUpdate, DispatchModel, DispatchOptimize
 
@@ -220,13 +220,20 @@ async def delete_dispatch_job(
     current_user: dict = Depends(require_capability("dispatch:write")),
 ):
     oid = _parse_object_id(job_id)
+    # Bump the version while the document still exists, then remove it and
+    # enqueue a DELETE so the SECONDARY replica drops the record too.
+    try:
+        new_version = await bump_version("dispatch", oid)
+    except KeyError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dispatch job not found"
+        )
     result = await dispatch_jobs_collection.delete_one({"_id": oid})
     if result.deleted_count == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Dispatch job not found"
         )
-    new_version = await bump_version("dispatch", oid)
-    await enqueue_sync("dispatch", oid, new_version)
+    await enqueue_delete("dispatch", oid, new_version)
 
 
 def _haversine(a: tuple[float, float], b: tuple[float, float]) -> float:

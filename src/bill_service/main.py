@@ -64,7 +64,7 @@ if SENTRY_DSN:
 
 app = FastAPI(title="Bills, Receiving & Deliveries Service", version="1.0.0")
 
-from .security import apply_security, insecure_flags
+from .security import apply_security
 
 origins = ALLOWED_ORIGINS if settings.cors_origins == ["*"] or not settings.cors_origins else settings.cors_origins
 apply_security(app, rate_limit=300, origins=origins)
@@ -142,12 +142,10 @@ async def shutdown_event():
 
 @app.get("/health")
 async def health():
-    flags = insecure_flags()
     return {
         "status": "ok",
         "security": {
             "headers": True,
             "rate_limiting": True,
-            "insecure_defaults": flags,
         },
     }

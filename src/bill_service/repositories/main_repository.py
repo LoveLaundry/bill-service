@@ -14,6 +14,11 @@ from typing import Any, Optional
 from ..database.main_db import sync_queue_collection, sync_status_collection
 from .entity_registry import get_main_collection
 
+# Sync job kinds. UPSERT replicates the current MAIN document; DELETE removes
+# the record from SECONDARY (replica deletions must follow MAIN deletions).
+OPERATION_UPSERT = "UPSERT"
+OPERATION_DELETE = "DELETE"
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -46,6 +51,33 @@ async def enqueue_sync(entity: str, record_id: Any, version: int) -> None:
                 "entity": entity,
                 "record_id": str(record_id),
                 "version": version,
+                "operation": OPERATION_UPSERT,
+                "status": "PENDING",
+                "attempts": 0,
+                "next_attempt_at": _now(),
+                "updated_at": _now(),
+            },
+            "$setOnInsert": {"created_at": _now()},
+        },
+        upsert=True,
+    )
+
+
+async def enqueue_delete(entity: str, record_id: Any, version: int) -> None:
+    """
+    Persist a DELETE job so the SECONDARY replica drops the record too.
+
+    Call this AFTER the document has been removed from MAIN, passing the
+    version captured by `bump_version` immediately before the delete.
+    """
+    await sync_queue_collection.update_one(
+        {"entity": entity, "record_id": str(record_id), "status": {"$in": ["PENDING", "FAILED"]}},
+        {
+            "$set": {
+                "entity": entity,
+                "record_id": str(record_id),
+                "version": version,
+                "operation": OPERATION_DELETE,
                 "status": "PENDING",
                 "attempts": 0,
                 "next_attempt_at": _now(),

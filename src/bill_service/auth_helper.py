@@ -4,22 +4,11 @@ from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer
 import jwt
 
-import logging as _auth_log
-_auth_logger = _auth_log.getLogger("auth")
 _jwt_secret = os.getenv("JWT_SECRET")
 if not _jwt_secret:
-    _auth_logger.warning("JWT_SECRET not set — using insecure fallback. Set JWT_SECRET in production!")
-_jwt_secret = _jwt_secret or "CHANGE-ME-IN-PRODUCTION-love-laundry-2026"
+    raise RuntimeError("FATAL: JWT_SECRET environment variable is not set. Refusing to start.")
 JWT_SECRET = _jwt_secret
 JWT_ALGORITHM = "HS256"
-
-# Track insecure defaults so the health endpoint can report them
-try:
-    from .security import mark_jwt_insecure
-    if not os.getenv("JWT_SECRET"):
-        mark_jwt_insecure()
-except ImportError:
-    pass
 
 security = HTTPBearer()
 

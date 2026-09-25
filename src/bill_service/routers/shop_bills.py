@@ -28,7 +28,7 @@ from ..models import (
     ShopBillUpdate,
     LegacyInvoiceCreate,
 )
-from ..repositories.main_repository import bump_version, enqueue_sync
+from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..router_utils import log_audit, parse_object_id
 
 router = APIRouter(prefix="/shop-bills", tags=["shop-bills"])
@@ -318,10 +318,10 @@ async def delete_legacy_invoice(
     current_user: dict = Depends(require_capability("bill:write")),
 ):
     raw = await _find_legacy_invoice(invoice_id)
-    await legacy_invoices_collection.delete_one({"_id": raw["_id"]})
-
+    # Bump before deleting: bump_version needs the document to still exist.
     new_version = await bump_version("legacy_invoice", raw["_id"])
-    await enqueue_sync("legacy_invoice", raw["_id"], new_version)
+    await legacy_invoices_collection.delete_one({"_id": raw["_id"]})
+    await enqueue_delete("legacy_invoice", raw["_id"], new_version)
 
     await log_audit(
         current_user.get("auth_id", "system"),
@@ -504,10 +504,10 @@ async def delete_bill(
     if doc.get("locked"):
         raise HTTPException(status_code=400, detail="Cannot delete a locked bill")
 
-    await shop_bills_collection.delete_one({"_id": raw["_id"]})
-
+    # Bump before deleting: bump_version needs the document to still exist.
     new_version = await bump_version("shop_bill", raw["_id"])
-    await enqueue_sync("shop_bill", raw["_id"], new_version)
+    await shop_bills_collection.delete_one({"_id": raw["_id"]})
+    await enqueue_delete("shop_bill", raw["_id"], new_version)
 
     await log_audit(
         current_user.get("auth_id", "system"),
@@ -1476,9 +1476,9 @@ async def bulk_delete(
         if doc.get("locked"):
             continue
 
-        await shop_bills_collection.delete_one({"_id": raw["_id"]})
         vi = await bump_version("shop_bill", raw["_id"])
-        await enqueue_sync("shop_bill", raw["_id"], vi)
+        await shop_bills_collection.delete_one({"_id": raw["_id"]})
+        await enqueue_delete("shop_bill", raw["_id"], vi)
         deleted += 1
 
     await log_audit(
@@ -2226,9 +2226,9 @@ async def delete_template(
     raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
     if not raw:
         raise HTTPException(status_code=404, detail="Template not found")
-    await bill_templates_collection.delete_one({"_id": raw["_id"]})
     v = await bump_version("bill_template", raw["_id"])
-    await enqueue_sync("bill_template", raw["_id"], v)
+    await bill_templates_collection.delete_one({"_id": raw["_id"]})
+    await enqueue_delete("bill_template", raw["_id"], v)
     await log_audit(current_user.get("auth_id", "system"), "TEMPLATE_DELETE", "bill_template", str(raw["_id"]))
     return {"message": "Template deleted"}
 

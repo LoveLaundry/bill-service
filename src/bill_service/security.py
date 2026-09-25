@@ -2,7 +2,10 @@
 
 • SecurityHeadersMiddleware — injects strict response headers
 • RateLimitMiddleware — sliding-window token bucket per client IP
-• Insecure secret detection — health endpoint reports when defaults are active
+
+Secrets are validated at import time in ``auth_helper`` / ``crypto_helper``:
+the service refuses to start when JWT_SECRET or MASTER_KEY is unset, so there
+is no insecure-default state for a health check to report.
 """
 import time
 import hashlib
@@ -65,25 +68,3 @@ def apply_security(app: FastAPI, rate_limit: int = 300, origins: list[str] | Non
     )
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(RateLimitMiddleware, requests_per_minute=rate_limit)
-
-
-# ── Insecure-secret state tracking (for health endpoint) ─────────────────────
-_jwt_insecure = False
-_master_insecure = False
-
-
-def mark_jwt_insecure() -> None:
-    global _jwt_insecure
-    _jwt_insecure = True
-
-
-def mark_master_insecure() -> None:
-    global _master_insecure
-    _master_insecure = True
-
-
-def insecure_flags() -> dict:
-    return {
-        "jwt_secret_uses_fallback": _jwt_insecure,
-        "master_key_uses_fallback": _master_insecure,
-    }

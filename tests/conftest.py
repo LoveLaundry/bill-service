@@ -41,8 +41,10 @@ COLLECTION_NAMES = [
 DEPENDENT_MODULES = [
     "bill_service.repositories.entity_registry",
     "bill_service.repositories.main_repository",
+    "bill_service.repositories.secondary_repository",
     "bill_service.services.transaction_events",
     "bill_service.services.verification_service",
+    "bill_service.services.synchronization_service",
     "bill_service.services.idempotency",
     "bill_service.services.bill_sync",
     "bill_service.routers.bills",
@@ -72,7 +74,37 @@ def mocked_db():
         except Exception:  # pragma: no cover - defensive against import noise
             pass
 
+    _assert_no_live_clients(db)
     return db
+
+
+def _assert_no_live_clients(mock_db) -> None:
+    """Fail loudly if any synced module still points at a real MongoDB.
+
+    Modules that cache collection handles at import time (``from ..database
+    .main_db import sync_queue_collection``) escape the patching above unless
+    they are also reloaded. A stale handle points at whatever ``.env`` names,
+    which in development is the PRODUCTION Atlas cluster -- so a stray
+    ``drain_due_jobs()`` in a test would mutate live data. Assert the handle a
+    module actually holds belongs to the mongomock database.
+    """
+    import bill_service.services.synchronization_service as sync_service
+
+    mock_prefix = f"{mock_db.name}."
+    leaked = sorted(
+        name
+        for name in ("sync_queue_collection", "sync_logs_collection")
+        if not str(getattr(sync_service, name, None).full_name).startswith(mock_prefix)
+    )
+    if leaked:
+        details = ", ".join(
+            f"{n} -> {getattr(sync_service, n).full_name}" for n in leaked
+        )
+        pytest.fail(
+            "Refusing to run: synchronization_service still holds live "
+            f"MongoDB collection(s) [{details}]. Tests would mutate a real "
+            "database. Add the owning module to DEPENDENT_MODULES."
+        )
 
 
 @pytest.fixture(autouse=True)

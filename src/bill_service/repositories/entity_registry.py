@@ -3,6 +3,7 @@ Entity registry — maps business entity names to their collections in each
 database role. This is the single place that knows which collections
 participate in synchronization.
 """
+from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorCollection
 
 from ..database import local_db, main_db, secondary_db
@@ -49,3 +50,17 @@ def all_entities() -> list[str]:
 def effective_version(doc: dict) -> int:
     """Return the sync version of a stored document, defaulting legacy docs to 1."""
     return int(doc.get("sync_version") or 1)
+
+
+def to_record_id(value):
+    """Coerce a stored queue `record_id` back into the type used by `_id`.
+
+    `sync_queue` persists `record_id` as a string, but MongoDB `_id` values are
+    `ObjectId`s and are compared by exact BSON type. Re-coercing here keeps the
+    sync worker able to find the document it is replicating.
+    """
+    if isinstance(value, ObjectId):
+        return value
+    if isinstance(value, str) and ObjectId.is_valid(value):
+        return ObjectId(value)
+    return value

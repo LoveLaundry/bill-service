@@ -18,7 +18,7 @@ from ..database.main_db import (
     audit_collection,
     bills_collection,
 )
-from ..repositories.main_repository import bump_version, enqueue_sync
+from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..models import (
     LinenCreate,
     LinenBulkCreate,
@@ -280,9 +280,16 @@ async def delete_linen(
     current_user: dict = Depends(require_capability("linen:write")),
 ):
     oid = _parse_object_id(doc_id)
+    # Bump the version while the document still exists, then remove it and
+    # enqueue a DELETE so the SECONDARY replica drops the record too.
+    try:
+        new_version = await bump_version("linen", oid)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Linen not found")
     result = await linens_collection.delete_one({"_id": oid})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Linen not found")
+    await enqueue_delete("linen", oid, new_version)
     await _log_audit(current_user.get("user_id", ""), "delete", "linen", doc_id)
 
 
