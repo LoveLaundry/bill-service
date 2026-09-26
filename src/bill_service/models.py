@@ -221,6 +221,10 @@ class BalanceAdjustmentModel(BaseModel):
 
 
 class DeliveryBalanceItem(BaseModel):
+    # The client keys each line by this, so it has to survive the response
+    # model: without it every balance figure on the note fails to line up with
+    # its row and the columns render blank.
+    item_key: str
     item_name: str
     specification: str = ""
     category: str = ""

@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from bill_service.crypto_helper import encrypt_dict
-from bill_service.models import BalanceAdjustmentCreate
+from bill_service.models import BalanceAdjustmentCreate, DeliveryBalanceReport
 from bill_service.routers import balance_adjustments as ba
 
 from conftest import auth_user
@@ -321,6 +321,58 @@ async def test_report_rejects_a_cancelled_delivery(mocked_db):
     with pytest.raises(HTTPException) as exc:
         await ba.delivery_balance_report(str(res.inserted_id), auth_user())
     assert exc.value.status_code == 409
+
+
+async def test_report_survives_the_response_model(mocked_db):
+    """Guard the wire contract, not just the engine.
+
+    The engine returns item_key, but the endpoint declares a response_model,
+    which strips anything it does not declare. If `item_key` ever drops out of
+    DeliveryBalanceItem the client silently keys nothing and every balance
+    column on the printed note renders blank — so assert on the SERIALIZED
+    payload, which is what the client actually receives.
+    """
+    gp_id = await seed_gp(mocked_db, items=[_gp_item(received=30)])
+    dl_id = await seed_delivery(mocked_db, gp_id=gp_id, qty=10)
+
+    raw = await ba.delivery_balance_report(dl_id, auth_user())
+
+    # Re-validate exactly as FastAPI does for response_model=...
+    wire = DeliveryBalanceReport(**raw).model_dump()
+
+    row = wire["items"][0]
+    assert row["item_key"] == "Pillow||"
+    assert row["previous_balance_qty"] == 30
+    assert row["current_balance_qty"] == 20
+
+    # The client keys its per-item map on this, so it must be a usable key.
+    assert row["item_key"] == f'{row["item_name"]}||{row["specification"]}'
+
+
+async def test_report_wire_keys_match_the_frontend_contract(mocked_db):
+    """Every field the delivery note and detail page read must be on the wire."""
+    expected = {
+        "delivery_id", "gate_pass_id", "gate_pass_number", "client_name",
+        "delivery_date", "items", "totals", "flags",
+    }
+    expected_item = {
+        "item_key", "item_name", "specification", "category",
+        "previous_balance_qty", "received_qty", "delivered_qty",
+        "balance_adjustment_qty", "current_balance_qty", "reconciles", "flags",
+    }
+
+    gp_id = await seed_gp(mocked_db, items=[_gp_item()])
+    dl_id = await seed_delivery(mocked_db, gp_id=gp_id, qty=5)
+    wire = DeliveryBalanceReport(
+        **(await ba.delivery_balance_report(dl_id, auth_user()))
+    ).model_dump()
+
+    assert set(wire) == expected
+    assert set(wire["items"][0]) == expected_item
+    assert set(wire["totals"]) == {
+        "previous_balance_qty", "received_qty", "delivered_qty",
+        "balance_adjustment_qty", "current_balance_qty",
+    }
 
 
 async def test_report_404s_for_an_unknown_delivery(mocked_db):
