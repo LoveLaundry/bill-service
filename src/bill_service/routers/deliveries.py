@@ -8,6 +8,7 @@ from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
+    balance_adjustments_collection,
     deliveries_collection,
     gatepasses_collection,
     returns_collection,
@@ -345,6 +346,19 @@ async def pending_gatepasses(
         for k, v in rm.items():
             cur[k] = cur.get(k, 0) + v
 
+    # Balance adjustments per gate pass, so a credited piece stays visible as
+    # pending in the delivery form instead of silently disappearing.
+    adjusted_by_gp: Dict[str, Dict[str, int]] = {}
+    adj_cursor = balance_adjustments_collection.find()
+    async for adj_doc in adj_cursor:
+        adj_gp_id = adj_doc.get("gate_pass_id") or ""
+        if not adj_gp_id:
+            continue
+        am = be.compute_balance_adjustments_by_item([adj_doc])
+        cur = adjusted_by_gp.setdefault(adj_gp_id, {})
+        for k, v in am.items():
+            cur[k] = cur.get(k, 0) + v
+
     # Process gate passes
     gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
     results = []
@@ -362,6 +376,7 @@ async def pending_gatepasses(
             delivered_by_gp.get(gp_id, {}),
             returned_by_gp.get(gp_id, {}),
             marked_delivered=bool(gp.get("marked_delivered")),
+            balance_adjustment_by_item=adjusted_by_gp.get(gp_id, {}),
         )
 
         items_with_pending = be.compute_outstanding_per_item(
@@ -377,6 +392,7 @@ async def pending_gatepasses(
                 "delivered_qty": r["delivered_qty"],
                 "returned_qty": r["returned_qty"],
                 "pending_qty": r["pending_qty"],
+                "balance_adjustment_qty": r["balance_adjustment_qty"],
             }
             for r in items_with_pending
         ]

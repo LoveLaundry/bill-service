@@ -9,21 +9,29 @@ tracked independently and NEVER derived from a note or a status label:
   rejected_qty              damaged/rejected portion (0 by default today)
   delivered_qty             actual recorded delivery quantity (sum of delivery items)
   returned_back_qty         items the client gave back (RECEIVE_BACK / RE_WASH, not re-sent)
-  outstanding_delivery_qty  received - delivered + returned_back  (still needs sending)
+  balance_adjustment_qty    signed correction posted when a delivery was recorded
+                            wrongly (see below)
+  outstanding_delivery_qty  received - delivered + returned_back + balance_adjustment
+                            (still needs sending, or is owed back to the client)
   not_received_qty          expected - received (>= 0), the shortage
   extra_received_qty        received - expected (>= 0), over-received quantity
 
-Delivery-time count reconciliation (reported, never billed):
-  client_counted_qty        what the client's representative counted on handover
-  discrepancy_qty           delivered - counted (>0 short, <0 over); 0 when the
-                            client did not count. This is a QUANTITY balance
-                            owed back to the client and is intentionally NOT
-                            folded into outstanding_delivery_qty or any money
-                            figure, so disputing a count can never silently
-                            change an invoice.
+Balance adjustments (quantities only, never money):
+  Sometimes a delivery is recorded with the wrong quantity, or pieces go
+  missing in transit, and the pass has to be squared off. A balance
+  adjustment is a SIGNED correction against one item of one gate pass:
+
+      +3   we under-delivered / lost / damaged  -> client is owed 3 more
+      -3   we over-recorded the send            -> 3 fewer are outstanding
+
+  It is deliberately a PIECE COUNT and never a money figure: billing still
+  derives from ``received_qty``, so posting an adjustment can never move an
+  invoice. The balance is clamped at zero, so an adjustment can correct a
+  mistake in one direction but can never make the pass look over-credited.
 
 The engine is pure (no database access). Callers pass decrypted documents.
 """
+from datetime import datetime
 from typing import Dict, List, Optional
 
 
@@ -57,23 +65,21 @@ def compute_delivered_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
     return out
 
 
-def compute_counted_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
-    """Sum the CLIENT-COUNTED quantities across non-cancelled deliveries.
+def compute_balance_adjustments_by_item(adjustment_docs: List[dict]) -> Dict[str, int]:
+    """Sum the SIGNED balance adjustments across adjustment documents.
 
-    Only lines where the client actually counted (``client_counted_qty`` is a
-    number) contribute. A delivery with no count contributes nothing, so a
-    pass that was never reconciled does not look like a zero-count pass.
+    Each adjustment targets one item and carries ``quantity``, which may be
+    negative to reduce the balance. Voided adjustments contribute nothing.
     """
     out: Dict[str, int] = {}
-    for dl in delivery_docs:
-        if dl.get("status") == "CANCELLED":
+    for adj in adjustment_docs:
+        if adj.get("status") in ("VOID", "CANCELLED"):
             continue
-        for it in dl.get("items", []):
-            counted = it.get("client_counted_qty")
-            if counted is None:
-                continue
-            key = item_key(it.get("item_name", ""), it.get("specification"))
-            out[key] = out.get(key, 0) + int(counted or 0)
+        qty = adj.get("quantity")
+        if qty is None:
+            continue
+        key = item_key(adj.get("item_name", ""), adj.get("specification"))
+        out[key] = out.get(key, 0) + int(qty or 0)
     return out
 
 
@@ -106,7 +112,7 @@ def compute_gate_pass_balance(
     returned_by_item: Optional[Dict[str, int]] = None,
     *,
     marked_delivered: bool = False,
-    counted_by_item: Optional[Dict[str, int]] = None,
+    balance_adjustment_by_item: Optional[Dict[str, int]] = None,
 ) -> dict:
     """Compute the full per-item balance for one gate pass.
 
@@ -126,10 +132,9 @@ def compute_gate_pass_balance(
         "returned_back_qty": 0,
         "outstanding_delivery_qty": 0,
         "not_received_qty": 0,
-        # Delivery-time count reconciliation. Purely additive reporting: these
-        # never feed outstanding_delivery_qty, billing, or any money figure.
-        "client_counted_qty": 0,
-        "discrepancy_qty": 0,
+        # Signed corrections posted when a delivery was recorded wrongly.
+        # Quantity-only: never reaches billing, which derives from received_qty.
+        "balance_adjustment_qty": 0,
     }
     gp_flags: List[str] = []
     if marked_delivered:
@@ -144,16 +149,13 @@ def compute_gate_pass_balance(
         rejected = 0
         delivered = int(delivered_by_item.get(key, 0) or 0)
         returned = int((returned_by_item or {}).get(key, 0) or 0)
-
-        counted = (counted_by_item or {}).get(key)
-        has_count = counted is not None
-        # Positive => we recorded more than the client counted (short-delivered,
-        # owed back to the client). Negative => we recorded less than they
-        # counted (over-delivered).
-        discrepancy = (delivered - int(counted)) if has_count else 0
+        # Signed: positive credits the client, negative debits them.
+        adjustment = int((balance_adjustment_by_item or {}).get(key, 0) or 0)
 
         effective_delivered = max(delivered, received) if marked_delivered else delivered
-        outstanding = max(0, received - effective_delivered + returned)
+        # Clamped at zero so an adjustment can correct a mistake but can never
+        # make a pass look over-credited.
+        outstanding = max(0, received - effective_delivered + returned + adjustment)
         not_received = max(0, expected - received)
         extra_received = max(0, received - expected)
 
@@ -168,10 +170,10 @@ def compute_gate_pass_balance(
             item_flags.append("EXTRA_RECEIVED")
         if marked_delivered and delivered < received:
             item_flags.append("LEGACY_NOTE_CLOSURE_HIDES_OUTSTANDING")
-        if has_count and discrepancy > 0:
-            item_flags.append("DELIVERY_SHORT_COUNTED")
-        elif has_count and discrepancy < 0:
-            item_flags.append("DELIVERY_OVER_COUNTED")
+        if adjustment > 0:
+            item_flags.append("BALANCE_CREDITED")
+        elif adjustment < 0:
+            item_flags.append("BALANCE_DEBITED")
 
         items[key] = {
             "item_key": key,
@@ -189,9 +191,7 @@ def compute_gate_pass_balance(
             "outstanding_delivery_qty": outstanding,
             "not_received_qty": not_received,
             "extra_received_qty": extra_received,
-            "client_counted_qty": int(counted) if has_count else None,
-            "discrepancy_qty": discrepancy,
-            "has_count": has_count,
+            "balance_adjustment_qty": adjustment,
             "flags": item_flags,
         }
         totals["expected_qty"] += expected
@@ -201,8 +201,7 @@ def compute_gate_pass_balance(
         totals["returned_back_qty"] += returned
         totals["outstanding_delivery_qty"] += outstanding
         totals["not_received_qty"] += not_received
-        totals["client_counted_qty"] += int(counted) if has_count else 0
-        totals["discrepancy_qty"] += discrepancy
+        totals["balance_adjustment_qty"] += adjustment
 
     return {
         "items": items,
@@ -216,6 +215,7 @@ def recompute_status_with_movements(
     delivery_docs: List[dict],
     return_docs: List[dict],
     current_status: str,
+    adjustment_docs: Optional[List[dict]] = None,
 ) -> str:
     """Derive the real status after a quantity correction, INCLUDING movements.
 
@@ -225,7 +225,10 @@ def recompute_status_with_movements(
     """
     delivered = compute_delivered_by_item(delivery_docs)
     returned = compute_returned_by_item(return_docs)
-    balance = compute_gate_pass_balance(gp_items, delivered, returned)
+    adjustments = compute_balance_adjustments_by_item(adjustment_docs or [])
+    balance = compute_gate_pass_balance(
+        gp_items, delivered, returned, balance_adjustment_by_item=adjustments
+    )
     return derive_gate_pass_status(balance, current_status)
 
 
@@ -260,9 +263,182 @@ def compute_outstanding_per_item(gp_items: List[dict], balance: dict) -> List[di
                     "delivered_qty": b["delivered_qty"],
                     "returned_qty": b["returned_back_qty"],
                     "pending_qty": b["outstanding_delivery_qty"],
+                    "balance_adjustment_qty": b["balance_adjustment_qty"],
                 }
             )
     return rows
+
+
+def order_deliveries(docs: List[dict], target_id: str) -> List[dict]:
+    """Deliveries in the order they were served, with ``target_id`` last.
+
+    The report is a statement about one delivery in the running sequence, so it
+    has to know which deliveries came before it. Ordering falls back through
+    the delivery date, the creation stamp and finally the id so a sequence is
+    always stable and total, even for hand-seeded rows.
+    """
+    def sort_key(doc: dict):
+        stamp = doc.get("delivery_date") or doc.get("created_at")
+        if isinstance(stamp, datetime):
+            stamp = stamp.timestamp()
+        return (stamp is None, stamp or 0.0, str(doc.get("_id") or doc.get("id") or ""))
+
+    present = {str(d.get("_id") or d.get("id") or "") for d in docs}
+    ordered = sorted(docs, key=sort_key)
+    if str(target_id) not in present:
+        # A target that is not in the list still has to be reportable, so the
+        # caller can pass every delivery it knows about without pre-selecting.
+        target = {"id": target_id}
+        if not any(str(d.get("_id") or d.get("id") or "") == str(target_id) for d in ordered):
+            ordered.append(target)
+    return ordered
+
+
+def compute_delivery_balance_report(
+    gp_items: List[dict],
+    delivery_doc: dict,
+    deliveries_in_order: List[dict],
+    returned_by_item: Optional[Dict[str, int]] = None,
+    adjustment_docs: Optional[List[dict]] = None,
+) -> dict:
+    """Per-item running balance for ONE delivery — the delivery print report.
+
+    Produces the four figures a signed delivery note has to show:
+
+        previous_balance_qty   what was still outstanding BEFORE this delivery
+        received_qty           total ever received on the gate pass for the item
+        delivered_qty          what THIS delivery carried
+        current_balance_qty    what was still outstanding AFTER this delivery
+
+    The report is a HISTORICAL statement, so it is evaluated as of the end of
+    this delivery: deliveries served after it, and corrections attached to
+    them, are deliberately excluded. A note printed today must not change
+    because the client was served again tomorrow.
+
+    In the normal case the printed line reconciles exactly:
+
+        current = previous - delivered + balance_adjustment
+
+    ``previous``/``current`` are each clamped at zero, so when the pre-delivery
+    balance was already negative (more recorded as sent than was ever received)
+    the identity can sit above the arithmetic. That state is a data error and
+    is surfaced as ``OVER_DELIVERED_BEFORE_DELIVERY`` rather than hidden.
+
+    Only items actually on the delivery are reported — a delivery note must not
+    list items the client did not just receive.
+    """
+    returned_by_item = returned_by_item or {}
+    adjustment_docs = adjustment_docs or []
+
+    received_by_key: Dict[str, dict] = {}
+    for it in gp_items:
+        received_by_key[item_key(it.get("item_name", ""), it.get("specification"))] = it
+
+    delivery_id = str(delivery_doc.get("id") or delivery_doc.get("_id") or "")
+    ordered = list(deliveries_in_order or [delivery_doc])
+
+    # Everything served up to AND INCLUDING this note. Anything after it is a
+    # later delivery and has no bearing on what this note had to say.
+    target_index = next(
+        (
+            i
+            for i, d in enumerate(ordered)
+            if str(d.get("_id") or d.get("id") or "") == delivery_id
+        ),
+        len(ordered) - 1,
+    )
+    prefix = ordered[: target_index + 1]
+    prefix_ids = {str(d.get("_id") or d.get("id") or "") for d in prefix} - {""}
+    delivered_upto = compute_delivered_by_item(prefix)
+
+    # A correction counts once its delivery has been served. A correction with
+    # no delivery attached applies to the pass as a whole, so it counts on
+    # every note.
+    adj_upto_by_key: Dict[str, int] = {}
+    adj_this_by_key: Dict[str, int] = {}
+    for adj in adjustment_docs:
+        if adj.get("status") in ("VOID", "CANCELLED"):
+            continue
+        owner = adj.get("delivery_id")
+        if owner and str(owner) not in prefix_ids:
+            continue
+        key = item_key(adj.get("item_name", ""), adj.get("specification"))
+        qty = int(adj.get("quantity", 0) or 0)
+        adj_upto_by_key[key] = adj_upto_by_key.get(key, 0) + qty
+        if owner and str(owner) == delivery_id:
+            adj_this_by_key[key] = adj_this_by_key.get(key, 0) + qty
+    adj_before_by_key = {
+        k: adj_upto_by_key.get(k, 0) - adj_this_by_key.get(k, 0)
+        for k in set(adj_upto_by_key) | set(adj_this_by_key)
+    }
+
+    rows: List[dict] = []
+    totals = {
+        "previous_balance_qty": 0,
+        "received_qty": 0,
+        "delivered_qty": 0,
+        "balance_adjustment_qty": 0,
+        "current_balance_qty": 0,
+    }
+    flags: List[str] = []
+
+    for it in delivery_doc.get("items", []) or []:
+        name = it.get("item_name", "")
+        spec = it.get("specification")
+        key = item_key(name, spec)
+        gp_item = received_by_key.get(key, {})
+        received = int(gp_item.get("received_qty", 0) or 0)
+        returned = int(returned_by_item.get(key, 0) or 0)
+
+        delivered_this = int(it.get("quantity", 0) or 0)
+        delivered_before = int(delivered_upto.get(key, 0) or 0) - delivered_this
+        adj_this = adj_this_by_key.get(key, 0)
+        adj_before = adj_before_by_key.get(key, 0)
+
+        raw_previous = received - delivered_before + returned + adj_before
+        previous = max(0, raw_previous)
+        current = max(0, previous - delivered_this + adj_this)
+
+        row_flags: List[str] = []
+        if raw_previous < 0:
+            row_flags.append("OVER_DELIVERED_BEFORE_DELIVERY")
+        elif delivered_this > previous:
+            # This note hands over more than was outstanding. The create
+            # endpoint caps quantity at the available balance, so this only
+            # appears when quantities were edited after the fact.
+            row_flags.append("DELIVERY_EXCEEDS_BALANCE")
+        if adj_this > 0:
+            row_flags.append("BALANCE_CREDITED")
+        elif adj_this < 0:
+            row_flags.append("BALANCE_DEBITED")
+        flags.extend(row_flags)
+
+        rows.append(
+            {
+                "item_key": key,
+                "item_name": name,
+                "specification": spec or "",
+                "category": gp_item.get("category") or "",
+                "previous_balance_qty": previous,
+                "received_qty": received,
+                "delivered_qty": delivered_this,
+                "balance_adjustment_qty": adj_this,
+                "current_balance_qty": current,
+                "reconciles": current == max(0, previous - delivered_this + adj_this),
+                "flags": row_flags,
+            }
+        )
+        totals["previous_balance_qty"] += previous
+        totals["received_qty"] += received
+        totals["delivered_qty"] += delivered_this
+        totals["balance_adjustment_qty"] += adj_this
+        totals["current_balance_qty"] += current
+
+    return {
+        "items": rows,
+        "totals": totals,
+        "flags": sorted(set(flags)),
+    }
 
 
 def compute_billable_on_received(

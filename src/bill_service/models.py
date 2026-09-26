@@ -1,7 +1,7 @@
 from pydantic import AliasChoices
 from datetime import datetime, timezone
 from typing import Annotated, List, Optional
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 PyObjectId = Annotated[str, BeforeValidator(str)]
 
@@ -146,17 +146,6 @@ class DeliveryItem(BaseModel):
     item_name: str
     specification: Optional[str] = None
     quantity: int = Field(gt=0)
-    # Quantity the client's own representative counted on taking delivery.
-    # None means the client did not count (the common case). When present it is
-    # reconciled against `quantity` into `discrepancy`, and a non-zero
-    # discrepancy is a quantity balance owed to the client -- deliberately kept
-    # out of the money ledger, so a disputed count never silently changes an
-    # invoice.
-    client_counted_qty: Optional[int] = Field(default=None, ge=0)
-    # recorded - counted (>0 short-delivered, <0 over-delivered). Server-owned.
-    discrepancy: int = 0
-    mismatch_reason: Optional[str] = None  # MISSING, EXTRA, COUNTING_ERROR, DAMAGED, OTHER
-    mismatch_notes: Optional[str] = None
 
 
 class DeliveryCreate(BaseModel):
@@ -168,11 +157,93 @@ class DeliveryCreate(BaseModel):
     items: List[DeliveryItem] = Field(min_length=1)
     notes: Optional[str] = None
 
-
 class DeliveryDateUpdate(BaseModel):
     """Special-case correction of a recorded delivery's dispatch date."""
+
     delivery_date: datetime
     reason: Optional[str] = None
+
+
+# --- Balance adjustments (quantity corrections on a delivery) ---
+class BalanceAdjustmentCreate(BaseModel):
+    """A signed correction posted when a recorded delivery was wrong.
+
+    ``quantity`` is signed and must be non-zero:
+      positive -> we under-delivered / lost / damaged pieces, so the client is
+                  owed that many more (the balance goes UP)
+      negative -> we recorded more as sent than the client actually took, so
+                  fewer pieces are outstanding (the balance goes DOWN)
+
+    A ``reason`` is mandatory: these are corrections to the client's balance,
+    so every one is auditable. The correction is a PIECE COUNT only — billing
+    still derives from the gate pass received quantity, so no invoice moves.
+    """
+
+    item_name: str = Field(min_length=1)
+    specification: Optional[str] = None
+    quantity: int = Field(description="Signed correction; must not be zero")
+    reason: str = Field(min_length=1, description="Reason is mandatory")
+    notes: Optional[str] = None
+    gate_pass_id: str = Field(min_length=1)
+    # Attach to a delivery so the correction is shown on that delivery note.
+    # When omitted it still applies to the gate pass as a whole.
+    delivery_id: Optional[str] = None
+
+    @field_validator("quantity")
+    @classmethod
+    def _non_zero(cls, v: int) -> int:
+        if v == 0:
+            raise ValueError("quantity must not be zero; omit the adjustment instead")
+        return v
+
+
+class BalanceAdjustmentModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    gate_pass_id: str
+    delivery_id: Optional[str] = None
+    item_name: str
+    specification: str = ""
+    quantity: int
+    reason: str
+    notes: Optional[str] = None
+    status: str = "POSTED"  # POSTED | VOID
+    created_by: str = ""
+    created_by_id: str = ""
+    created_at: datetime
+    voided_at: Optional[datetime] = None
+    voided_by: Optional[str] = None
+    void_reason: Optional[str] = None
+
+
+class DeliveryBalanceItem(BaseModel):
+    item_name: str
+    specification: str = ""
+    category: str = ""
+    previous_balance_qty: int
+    received_qty: int
+    delivered_qty: int
+    balance_adjustment_qty: int
+    current_balance_qty: int
+    reconciles: bool
+    flags: List[str] = []
+
+
+class DeliveryBalanceReport(BaseModel):
+    """The four running-balance figures shown on the printed delivery note."""
+
+    delivery_id: str
+    gate_pass_id: str
+    gate_pass_number: Optional[str] = None
+    client_name: Optional[str] = None
+    delivery_date: Optional[datetime] = None
+    items: List[DeliveryBalanceItem]
+    totals: dict
+    flags: List[str] = []
 
 
 class DeliveryModel(BaseModel):

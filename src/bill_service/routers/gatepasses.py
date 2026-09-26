@@ -8,6 +8,7 @@ from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
+    balance_adjustments_collection,
     deliveries_collection,
     gatepasses_collection,
     returns_collection,
@@ -264,11 +265,19 @@ async def get_gate_pass_balance(
         except Exception:
             continue
 
+    balance_adjustments: List[dict] = []
+    adj_cursor = balance_adjustments_collection.find({"gate_pass_id": gate_pass_id})
+    async for adj_doc in adj_cursor:
+        balance_adjustments.append(adj_doc)
+
     balance = be.compute_gate_pass_balance(
         decrypted.get("items", []),
         be.compute_delivered_by_item(deliveries),
         be.compute_returned_by_item(returns),
         marked_delivered=bool(decrypted.get("marked_delivered")),
+        balance_adjustment_by_item=be.compute_balance_adjustments_by_item(
+            balance_adjustments
+        ),
     )
 
     derived_status = be.derive_gate_pass_status(balance, decrypted.get("status", ""))
@@ -524,8 +533,17 @@ async def catch_up_delivery(
 
     # Derive new gate pass status from the recorded quantities.
     delivered_map = be.compute_delivered_by_item(existing_deliveries + [delivery_doc])
+    existing_adjustments: List[dict] = []
+    async for adj_doc in balance_adjustments_collection.find({"gate_pass_id": gate_pass_id}):
+        existing_adjustments.append(adj_doc)
     balance = be.compute_gate_pass_balance(
-        decrypted.get("items", []), delivered_map, {}, marked_delivered=False
+        decrypted.get("items", []),
+        delivered_map,
+        {},
+        marked_delivered=False,
+        balance_adjustment_by_item=be.compute_balance_adjustments_by_item(
+            existing_adjustments
+        ),
     )
     new_gp_status = be.derive_gate_pass_status(balance, current_status)
 

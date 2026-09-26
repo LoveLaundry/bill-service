@@ -11,7 +11,12 @@ from fastapi import APIRouter, Depends, Query
 
 from ..auth_helper import require_capability
 from ..crypto_helper import decrypt_dict
-from ..database.main_db import bills_collection, deliveries_collection, gatepasses_collection
+from ..database.main_db import (
+    balance_adjustments_collection,
+    bills_collection,
+    deliveries_collection,
+    gatepasses_collection,
+)
 from ..services import balance_engine as be
 
 router = APIRouter(prefix="/reconciliation", tags=["reconciliation"])
@@ -67,11 +72,18 @@ async def reconciliation_issues(
             except Exception:
                 continue
 
+        adjustments = []
+        async for adj_doc in balance_adjustments_collection.find({"gate_pass_id": gp_id}):
+            adjustments.append(adj_doc)
+
         balance = be.compute_gate_pass_balance(
             gp.get("items", []),
             be.compute_delivered_by_item(deliveries),
             {},
             marked_delivered=bool(gp.get("marked_delivered")),
+            balance_adjustment_by_item=be.compute_balance_adjustments_by_item(
+                adjustments
+            ),
         )
 
         # Billed quantities per item name, summed across this pass's bills

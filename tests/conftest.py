@@ -19,6 +19,7 @@ import bill_service.database.secondary_db as secondary_db
 
 COLLECTION_NAMES = [
     "adjustments_collection",
+    "balance_adjustments_collection",
     "audit_collection",
     "bills_collection",
     "deliveries_collection",
@@ -52,6 +53,9 @@ DEPENDENT_MODULES = [
     "bill_service.routers.deliveries",
     "bill_service.routers.returns",
     "bill_service.routers.adjustments",
+    "bill_service.routers.balance_adjustments",
+    "bill_service.routers.dashboard",
+    "bill_service.routers.reconciliation",
 ]
 
 

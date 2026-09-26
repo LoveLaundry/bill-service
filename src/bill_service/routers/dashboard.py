@@ -11,6 +11,7 @@ from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
+    balance_adjustments_collection,
     bills_collection,
     deliveries_collection,
     gatepasses_collection,
@@ -65,6 +66,20 @@ def _decrypt_shop_bill(doc: dict) -> dict:
 
 def _key(name: str, spec: str = ""):
     return f"{name}||{spec}" if spec else name
+
+
+async def _fetch_balance_adjustments(gate_pass_ids: List[str]) -> List[dict]:
+    """Fetch the raw balance-adjustment documents for the given gate passes.
+
+    Returned unaggregated so ``aggregate`` can attribute them itself; these
+    documents hold no encrypted fields.
+    """
+    ids = [g for g in (gate_pass_ids or []) if g]
+    if not ids:
+        return []
+    return await balance_adjustments_collection.find(
+        {"gate_pass_id": {"$in": ids}}
+    ).to_list(length=None)
 
 
 async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
@@ -179,6 +194,20 @@ async def get_client_balances(
         for k, v in rm.items():
             cur[k] = cur.get(k, 0) + v
 
+    # Signed balance corrections for these gate passes, so a credited piece
+    # is not missing from the client balance.
+    adjusted_by_gp: Dict[str, Dict[str, int]] = {}
+    async for adj_doc in balance_adjustments_collection.find(
+        {"gate_pass_id": {"$in": gp_ids}}
+    ):
+        adj_gp_id = adj_doc.get("gate_pass_id") or ""
+        if not adj_gp_id:
+            continue
+        am = be.compute_balance_adjustments_by_item([adj_doc])
+        cur = adjusted_by_gp.setdefault(adj_gp_id, {})
+        for k, v in am.items():
+            cur[k] = cur.get(k, 0) + v
+
     result_gps = []
     totals = {
         "expected_qty": 0,
@@ -188,6 +217,7 @@ async def get_client_balances(
         "outstanding_delivery_qty": 0,
         "returned_back_qty": 0,
         "not_received_qty": 0,
+        "balance_adjustment_qty": 0,
     }
     for gp in gp_docs:
         balance = be.compute_gate_pass_balance(
@@ -195,6 +225,7 @@ async def get_client_balances(
             delivered_by_gp.get(gp["id"], {}),
             returned_by_gp.get(gp["id"], {}),
             marked_delivered=bool(gp.get("marked_delivered")),
+            balance_adjustment_by_item=adjusted_by_gp.get(gp["id"], {}),
         )
         derived = be.derive_gate_pass_status(balance, gp.get("status", ""))
         for k, v in balance["totals"].items():
@@ -937,7 +968,14 @@ def _outstanding(b):
     return max(0.0, b["grand_total"] - b["paid_amount"])
 
 
-def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
+def aggregate(
+    bills,
+    gate_passes,
+    deliveries,
+    period,
+    returned_by_gp=None,
+    balance_adjustments=None,
+):
     revenue = sum(b["grand_total"] for b in bills)
     collected = sum(b["paid_amount"] for b in bills)
     outstanding = sum(_outstanding(b) for b in bills)
@@ -967,6 +1005,16 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
         for k, v in dm.items():
             cur[k] = cur.get(k, 0) + v
 
+    adjusted_by_gp: Dict[str, Dict[str, int]] = {}
+    for adj_doc in balance_adjustments or []:
+        adj_gp_id = adj_doc.get("gate_pass_id") or ""
+        if not adj_gp_id:
+            continue
+        am = be.compute_balance_adjustments_by_item([adj_doc])
+        cur = adjusted_by_gp.setdefault(adj_gp_id, {})
+        for k, v in am.items():
+            cur[k] = cur.get(k, 0) + v
+
     balances = []
     items_received = 0
     items_delivered = 0
@@ -978,6 +1026,7 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
             delivered_by_gp.get(gp_id, {}),
             (returned_by_gp or {}).get(gp_id, {}),
             marked_delivered=bool(gp.get("marked_delivered")),
+            balance_adjustment_by_item=adjusted_by_gp.get(gp_id, {}),
         )
         balances.append((gp, bal))
         items_received += bal["totals"]["received_qty"]
@@ -1094,9 +1143,16 @@ async def get_dashboard_summary(
     prev_dels = await _fetch_deliveries([gp["id"] for gp in prev_gps])
 
     returned_by_gp = await _get_returned_items_by_gate_pass()
+    adjustments = await _fetch_balance_adjustments(
+        [gp["id"] for gp in cur_gps] + [gp["id"] for gp in prev_gps]
+    )
 
-    current = aggregate(cur_bills, cur_gps, cur_dels, period, returned_by_gp)
-    previous = aggregate(prev_bills, prev_gps, prev_dels, period, returned_by_gp)
+    current = aggregate(
+        cur_bills, cur_gps, cur_dels, period, returned_by_gp, adjustments
+    )
+    previous = aggregate(
+        prev_bills, prev_gps, prev_dels, period, returned_by_gp, adjustments
+    )
 
     cur_clients = {b["client_name"] for b in cur_bills}
     prev_clients = {b["client_name"] for b in prev_bills}

@@ -22,6 +22,15 @@ linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
 linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
 returns_collection: AsyncIOMotorCollection = _db.get_collection("returns")
 adjustments_collection: AsyncIOMotorCollection = _db.get_collection("adjustments")
+# MAIN only, deliberately NOT a replicated entity (no secondary/local binding
+# and no entity_registry entry). A balance correction is not consumed as a
+# document of its own: every balance surface folds it into
+# compute_gate_pass_balance at read time, fetching these rows from MAIN. That is
+# the same treatment bills get for billable-on-received, and it means a
+# correction cannot go missing on a lagging replica.
+balance_adjustments_collection: AsyncIOMotorCollection = _db.get_collection(
+    "balance_adjustments"
+)
 idempotency_collection: AsyncIOMotorCollection = _db.get_collection("idempotency_keys")
 shop_bills_collection: AsyncIOMotorCollection = _db.get_collection("shop_bills")
 bill_templates_collection: AsyncIOMotorCollection = _db.get_collection("bill_templates")
@@ -50,6 +59,11 @@ async def ensure_indexes():
     await deliveries_collection.create_index("gate_pass_id")
     await deliveries_collection.create_index("client_name_search")
     await deliveries_collection.create_index("created_at")
+
+    # Balance adjustments indexes
+    await balance_adjustments_collection.create_index("gate_pass_id")
+    await balance_adjustments_collection.create_index("delivery_id")
+    await balance_adjustments_collection.create_index("created_at")
 
     # Dispatch jobs indexes
     await dispatch_jobs_collection.create_index("client_name_search")
