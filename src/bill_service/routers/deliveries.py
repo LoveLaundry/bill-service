@@ -308,8 +308,21 @@ async def pending_gatepasses(
 
     Used by the multi-select delivery form to show which gate passes have
     items that still need to be sent.
+
+    Membership is decided by the COMPUTED balance, never by the stored status
+    label. A pass that was fully delivered and then balanced off — a return, a
+    counting correction posted as a credit — is owed pieces again, so it belongs
+    here. Filtering on the label instead hid exactly those passes, which is how
+    a balanced pass ended up invisible to the operator who had to send it. Only
+    CANCELLED is excluded outright; a genuinely closed pass falls out on its own
+    because it computes to zero outstanding and therefore lists no items.
+
+    Note that ``items`` is envelope-encrypted, so no predicate can be pushed
+    into the query on quantities — membership can only be decided after
+    decryption, here. That is the same full pass scan this endpoint already
+    performs over every delivery, return and correction.
     """
-    query: dict = {"status": {"$nin": ["DELIVERED", "CANCELLED"]}}
+    query: dict = {"status": {"$ne": "CANCELLED"}}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 
@@ -401,13 +414,22 @@ async def pending_gatepasses(
 
         if items_with_pending:
             total_pending = sum(i["pending_qty"] for i in items_with_pending)
+            # Report what the engine says the status SHOULD be. The stored label
+            # can lag a pass that was balanced after it was last written, and an
+            # operator picking this pass up for delivery must not be shown a
+            # DELIVERED badge for something that is still owed.
+            derived_status = be.derive_gate_pass_status(balance, gp.get("status", ""))
             results.append({
                 "gate_pass_id": gp_id,
                 "gate_pass_number": gp.get("gate_pass_number", ""),
                 "client_name": client,
                 "receiving_date": str(gp.get("receiving_date", ""))[:10],
-                "status": gp.get("status", ""),
+                "status": derived_status,
+                "stored_status": gp.get("status", ""),
                 "total_pending": total_pending,
+                "total_balance_adjusted": sum(
+                    i["balance_adjustment_qty"] for i in items_with_pending
+                ),
                 "items": items_with_pending,
             })
 

@@ -19,6 +19,7 @@ from ..database.main_db import (
     returns_collection,
     shop_bills_collection,
 )
+from ..services import balance_engine as be
 
 router = APIRouter(tags=["dashboard"])
 
@@ -131,6 +132,23 @@ def _flatten_returned_by_name(returned_by_gp: Dict[str, Dict[str, int]]) -> Dict
     return out
 
 
+async def _flatten_balance_adjustments_by_name() -> Dict[str, int]:
+    """Signed balance corrections summed per item NAME across every pass.
+
+    Posted corrections are the other half of "what is still owed" — a credited
+    piece has to be sent, a debited one does not. They are aggregated by name
+    here for the same reason returns are: the pending-balances report is a
+    per-item-name roll-up, not a per-pass ledger.
+    """
+    out: Dict[str, int] = {}
+    async for adj_doc in balance_adjustments_collection.find():
+        am = be.compute_balance_adjustments_by_item([adj_doc])
+        for key, qty in am.items():
+            name = key.split("||", 1)[0]
+            out[name] = out.get(name, 0) + qty
+    return out
+
+
 @router.get("/balances/client")
 async def get_client_balances(
     client_name: str = Query(..., min_length=1),
@@ -143,8 +161,6 @@ async def get_client_balances(
     delivery and return documents. Nothing on the frontend should
     calculate these numbers independently.
     """
-    from ..services import balance_engine as be
-
     query: dict = {"client_name_search": get_search_token(client_name)}
     if not include_closed:
         query["status"] = {"$nin": ["CANCELLED"]}
@@ -378,10 +394,20 @@ async def get_client_summary(client_name: str = Query(...)):
     returned_by_gp = await _get_returned_items_by_gate_pass()
     returned_global = _flatten_returned_by_name(returned_by_gp)
 
+    # ...and so do balanced items: a posted correction moves the balance just as
+    # a return does, so it is reported alongside the pending quantity instead of
+    # staying invisible on the screen that claims to show what is owed.
+    adjusted_global = await _flatten_balance_adjustments_by_name()
+
     pending_items_sum = 0
     for name, item_bal in balances_map.items():
         ret_qty = returned_global.get(name, 0)
-        item_bal["pending"] = max(0, item_bal["received"] - item_bal["delivered"] + ret_qty)
+        adj_qty = adjusted_global.get(name, 0)
+        item_bal["returned"] = ret_qty
+        item_bal["balance_adjusted"] = adj_qty
+        item_bal["pending"] = max(
+            0, item_bal["received"] - item_bal["delivered"] + ret_qty + adj_qty
+        )
         pending_items_sum += item_bal["pending"]
 
     total_billed = 0.0
@@ -996,7 +1022,6 @@ def aggregate(
 
     # Single authoritative balance engine. All delivered/outstanding numbers
     # below come from balance_engine so no other page can compute them differently.
-    from ..services import balance_engine as be
 
     delivered_by_gp: Dict[str, Dict[str, int]] = {}
     for d in deliveries:
@@ -1019,6 +1044,7 @@ def aggregate(
     items_received = 0
     items_delivered = 0
     total_returned = 0
+    total_adjusted = 0
     for gp in open_gps:
         gp_id = gp["id"]
         bal = be.compute_gate_pass_balance(
@@ -1032,8 +1058,14 @@ def aggregate(
         items_received += bal["totals"]["received_qty"]
         items_delivered += bal["totals"]["effective_delivered_qty"]
         total_returned += bal["totals"]["returned_back_qty"]
+        total_adjusted += bal["totals"]["balance_adjustment_qty"]
 
-    items_pending = max(0, items_received - items_delivered + total_returned)
+    # The headline figure has to include corrections, exactly like the per-pass
+    # list below it. Summing the parts and dropping the adjustments made this
+    # number disagree with the very list rendered under it.
+    items_pending = max(
+        0, items_received - items_delivered + total_returned + total_adjusted
+    )
 
     active_clients = len(set(b["client_name"] for b in bills))
 
@@ -1097,10 +1129,14 @@ def aggregate(
                             "received": r["received_qty"],
                             "delivered": r["delivered_qty"],
                             "returned": r["returned_qty"],
+                            "balance_adjusted": r["balance_adjustment_qty"],
                             "pending": r["pending_qty"],
                         }
                         for r in pending_rows
                     ],
+                    "balance_adjusted": sum(
+                        r["balance_adjustment_qty"] for r in pending_rows
+                    ),
                 }
             )
     pending_gps.sort(key=lambda x: -x["pending"])

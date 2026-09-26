@@ -16,6 +16,7 @@ whole read: a single unreadable row must not make the gate pass unviewable. That
 does mean such a row is invisible to the balance, which is why the caller can
 ask for the count of skipped rows.
 """
+from datetime import datetime, timezone
 from typing import List, NamedTuple, Optional
 
 from bson import ObjectId
@@ -140,3 +141,34 @@ def outstanding_for(context: GatePassBalanceContext, name: str, spec: Optional[s
         int(row.get("received_qty", 0) or 0),
         int(row.get("delivered_qty", 0) or 0),
     )
+
+
+async def resync_gate_pass_status(gate_pass_id: str) -> str:
+    """Re-derive a gate pass's status from its movements and persist any change.
+
+    Every path that moves a piece — a delivery, a return, a posted or voided
+    balance correction, an approved received-qty correction — has to end here.
+    A pass whose status is left behind its own balance is the reason a balanced
+    pass stays hidden: ``GET /deliveries/pending-gatepasses`` and the delivery
+    form both key off the status, so a pass still labelled DELIVERED after a
+    return never becomes selectable again.
+
+    Returns the status now stored on the pass, whether or not it moved.
+    """
+    context = await load_gate_pass_balance_context(gate_pass_id)
+    current = context.gate_pass.get("status", "RECEIVED")
+    derived = be.derive_gate_pass_status(context.balance, current)
+    if derived == current:
+        return current
+
+    now = datetime.now(timezone.utc)
+    await gatepasses_collection.update_one(
+        {"_id": context.gate_pass_oid},
+        {"$set": {"status": derived, "updated_at": now}},
+    )
+
+    from .repositories.main_repository import bump_version, enqueue_sync
+
+    version = await bump_version("gatepass", context.gate_pass_oid)
+    await enqueue_sync("gatepass", context.gate_pass_oid, version)
+    return derived

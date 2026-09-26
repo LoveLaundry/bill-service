@@ -255,19 +255,45 @@ def recompute_status_with_movements(
     return derive_gate_pass_status(balance, current_status)
 
 
+def has_prior_send(balance: dict) -> bool:
+    """True when the pass has proof that pieces already left the premises.
+
+    A recorded delivery is the obvious proof. A return is just as good: the
+    client can only hand a piece BACK after it was sent. A balance CREDIT is
+    proof too, because a credit is only ever posted against a send that was
+    recorded short (under-delivered, lost or damaged in transit).
+
+    A debit is deliberately NOT proof on its own: it means we logged MORE as
+    sent than was taken, so the piece never actually went out and the honest
+    label for that pass is still a workflow state.
+    """
+    totals = balance["totals"]
+    return (
+        totals["delivered_qty"] > 0
+        or totals["returned_back_qty"] > 0
+        or totals["balance_adjustment_qty"] > 0
+    )
+
+
 def derive_gate_pass_status(balance: dict, current_status: str) -> str:
     """Derive the correct status from quantities, not from a manual label.
 
     CANCELLED stays cancelled. A pass with zero outstanding deliveries is
-    DELIVERED. A pass with some real deliveries left pending is
-    PARTIALLY_DELIVERED. Otherwise the workflow states
-    (RECEIVED / PROCESSING / READY_FOR_DELIVERY) are kept as-is.
+    DELIVERED. A pass that still owes pieces AND has proof that something was
+    already sent (a delivery, a pending return, or a balance credit) is
+    PARTIALLY_DELIVERED — that includes a pass that was fully delivered and
+    then balanced off by a return or a counting correction, which otherwise
+    stayed stuck on a false DELIVERED and vanished from the delivery form.
+
+    Otherwise the workflow states (RECEIVED / PROCESSING / READY_FOR_DELIVERY)
+    are kept as-is: a pass that was never sent, only short-received, is not a
+    partial delivery.
     """
     if current_status == "CANCELLED":
         return "CANCELLED"
     if balance["totals"]["outstanding_delivery_qty"] == 0:
         return "DELIVERED"
-    if balance["totals"]["delivered_qty"] > 0:
+    if has_prior_send(balance):
         return "PARTIALLY_DELIVERED"
     return current_status
 

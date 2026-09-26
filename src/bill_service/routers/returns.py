@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth_helper import require_capability
 from ..database.main_db import returns_collection, gatepasses_collection, deliveries_collection
+from ..gatepass_balance import resync_gate_pass_status
 from ..models import ReturnCreate, ReturnUpdate, RETURN_STATUSES
 from ..router_utils import parse_object_id, log_audit
 from ..services.transaction_events import (
@@ -45,6 +46,23 @@ def _generate_return_id() -> str:
     alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
     code = "".join(secrets.choice(alphabet) for _ in range(8))
     return f"RT-{code}"
+
+
+async def _resync_pass(gate_pass_id: Optional[str]) -> Optional[str]:
+    """Re-derive the linked gate pass, tolerating a return with no usable link.
+
+    A return always moves the balance of its gate pass, so the pass status has to
+    follow it — otherwise a balanced pass keeps a stale status and stays hidden
+    from the delivery form. A legacy return whose gate_pass_id is missing or
+    unreadable must not fail the write that the operator actually asked for, so
+    the resync is best-effort and reported as ``None``.
+    """
+    if not gate_pass_id:
+        return None
+    try:
+        return await resync_gate_pass_status(gate_pass_id)
+    except HTTPException:
+        return None
 
 
 @router.post("/returns")
@@ -89,12 +107,23 @@ async def create_return(
     result = await returns_collection.insert_one(encrypted)
     doc["_id"] = str(result.inserted_id)
 
+    # A return puts pieces back on the pass, so the balance moves and the stored
+    # status has to move with it. Without this a fully-delivered pass stays
+    # labelled DELIVERED and disappears from the delivery form even though the
+    # client is now owed those pieces again.
+    status_after = await _resync_pass(payload.gate_pass_id)
+
     await log_audit(
         current_user.get("user_name", ""),
         "create",
         "return",
         str(result.inserted_id),
-        details={"return_id": return_id, "client": payload.client_name, "items": len(payload.items)},
+        details={
+            "return_id": return_id,
+            "client": payload.client_name,
+            "items": len(payload.items),
+            "gate_pass_status": status_after,
+        },
     )
 
     await record_event(
@@ -107,9 +136,9 @@ async def create_return(
         reason=payload.notes,
         item_deltas=[
             build_item_delta(item.get("item_name"), item.get("specification"), 0, item.get("returned_qty", 0))
-            for item in payload.items
+            for item in items_data
         ],
-        meta={"return_id": return_id, "delivery_id": payload.delivery_id, "status": "PENDING"},
+        meta={"return_id": return_id, "delivery_id": payload.delivery_id, "status": "PENDING", "gate_pass_status": status_after},
     )
 
     return _dec(doc)
@@ -242,12 +271,20 @@ async def update_return(
     encrypted = encrypt_dict(merged, SENSITIVE_FIELDS)
     await returns_collection.update_one({"return_id": return_id}, {"$set": encrypted})
 
+    # Editing a return can change what it contributes to the balance (items,
+    # their action, or their resend flag), so the pass is re-derived again.
+    status_after = await _resync_pass(doc.get("gate_pass_id"))
+
     await log_audit(
         current_user.get("user_name", ""),
         "update",
         "return",
         str(raw_doc["_id"]),
-        details={"return_id": return_id, "changes": list(update_fields.keys())},
+        details={
+            "return_id": return_id,
+            "changes": list(update_fields.keys()),
+            "gate_pass_status": status_after,
+        },
     )
 
     await record_event(
@@ -258,7 +295,11 @@ async def update_return(
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
         reason=payload.notes,
-        meta={"return_id": return_id, "changes": list(update_fields.keys())},
+        meta={
+            "return_id": return_id,
+            "changes": list(update_fields.keys()),
+            "gate_pass_status": status_after,
+        },
     )
 
     updated = await returns_collection.find_one({"return_id": return_id})
@@ -282,10 +323,15 @@ async def mark_item_resent(
     now = datetime.now(timezone.utc)
     updated_items = []
     found = False
+    # A specification is stored as None when the item has none, but every caller
+    # sends "" for that case, so both sides are normalised before comparing.
+    # Comparing raw values made this endpoint reject every un-specified item,
+    # which is most of them, so a re-sent could never actually be recorded.
+    wanted_spec = (specification or "").strip()
     for item in doc.get("items", []):
         if (
             item.get("item_name") == item_name
-            and item.get("specification", "") == specification
+            and (item.get("specification") or "").strip() == wanted_spec
             and item.get("action") in ("RECEIVE_BACK", "RE_WASH")
         ):
             item["resend_status"] = "SENT"
@@ -306,12 +352,22 @@ async def mark_item_resent(
         {"$set": encrypted},
     )
 
+    # Re-sending takes the piece off the pending-return balance, which can close
+    # the pass again. Re-derive so a pass cannot stay PARTIALLY_DELIVERED after
+    # the last outstanding piece went back out.
+    status_after = await _resync_pass(doc.get("gate_pass_id"))
+
     await log_audit(
         current_user.get("user_name", ""),
         "resent",
         "return",
         str(raw_doc["_id"]),
-        details={"return_id": return_id, "item": item_name, "spec": specification},
+        details={
+            "return_id": return_id,
+            "item": item_name,
+            "spec": specification,
+            "gate_pass_status": status_after,
+        },
     )
 
     await record_event(
@@ -324,7 +380,11 @@ async def mark_item_resent(
         item_deltas=[
             build_item_delta(item_name, specification, 0, 0)
         ],
-        meta={"return_id": return_id, "resent_at": now.isoformat()},
+        meta={
+            "return_id": return_id,
+            "resent_at": now.isoformat(),
+            "gate_pass_status": status_after,
+        },
     )
 
     updated = await returns_collection.find_one({"return_id": return_id})
