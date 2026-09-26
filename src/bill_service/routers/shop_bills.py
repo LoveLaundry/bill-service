@@ -30,6 +30,7 @@ from ..models import (
 )
 from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..router_utils import log_audit, parse_object_id
+from ..services.bill_sync import derive_payment_status
 
 router = APIRouter(prefix="/shop-bills", tags=["shop-bills"])
 
@@ -614,7 +615,11 @@ async def record_payment(
     if doc.get("payment_status") in ("PAID", "CANCELLED", "REFUNDED"):
         raise HTTPException(status_code=400, detail="Cannot record payment on this bill")
 
-    outstanding = doc.get("outstanding_amount", 0) or 0
+    # The cap comes from the money, not from the cached outstanding figure, so a
+    # stale cache can never let a payment take the bill past what is owed.
+    outstanding = max(
+        0.0, round(float(doc.get("grand_total") or 0) - float(doc.get("paid_amount") or 0), 2)
+    )
     if payload.amount > outstanding + 0.01:
         raise HTTPException(status_code=400, detail=f"Payment amount {payload.amount} exceeds outstanding {outstanding}")
 
@@ -691,6 +696,12 @@ async def split_bill(
     merged["total_amount"] = remaining_totals["total_amount"]
     merged["grand_total"] = remaining_totals["grand_total"]
     merged["outstanding_amount"] = round(remaining_totals["grand_total"] - doc.get("paid_amount", 0), 2)
+    # Splitting lines off a part-paid bill changes what is owed, so the status
+    # has to follow. Left behind, a bill that is now fully paid kept reading
+    # PARTIALLY_PAID and sat in the outstanding bucket with nothing owed.
+    merged["payment_status"] = derive_payment_status(
+        merged["grand_total"], doc.get("paid_amount", 0) or 0, doc.get("payment_status", "PENDING")
+    )
     merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
 

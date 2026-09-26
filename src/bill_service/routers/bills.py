@@ -16,6 +16,7 @@ from ..database.main_db import (
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..services import balance_engine as be
+from ..services.bill_sync import derive_payment_status
 from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
 from pydantic import BaseModel
@@ -894,6 +895,13 @@ async def edit_bill(
     update_fields["grand_total"] = round(grand_total, 2)
     paid = dec.get("paid_amount", 0) or 0
     update_fields["outstanding_amount"] = max(0.0, round(grand_total - paid, 2))
+    # The status labels this same money. Editing a part-paid bill's lines down
+    # to nothing used to leave it PARTIALLY_PAID with nothing owed, so it sat in
+    # the outstanding bucket forever. Derived here, exactly as the auto bill-sync
+    # and the payment endpoint do it.
+    update_fields["payment_status"] = derive_payment_status(
+        update_fields["grand_total"], paid, dec.get("payment_status", "PENDING")
+    )
 
     if not update_fields:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -980,7 +988,15 @@ async def create_payment(
             status_code=400, detail="Cannot record payments on a cancelled bill."
         )
 
-    outstanding = dec_bill["outstanding_amount"]
+    # The cap is derived from the MONEY, not from the stored outstanding figure.
+    # `outstanding_amount` is a cached copy that a correction, a manual fee edit
+    # or a partial write can leave behind, and trusting it let a payment
+    # overpay the bill: the extra went in as a payment record and the bill
+    # reported a negative balance that nothing could ever settle.
+    live_outstanding = round(
+        float(dec_bill.get("grand_total") or 0) - float(dec_bill.get("paid_amount") or 0), 2
+    )
+    outstanding = max(0.0, live_outstanding)
     if payload.amount > outstanding + 0.01:  # Allow minor tolerance for rounding
         raise HTTPException(
             status_code=400,
@@ -1015,8 +1031,12 @@ async def create_payment(
     else:
         new_status = "PARTIALLY_PAID"
 
-    await bills_collection.update_one(
-        {"_id": oid},
+    # The payment row and the bill's money have to move together. A conditional
+    # write plus a compensating delete means a bill that is cancelled or removed
+    # mid-request cannot end up with a payment recorded against it and a balance
+    # that never moved — the two used to be able to diverge silently.
+    bill_update = await bills_collection.update_one(
+        {"_id": oid, "payment_status": {"$ne": "CANCELLED"}},
         {
             "$set": {
                 "paid_amount": new_paid,
@@ -1026,6 +1046,15 @@ async def create_payment(
             }
         },
     )
+    if bill_update.matched_count == 0:
+        await payments_collection.delete_one({"_id": pay_result.inserted_id})
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This bill was cancelled or removed while the payment was being "
+                "recorded, so nothing was saved. Reload the bill and try again."
+            ),
+        )
 
     created_pay = await payments_collection.find_one({"_id": pay_result.inserted_id})
     serialized_pay = _serialize_payment(created_pay)

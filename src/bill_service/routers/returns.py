@@ -10,6 +10,7 @@ from ..database.main_db import returns_collection, gatepasses_collection, delive
 from ..gatepass_balance import resync_gate_pass_status
 from ..models import ReturnCreate, ReturnUpdate, RETURN_STATUSES
 from ..router_utils import parse_object_id, log_audit
+from ..services import balance_engine as be
 from ..services.transaction_events import (
     build_item_delta,
     record_event,
@@ -65,6 +66,44 @@ async def _resync_pass(gate_pass_id: Optional[str]) -> Optional[str]:
         return None
 
 
+def _pass_item_keys(gp_dec: dict) -> set:
+    return {
+        be.item_key(it.get("item_name", ""), it.get("specification"))
+        for it in (gp_dec.get("items") or [])
+    }
+
+
+def _reject_items_not_on_pass(gp_dec: dict, items, gate_pass_id: str) -> None:
+    """Refuse a return for an item the gate pass never carried.
+
+    Returns feed the balance directly (``outstanding = received - delivered +
+    returned + adjustment``), so an unvalidated return manufactures outstanding
+    pieces. The operator is then asked to deliver laundry that was never
+    received, and the balance can only be cleared by a correction that papered
+    over the mistake.
+    """
+    known = _pass_item_keys(gp_dec)
+    unknown = []
+    for item in items or []:
+        key = be.item_key(item.item_name, item.specification)
+        if key not in known and key not in unknown:
+            unknown.append(key)
+    if not unknown:
+        return
+    listed = ", ".join(
+        f"{k} (spec: {k.split('||', 1)[1]})" if "||" in k and k.split("||", 1)[1] else k
+        for k in unknown
+    )
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"{listed} was not received on this gate pass, so it cannot be "
+            "returned against it. Check the item name, or record the missing "
+            "pieces on the gate pass first."
+        ),
+    )
+
+
 @router.post("/returns")
 async def create_return(
     payload: ReturnCreate,
@@ -76,6 +115,7 @@ async def create_return(
     gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
     if not gp_doc:
         raise HTTPException(status_code=404, detail="Gate pass not found")
+    gp_dec = decrypt_dict(gp_doc, SENSITIVE_FIELDS)
 
     # Validate delivery if provided
     if payload.delivery_id:
@@ -83,6 +123,24 @@ async def create_return(
         dl_doc = await deliveries_collection.find_one({"_id": dl_oid})
         if not dl_doc:
             raise HTTPException(status_code=404, detail="Delivery not found")
+        # A return raises the balance of ITS OWN pass. Pointing it at a delivery
+        # from a different pass credited pieces to a gate pass that never sent
+        # them, which is how a balance ends up owed for laundry that was never
+        # involved.
+        if dl_doc.get("gate_pass_id") != payload.gate_pass_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "That delivery belongs to a different gate pass, so returning "
+                    "it against this pass would credit pieces to the wrong "
+                    "balance."
+                ),
+            )
+
+    # Every returned item has to be one the pass actually carries. A return for
+    # an item that was never received creates outstanding pieces out of nothing,
+    # and the client is then chased for laundry that does not exist.
+    _reject_items_not_on_pass(gp_dec, payload.items, payload.gate_pass_id)
 
     now = datetime.now(timezone.utc)
     return_id = _generate_return_id()
@@ -257,6 +315,21 @@ async def update_return(
         update_fields["status"] = payload.status
 
     if payload.items is not None:
+        gp_id = doc.get("gate_pass_id")
+        if gp_id:
+            # Editing items can change what the return contributes to the
+            # balance, so the same "must exist on the pass" rule applies as on
+            # create — otherwise an edit is a way around it.
+            try:
+                gp_doc = await gatepasses_collection.find_one(
+                    {"_id": parse_object_id(gp_id)}
+                )
+            except HTTPException:
+                gp_doc = None
+            if gp_doc:
+                _reject_items_not_on_pass(
+                    decrypt_dict(gp_doc, SENSITIVE_FIELDS), payload.items, gp_id
+                )
         update_fields["items"] = [item.model_dump() for item in payload.items]
 
     if payload.bill_adjustment is not None:

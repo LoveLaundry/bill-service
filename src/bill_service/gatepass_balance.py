@@ -72,15 +72,25 @@ def _decrypt_or_none(doc: dict, sensitive_fields: List[str]):
 
 
 async def load_gate_pass_balance_context(
-    gate_pass_id: str, marked_delivered: bool = False
+    gate_pass_id: str, marked_delivered: Optional[bool] = None
 ) -> GatePassBalanceContext:
     """Load everything the engine needs and run it.
 
-    ``marked_delivered`` mirrors the legacy "operator ticked it off by hand"
-    flag, which is retained only so old records still read the way they always
-    have. It is not a shortcut for skipping movement figures.
+    ``marked_delivered`` is the legacy "operator ticked it off by hand" flag.
+    It defaults to whatever the pass actually carries, because that is the only
+    answer that keeps every surface in agreement: a legacy note closure is
+    treated as a real send (effective delivered = received), so the delivery
+    form does not offer those pieces AND the delivery endpoint refuses to send
+    them a second time. Pass ``True``/``False`` only to deliberately override it.
+
+    It is not a shortcut for skipping movement figures.
     """
     gp_oid, gp_dec = await _load_gate_pass(gate_pass_id)
+    legacy_marked = (
+        bool(gp_dec.get("marked_delivered"))
+        if marked_delivered is None
+        else bool(marked_delivered)
+    )
 
     deliveries: List[dict] = []
     unreadable = 0
@@ -112,7 +122,7 @@ async def load_gate_pass_balance_context(
         gp_dec.get("items", []),
         delivered_by_item,
         returned_by_item,
-        marked_delivered=marked_delivered,
+        marked_delivered=legacy_marked,
         balance_adjustment_by_item=balance_adjustment_by_item,
     )
 

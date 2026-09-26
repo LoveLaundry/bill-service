@@ -53,6 +53,36 @@ def flatten_name(key: str) -> str:
     return key.split("||", 1)[0]
 
 
+def merge_gate_pass_items(gp_items: List[dict]) -> List[dict]:
+    """Collapse rows that share a name+spec into one, summing the quantities.
+
+    Two rows for the same item (a second batch of towels, say) used to be
+    keyed straight into a per-item map, where the last row silently overwrote
+    the earlier one and its pieces vanished from every balance. Merging is done
+    here, once, so every consumer of a gate pass's item rows sees the same
+    summed figures.
+    """
+    merged: List[dict] = []
+    merged_at: Dict[str, dict] = {}
+    for it in gp_items:
+        name = it.get("item_name", "")
+        spec = it.get("specification")
+        key = item_key(name, spec)
+        existing = merged_at.get(key)
+        if existing is None:
+            copy = dict(it)
+            merged.append(copy)
+            merged_at[key] = copy
+            continue
+        for field in ("client_qty", "received_qty", "rejected_qty"):
+            existing[field] = int(existing.get(field, 0) or 0) + int(it.get(field, 0) or 0)
+        # A re-wash tag is a property of the batch, so one flagged row keeps the
+        # merged row flagged rather than hiding a free re-wash.
+        if is_rewashed(it):
+            existing["rewashed"] = True
+    return merged
+
+
 def compute_delivered_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
     """Sum delivered quantities across non-cancelled delivery documents."""
     out: Dict[str, int] = {}
@@ -144,24 +174,7 @@ def compute_gate_pass_balance(
     # quantities ADD UP: keying straight into `items` let the last row overwrite
     # the earlier ones, so received pieces silently vanished from every balance,
     # print note and status derivation. Fold them into one row instead.
-    merged: List[dict] = []
-    merged_at: Dict[str, dict] = {}
-    for it in gp_items:
-        name = it.get("item_name", "")
-        spec = it.get("specification")
-        key = item_key(name, spec)
-        existing = merged_at.get(key)
-        if existing is None:
-            copy = dict(it)
-            merged.append(copy)
-            merged_at[key] = copy
-            continue
-        for field in ("client_qty", "received_qty", "rejected_qty"):
-            existing[field] = int(existing.get(field, 0) or 0) + int(it.get(field, 0) or 0)
-        # A re-wash tag is a property of the batch, so one flagged row keeps the
-        # merged row flagged rather than hiding a free re-wash.
-        if is_rewashed(it):
-            existing["rewashed"] = True
+    merged = merge_gate_pass_items(gp_items)
 
     for it in merged:
         name = it.get("item_name", "")
@@ -239,18 +252,29 @@ def recompute_status_with_movements(
     return_docs: List[dict],
     current_status: str,
     adjustment_docs: Optional[List[dict]] = None,
+    *,
+    marked_delivered: bool = False,
 ) -> str:
     """Derive the real status after a quantity correction, INCLUDING movements.
 
     The approval of a gate-pass adjustment must never re-derive status from an
     empty movement set — that would downgrade a fully-delivered pass to
     PARTIALLY_DELIVERED/RECEIVED because recorded deliveries were ignored.
+
+    ``adjustment_docs`` must be the pass's posted balance corrections. Omitting
+    them let a re-derived status ignore credits that were already applied, so a
+    pass that genuinely still owed pieces came back labelled DELIVERED and
+    disappeared from the delivery form.
     """
     delivered = compute_delivered_by_item(delivery_docs)
     returned = compute_returned_by_item(return_docs)
     adjustments = compute_balance_adjustments_by_item(adjustment_docs or [])
     balance = compute_gate_pass_balance(
-        gp_items, delivered, returned, balance_adjustment_by_item=adjustments
+        gp_items,
+        delivered,
+        returned,
+        marked_delivered=marked_delivered,
+        balance_adjustment_by_item=adjustments,
     )
     return derive_gate_pass_status(balance, current_status)
 
@@ -263,16 +287,21 @@ def has_prior_send(balance: dict) -> bool:
     proof too, because a credit is only ever posted against a send that was
     recorded short (under-delivered, lost or damaged in transit).
 
-    A debit is deliberately NOT proof on its own: it means we logged MORE as
-    sent than was taken, so the piece never actually went out and the honest
-    label for that pass is still a workflow state.
+    This is decided PER ITEM. Summing the adjustments across the whole pass
+    first let a debit on one item cancel out a credit on another, so a pass
+    that was genuinely partly sent went back to reading RECEIVED and vanished
+    from the delivery form. A debit is deliberately not proof on its own: it
+    means we logged MORE as sent than was taken, so the piece never actually
+    went out and the honest label for that pass is still a workflow state.
     """
-    totals = balance["totals"]
-    return (
-        totals["delivered_qty"] > 0
-        or totals["returned_back_qty"] > 0
-        or totals["balance_adjustment_qty"] > 0
-    )
+    for row in balance["items"].values():
+        if int(row.get("delivered_qty", 0) or 0) > 0:
+            return True
+        if int(row.get("returned_back_qty", 0) or 0) > 0:
+            return True
+        if int(row.get("balance_adjustment_qty", 0) or 0) > 0:
+            return True
+    return False
 
 
 def derive_gate_pass_status(balance: dict, current_status: str) -> str:
@@ -318,29 +347,56 @@ def compute_outstanding_per_item(gp_items: List[dict], balance: dict) -> List[di
     return rows
 
 
+def _sortable_stamp(value) -> Optional[float]:
+    """Coerce a stored delivery stamp into a comparable float.
+
+    Deliveries are written with a ``datetime`` but older hand-seeded rows can
+    hold an ISO string or a plain date. Sorting a mixed set used to raise
+    TypeError (datetime vs str), which turned the whole balance report into a
+    500 for one legacy row. Anything unparseable sorts as "no date" and falls
+    back to the creation stamp / id, which keeps the order total and stable.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def order_deliveries(docs: List[dict], target_id: str) -> List[dict]:
     """Deliveries in the order they were served, with ``target_id`` last.
 
     The report is a statement about one delivery in the running sequence, so it
-    has to know which deliveries came before it. Ordering falls back through
-    the delivery date, the creation stamp and finally the id so a sequence is
+    has to know which deliveries came before it. Ordering falls back through the
+    delivery date, the creation stamp and finally the id so a sequence is
     always stable and total, even for hand-seeded rows.
     """
     def sort_key(doc: dict):
-        stamp = doc.get("delivery_date") or doc.get("created_at")
-        if isinstance(stamp, datetime):
-            stamp = stamp.timestamp()
+        stamp = _sortable_stamp(doc.get("delivery_date"))
+        if stamp is None:
+            stamp = _sortable_stamp(doc.get("created_at"))
         return (stamp is None, stamp or 0.0, str(doc.get("_id") or doc.get("id") or ""))
 
-    present = {str(d.get("_id") or d.get("id") or "") for d in docs}
-    ordered = sorted(docs, key=sort_key)
-    if str(target_id) not in present:
+    ordered = sorted(docs or [], key=sort_key)
+    target = str(target_id)
+    if not any(str(d.get("_id") or d.get("id") or "") == target for d in ordered):
         # A target that is not in the list still has to be reportable, so the
         # caller can pass every delivery it knows about without pre-selecting.
-        target = {"id": target_id}
-        if not any(str(d.get("_id") or d.get("id") or "") == str(target_id) for d in ordered):
-            ordered.append(target)
+        ordered.append({"id": target_id})
     return ordered
+
 
 
 def compute_delivery_balance_report(
@@ -368,10 +424,13 @@ def compute_delivery_balance_report(
 
         current = previous - delivered + balance_adjustment
 
-    ``previous``/``current`` are each clamped at zero, so when the pre-delivery
-    balance was already negative (more recorded as sent than was ever received)
-    the identity can sit above the arithmetic. That state is a data error and
-    is surfaced as ``OVER_DELIVERED_BEFORE_DELIVERY`` rather than hidden.
+    ``current`` is never an independent calculation: it is the ENGINE's own
+    outstanding for the item as of the end of this delivery
+    (``received - delivered_upto + returned + adjustment_upto``, clamped at
+    zero). Deriving it from a clamped ``previous`` instead produced a figure
+    that disagreed with the gate-pass balance whenever the pre-delivery balance
+    was already negative. ``reconciles`` reports that disagreement honestly
+    instead of comparing the number against itself and always answering yes.
 
     Only items actually on the delivery are reported — a delivery note must not
     list items the client did not just receive.
@@ -379,8 +438,12 @@ def compute_delivery_balance_report(
     returned_by_item = returned_by_item or {}
     adjustment_docs = adjustment_docs or []
 
+    # Rows sharing a name+spec are summed, exactly as the gate-pass balance sums
+    # them. Keying straight into this map let the last row win, so a pass with
+    # two batches of the same item printed the SECOND batch's received quantity
+    # and every running-balance figure on the note was wrong.
     received_by_key: Dict[str, dict] = {}
-    for it in gp_items:
+    for it in merge_gate_pass_items(gp_items):
         received_by_key[item_key(it.get("item_name", ""), it.get("specification"))] = it
 
     delivery_id = str(delivery_doc.get("id") or delivery_doc.get("_id") or "")
@@ -394,7 +457,7 @@ def compute_delivery_balance_report(
             for i, d in enumerate(ordered)
             if str(d.get("_id") or d.get("id") or "") == delivery_id
         ),
-        len(ordered) - 1,
+        max(len(ordered) - 1, 0),
     )
     prefix = ordered[: target_index + 1]
     prefix_ids = {str(d.get("_id") or d.get("id") or "") for d in prefix} - {""}
@@ -446,7 +509,12 @@ def compute_delivery_balance_report(
 
         raw_previous = received - delivered_before + returned + adj_before
         previous = max(0, raw_previous)
-        current = max(0, previous - delivered_this + adj_this)
+        # The engine's figure for this item once THIS delivery has been served.
+        # This is the same expression the gate-pass balance uses, so the last
+        # note on a pass always prints the pass's real outstanding figure.
+        current = max(0, received - int(delivered_upto.get(key, 0) or 0) + returned
+                      + int(adj_upto_by_key.get(key, 0) or 0))
+        expected_current = max(0, previous - delivered_this + adj_this)
 
         row_flags: List[str] = []
         if raw_previous < 0:
@@ -460,6 +528,8 @@ def compute_delivery_balance_report(
             row_flags.append("BALANCE_CREDITED")
         elif adj_this < 0:
             row_flags.append("BALANCE_DEBITED")
+        if current != expected_current:
+            row_flags.append("BALANCE_DOES_NOT_RECONCILE")
         flags.extend(row_flags)
 
         rows.append(
@@ -473,7 +543,7 @@ def compute_delivery_balance_report(
                 "delivered_qty": delivered_this,
                 "balance_adjustment_qty": adj_this,
                 "current_balance_qty": current,
-                "reconciles": current == max(0, previous - delivered_this + adj_this),
+                "reconciles": current == expected_current,
                 "flags": row_flags,
             }
         )

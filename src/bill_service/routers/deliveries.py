@@ -336,8 +336,6 @@ async def pending_gatepasses(
             continue
 
     # Build delivered map: gate_pass_id → {item_key → qty} via the canonical engine.
-    from ..services import balance_engine as be
-
     delivered_by_gp: Dict[str, Dict[str, int]] = {}
     for dl in all_deliveries:
         dm = be.compute_delivered_by_item([dl])

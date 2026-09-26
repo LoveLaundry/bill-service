@@ -52,6 +52,7 @@ async def reconciliation_issues(
 
     issues_out = []
     summary: Counter = Counter()
+    unreadable_returns = 0
 
     gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
     async for gp_doc in gp_cursor:
@@ -78,13 +79,19 @@ async def reconciliation_issues(
             adjustments.append(adj_doc)
 
         # Returns live on their own collection keyed by the pass they were
-        # raised on. They used to be dropped here, so a piece the client handed
-        # back still counted as outstanding and the pass got flagged for an
-        # issue it did not have.
+        # raised on, and their `items` are envelope-encrypted. They used to be
+        # dropped here, so a piece the client handed back still counted as
+        # outstanding and the pass got flagged for an issue it did not have —
+        # and when they WERE read they were read raw, so `items` came back as
+        # ciphertext and contributed nothing either way.
         return_docs = []
         return_cursor = returns_collection.find({"gate_pass_id": gp_id})
         async for ret_doc in return_cursor:
-            return_docs.append(ret_doc)
+            try:
+                return_docs.append(decrypt_dict(ret_doc, GATEPASS_SENSITIVE_FIELDS))
+            except Exception:
+                unreadable_returns += 1
+                continue
 
         balance = be.compute_gate_pass_balance(
             gp.get("items", []),
@@ -129,4 +136,10 @@ async def reconciliation_issues(
                 }
             )
 
-    return {"items": issues_out, "summary": dict(summary)}
+    return {
+        "items": issues_out,
+        "summary": dict(summary),
+        # A return that will not decrypt is invisible to the balance, so the
+        # screen must be able to say so rather than quietly under-report.
+        "unreadable_returns": unreadable_returns,
+    }

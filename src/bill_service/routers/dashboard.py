@@ -66,7 +66,16 @@ def _decrypt_shop_bill(doc: dict) -> dict:
 
 
 def _key(name: str, spec: str = ""):
-    return f"{name}||{spec}" if spec else name
+    """Canonical per-item key, identical to the balance engine's.
+
+    This used to return a bare ``name`` when there was no specification, while
+    the engine keys everything as ``name||spec``. Every map built here is fed to
+    ``compute_gate_pass_balance``, which looks items up by the engine's key, so
+    for an un-specified item — most of them — the whole figure was looked up
+    under a key that does not exist and silently contributed nothing. That is
+    how returned and corrected pieces disappeared from a client's balances.
+    """
+    return be.item_key(name, spec)
 
 
 async def _fetch_balance_adjustments(gate_pass_ids: List[str]) -> List[dict]:
@@ -83,17 +92,29 @@ async def _fetch_balance_adjustments(gate_pass_ids: List[str]) -> List[dict]:
     ).to_list(length=None)
 
 
-async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
-    """Fetch all returns and build gate_pass_id → {item_key → returned_qty}.
+async def _get_returned_items_by_gate_pass(
+    gate_pass_ids: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, int]]:
+    """Fetch returns and build gate_pass_id → {item_key → returned_qty}.
 
     Only includes items with action RECEIVE_BACK/RE_WASH that haven't been
     re-sent yet (resend_status != SENT). These count as pending items because
     they must be sent back to the client. Returns carry their own
     gate_pass_id, so they are attributed to the exact gate pass they were
     raised on — never to another pass of the same client.
+
+    ``gate_pass_ids`` scopes the scan. Without it this returned EVERY return in
+    the database, and callers that folded the result into one client's balances
+    were adding other clients' (and other hotels') returned pieces to that
+    client's pending total.
     """
     returned: Dict[str, Dict[str, int]] = {}
-    ret_cursor = returns_collection.find()
+    scope = {str(g) for g in (gate_pass_ids or []) if g}
+    ret_cursor = (
+        returns_collection.find({"gate_pass_id": {"$in": list(scope)}})
+        if scope
+        else returns_collection.find()
+    )
     async for ret_doc in ret_cursor:
         try:
             try:
@@ -103,21 +124,14 @@ async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
             gp_id = str(ret.get("gate_pass_id") or "")
             if not gp_id:
                 continue
-            if gp_id not in returned:
-                returned[gp_id] = {}
-            for item in ret.get("items", []):
-                if not isinstance(item, dict):
-                    continue
-                if item.get("action") not in ("RECEIVE_BACK", "RE_WASH"):
-                    continue
-                if item.get("resend_status") == "SENT":
-                    continue
-                name = item.get("item_name", "")
-                spec = item.get("specification") or ""
-                key = _key(name, spec)
-                qty = int(item.get("returned_qty", 0) or 0)
-                if qty > 0:
-                    returned[gp_id][key] = returned[gp_id].get(key, 0) + qty
+            if scope and gp_id not in scope:
+                continue
+            rm = be.compute_returned_by_item([ret])
+            if not rm:
+                continue
+            cur = returned.setdefault(gp_id, {})
+            for k, v in rm.items():
+                cur[k] = cur.get(k, 0) + v
         except Exception:
             continue
     return returned
@@ -132,16 +146,31 @@ def _flatten_returned_by_name(returned_by_gp: Dict[str, Dict[str, int]]) -> Dict
     return out
 
 
-async def _flatten_balance_adjustments_by_name() -> Dict[str, int]:
+async def _flatten_balance_adjustments_by_name(
+    gate_pass_ids: Optional[List[str]] = None,
+) -> Dict[str, int]:
     """Signed balance corrections summed per item NAME across every pass.
 
     Posted corrections are the other half of "what is still owed" — a credited
     piece has to be sent, a debited one does not. They are aggregated by name
     here for the same reason returns are: the pending-balances report is a
     per-item-name roll-up, not a per-pass ledger.
+
+    ``gate_pass_ids`` scopes the scan, so a per-client figure can never be
+    inflated by corrections posted against another client's (or another
+    hotel's) gate passes.
     """
+    scope = {str(g) for g in (gate_pass_ids or []) if g}
     out: Dict[str, int] = {}
-    async for adj_doc in balance_adjustments_collection.find():
+    cursor = (
+        balance_adjustments_collection.find({"gate_pass_id": {"$in": list(scope)}})
+        if scope
+        else balance_adjustments_collection.find()
+    )
+    async for adj_doc in cursor:
+        gp_id = str(adj_doc.get("gate_pass_id") or "")
+        if scope and gp_id not in scope:
+            continue
         am = be.compute_balance_adjustments_by_item([adj_doc])
         for key, qty in am.items():
             name = key.split("||", 1)[0]
@@ -316,99 +345,103 @@ async def get_client_summary(client_name: str = Query(...)):
         except Exception:
             pass
 
-    # Compute stats
+    # ── Balances come from the ENGINE, per gate pass, then roll up by name ────
+    #
+    # This used to add up received/delivered by hand and then fold in returns
+    # and corrections that had been aggregated across the WHOLE database. Three
+    # separate wrongnesses came out of that: another client's (and another
+    # hotel's) returned or credited pieces were added to this client's pending
+    # total, a cancelled pass still contributed its received pieces, and the
+    # single `max(0, received - delivered + returned + adjusted)` per item NAME
+    # did not match the per-pass, per-item clamped figure every other screen
+    # shows. Running the engine per pass and rolling the rows up can only ever
+    # agree with the gate-pass balance screen.
+    open_gps = [gp for gp in gps if gp.get("status") != "CANCELLED"]
+    open_gp_ids = [gp["id"] for gp in open_gps]
+
+    delivered_by_gp: Dict[str, Dict[str, int]] = {}
+    for dl in deliveries:
+        if dl.get("status") == "CANCELLED":
+            continue
+        dm = be.compute_delivered_by_item([dl])
+        cur = delivered_by_gp.setdefault(dl.get("gate_pass_id", ""), {})
+        for k, v in dm.items():
+            cur[k] = cur.get(k, 0) + v
+
+    # Scoped to THIS client's gate passes, so nothing from another pass — or
+    # another hotel — can reach these figures.
+    returned_by_gp = await _get_returned_items_by_gate_pass(open_gp_ids)
+
+    adjusted_by_gp: Dict[str, Dict[str, int]] = {}
+    async for adj_doc in balance_adjustments_collection.find(
+        {"gate_pass_id": {"$in": open_gp_ids}} if open_gp_ids else {"gate_pass_id": "__none__"}
+    ):
+        gp_id = str(adj_doc.get("gate_pass_id") or "")
+        if not gp_id:
+            continue
+        am = be.compute_balance_adjustments_by_item([adj_doc])
+        cur = adjusted_by_gp.setdefault(gp_id, {})
+        for k, v in am.items():
+            cur[k] = cur.get(k, 0) + v
+
     total_received = 0
+    total_delivered = 0
     open_mismatches = 0
-    mismatches_list = []
+    mismatches_list: List[dict] = []
     balances_map: Dict[str, dict] = {}
 
-    for gp in gps:
-        for item in gp.get("items", []):
-            name = item["item_name"]
-            client_qty = item.get("client_qty", 0)
-            rec_qty = item.get("received_qty", 0)
-            diff = item.get("difference", 0)
-            total_received += rec_qty
-
-            if diff != 0:
-                open_mismatches += 1
-                mismatches_list.append(
-                    {
-                        "gate_pass_id": gp["id"],
-                        "gate_pass_number": gp["gate_pass_number"],
-                        "item_name": name,
-                        "expected": client_qty,
-                        "received": rec_qty,
-                        "difference": diff,
-                        "reason": item.get("mismatch_reason", "OTHER"),
-                        "notes": item.get("mismatch_notes"),
-                        "date": gp.get("receiving_date"),
-                    }
-                )
-
-            if name not in balances_map:
-                balances_map[name] = {"received": 0, "delivered": 0, "pending": 0}
-            balances_map[name]["received"] += rec_qty
-
-    total_delivered = 0
-    for dl in deliveries:
-        if dl.get("status") == "CANCELLED":
-            continue
-        for item in dl.get("items", []):
-            name = item["item_name"]
-            qty = item["quantity"]
-            total_delivered += qty
-            if name not in balances_map:
-                balances_map[name] = {"received": 0, "delivered": 0, "pending": 0}
-            balances_map[name]["delivered"] += qty
-
-    # Gate passes completed via catch-up mark-delivered count as fully delivered.
-    # A marked GP might also have real delivery rows; only add the un-recorded
-    # remainder so those quantities are not double counted.
-    recorded_by_gp: Dict[str, Dict[str, int]] = {}
-    for dl in deliveries:
-        if dl.get("status") == "CANCELLED":
-            continue
-        gpid = dl.get("gate_pass_id") or ""
-        m = recorded_by_gp.setdefault(gpid, {})
-        for item in dl.get("items", []):
-            nm = item.get("item_name", "")
-            m[nm] = m.get(nm, 0) + item.get("quantity", 0)
-
-    for gp in gps:
-        if not gp.get("marked_delivered"):
-            continue
-        recorded = recorded_by_gp.get(gp["id"], {})
-        for item in gp.get("items", []):
-            name = item["item_name"]
-            qty = int(item.get("received_qty", 0) or 0)
-            extra = max(0, qty - recorded.get(name, 0))
-            if extra <= 0:
-                continue
-            total_delivered += extra
-            if name not in balances_map:
-                balances_map[name] = {"received": 0, "delivered": 0, "pending": 0}
-            balances_map[name]["delivered"] += extra
-
-    # Add returned items to pending — items returned by client need re-sending
-    returned_by_gp = await _get_returned_items_by_gate_pass()
-    returned_global = _flatten_returned_by_name(returned_by_gp)
-
-    # ...and so do balanced items: a posted correction moves the balance just as
-    # a return does, so it is reported alongside the pending quantity instead of
-    # staying invisible on the screen that claims to show what is owed.
-    adjusted_global = await _flatten_balance_adjustments_by_name()
-
-    pending_items_sum = 0
-    for name, item_bal in balances_map.items():
-        ret_qty = returned_global.get(name, 0)
-        adj_qty = adjusted_global.get(name, 0)
-        item_bal["returned"] = ret_qty
-        item_bal["balance_adjusted"] = adj_qty
-        item_bal["pending"] = max(
-            0, item_bal["received"] - item_bal["delivered"] + ret_qty + adj_qty
+    for gp in open_gps:
+        gp_id = gp["id"]
+        balance = be.compute_gate_pass_balance(
+            gp.get("items", []),
+            delivered_by_gp.get(gp_id, {}),
+            returned_by_gp.get(gp_id, {}),
+            marked_delivered=bool(gp.get("marked_delivered")),
+            balance_adjustment_by_item=adjusted_by_gp.get(gp_id, {}),
         )
-        pending_items_sum += item_bal["pending"]
+        total_received += balance["totals"]["received_qty"]
+        total_delivered += balance["totals"]["effective_delivered_qty"]
+
+        for row in balance["items"].values():
+            name = row["item_name"]
+            slot = balances_map.setdefault(
+                name,
+                {"received": 0, "delivered": 0, "returned": 0,
+                 "balance_adjusted": 0, "pending": 0},
+            )
+            slot["received"] += row["received_qty"]
+            slot["delivered"] += row["effective_delivered_qty"]
+            slot["returned"] += row["returned_back_qty"]
+            slot["balance_adjusted"] += row["balance_adjustment_qty"]
+            # Clamped PER ITEM, the way the engine does it. Clamping the rolled-up
+            # name total instead hid a per-item over-delivery and disagreed with
+            # every other screen.
+            slot["pending"] += row["outstanding_delivery_qty"]
+
+    # Mismatches are a property of the receiving sheet, so they come off the raw
+    # rows — including on cancelled passes, which is where a counting mistake
+    # still needs to be visible and correctable.
+    for gp in gps:
+        for item in gp.get("items", []):
+            diff = item.get("difference", 0)
+            if not diff:
+                continue
+            open_mismatches += 1
+            mismatches_list.append(
+                {
+                    "gate_pass_id": gp["id"],
+                    "gate_pass_number": gp["gate_pass_number"],
+                    "item_name": item["item_name"],
+                    "expected": item.get("client_qty", 0),
+                    "received": item.get("received_qty", 0),
+                    "difference": diff,
+                    "reason": item.get("mismatch_reason", "OTHER"),
+                    "notes": item.get("mismatch_notes"),
+                    "date": gp.get("receiving_date"),
+                }
+            )
+
+    pending_items_sum = sum(slot["pending"] for slot in balances_map.values())
 
     total_billed = 0.0
     total_paid = 0.0
@@ -515,7 +548,7 @@ async def get_client_wise_report():
                     clients_map[c_label]["total_mismatches"] += 1
                 item_key = item.get("item_name", "")
                 spec = item.get("specification") or ""
-                detail_key = f"{item_key}||{spec}" if spec else item_key
+                detail_key = _key(item_key, spec)
                 if detail_key not in clients_map[c_label]["items_detail"]:
                     clients_map[c_label]["items_detail"][detail_key] = {
                         "item_name": item_key,
@@ -547,7 +580,7 @@ async def get_client_wise_report():
                     clients_map[client]["total_delivered"] += item.get("quantity", 0)
                     item_key = item.get("item_name", "")
                     spec = item.get("specification") or ""
-                    detail_key = f"{item_key}||{spec}" if spec else item_key
+                    detail_key = _key(item_key, spec)
                     if detail_key in clients_map[client]["items_detail"]:
                         clients_map[client]["items_detail"][detail_key]["delivered"] += item.get("quantity", 0)
         except Exception:
@@ -564,7 +597,7 @@ async def get_client_wise_report():
             for item in dl.get("items", []):
                 ik_ = item.get("item_name", "")
                 sp_ = item.get("specification") or ""
-                key = f"{ik_}||{sp_}" if sp_ else ik_
+                key = _key(ik_, sp_)
                 m[key] = m.get(key, 0) + item.get("quantity", 0)
         except Exception:
             continue
@@ -584,7 +617,7 @@ async def get_client_wise_report():
                     received = item.get("received_qty", 0)
                     item_key = item.get("item_name", "")
                     spec = item.get("specification") or ""
-                    detail_key = f"{item_key}||{spec}" if spec else item_key
+                    detail_key = _key(item_key, spec)
                     extra = max(0, received - recorded.get(detail_key, 0))
                     if extra <= 0:
                         continue
@@ -618,20 +651,109 @@ async def get_client_wise_report():
         for key, qty in gp_items_returned.items():
             target[key] = target.get(key, 0) + qty
 
+    # ── Pending is recomputed from the ENGINE, per gate pass ─────────────────
+    #
+    # The figures above are collected pass by pass precisely so the pending
+    # number can come from the same code every other screen uses. The previous
+    # hand-rolled `max(0, received - delivered + returned)` on the ROLLED-UP
+    # figures ignored posted balance corrections entirely and clamped once per
+    # client+item instead of once per pass+item, so a credited piece never
+    # showed as owed and a per-item over-delivery was masked.
+    delivered_by_gp: Dict[str, Dict[str, int]] = {}
+    for doc in del_docs:
+        try:
+            dl = _decrypt_del(doc)
+            dm = be.compute_delivered_by_item([dl])
+            cur = delivered_by_gp.setdefault(dl.get("gate_pass_id", ""), {})
+            for k, v in dm.items():
+                cur[k] = cur.get(k, 0) + v
+        except Exception:
+            continue
+
+    adjusted_by_gp: Dict[str, Dict[str, int]] = {}
+    async for adj_doc in balance_adjustments_collection.find():
+        gp_id = str(adj_doc.get("gate_pass_id") or "")
+        if not gp_id or gp_id not in gp_client_map:
+            continue
+        am = be.compute_balance_adjustments_by_item([adj_doc])
+        cur = adjusted_by_gp.setdefault(gp_id, {})
+        for k, v in am.items():
+            cur[k] = cur.get(k, 0) + v
+
+    # Cancelled passes are void: their pieces are neither held nor owed.
+    for c_label, stats in clients_map.items():
+        stats["total_received"] = 0
+        stats["total_delivered"] = 0
+        detail = stats.pop("items_detail")
+        for slot in detail.values():
+            slot["received"] = 0
+            slot["delivered"] = 0
+            slot["returned"] = 0
+            slot["balance_adjusted"] = 0
+            slot["pending"] = 0
+
+    for doc in gp_docs:
+        try:
+            gp = _decrypt_gp(doc)
+            if gp.get("status") == "CANCELLED":
+                continue
+            c_label = gp_client_map.get(gp["id"])
+            stats = clients_map.get(c_label) if c_label else None
+            if stats is None:
+                continue
+            balance = be.compute_gate_pass_balance(
+                gp.get("items", []),
+                delivered_by_gp.get(gp["id"], {}),
+                returned_by_gp.get(gp["id"], {}),
+                marked_delivered=bool(gp.get("marked_delivered")),
+                balance_adjustment_by_item=adjusted_by_gp.get(gp["id"], {}),
+            )
+            stats["total_received"] += balance["totals"]["received_qty"]
+            stats["total_delivered"] += balance["totals"]["effective_delivered_qty"]
+            detail = stats["items_detail"]
+            for row in balance["items"].values():
+                d_key = _key(row["item_name"], row["specification"])
+                slot = detail.get(d_key)
+                if slot is None:
+                    slot = detail.setdefault(
+                        d_key,
+                        {
+                            "item_name": row["item_name"],
+                            "specification": row["specification"],
+                            "category": row.get("category") or "",
+                            "received": 0,
+                            "delivered": 0,
+                        },
+                    )
+                slot["received"] += row["received_qty"]
+                slot["delivered"] += row["effective_delivered_qty"]
+                slot["returned"] = slot.get("returned", 0) + row["returned_back_qty"]
+                slot["balance_adjusted"] = (
+                    slot.get("balance_adjusted", 0) + row["balance_adjustment_qty"]
+                )
+                slot["pending"] = slot.get("pending", 0) + row["outstanding_delivery_qty"]
+        except Exception:
+            continue
+
     results = []
     for c_label, stats in clients_map.items():
-        creturned = client_returned.get(c_label, {})
-        total_returned = sum(creturned.values())
-        stats["total_pending"] = max(0, stats["total_received"] - stats["total_delivered"] + total_returned)
+        stats["total_pending"] = sum(
+            slot.get("pending", 0) for slot in stats["items_detail"].values()
+        )
         stats["total_billed"] = round(stats["total_billed"], 2)
         stats["paid_amount"] = round(stats["paid_amount"], 2)
         stats["outstanding"] = round(stats["outstanding"], 2)
+        stats["total_returned"] = sum(
+            slot.get("returned", 0) for slot in stats["items_detail"].values()
+        )
+        stats["total_balance_adjusted"] = sum(
+            slot.get("balance_adjusted", 0) for slot in stats["items_detail"].values()
+        )
         items_list = list(stats.pop("items_detail").values())
         for it in items_list:
-            it_key = f"{it['item_name']}||{it['specification']}" if it["specification"] else it["item_name"]
-            ret_qty = creturned.get(it_key, 0)
-            it["returned"] = ret_qty
-            it["pending"] = max(0, it["received"] - it["delivered"] + ret_qty)
+            it.setdefault("returned", 0)
+            it.setdefault("balance_adjusted", 0)
+            it.setdefault("pending", 0)
         stats["items"] = [it for it in items_list if it["pending"] > 0]
         stats["gate_passes"] = stats.pop("gate_passes", [])
         results.append(stats)
@@ -720,11 +842,70 @@ async def get_item_wise_report():
     # Add returned items — returned by client, need re-sending
     returned_global = _flatten_returned_by_name(returned_by_gp)
 
+    # ...and posted balance corrections, which move the balance exactly like a
+    # return does. They used to be missing from this report entirely, so a
+    # credited piece read as settled here while the delivery form was still
+    # offering it.
+    adjusted_global = await _flatten_balance_adjustments_by_name()
+
+    # Pending is the sum of the engine's PER-PASS, PER-ITEM clamped outstanding.
+    # Clamping once per item NAME over the whole business hid a per-item
+    # over-delivery and disagreed with every other screen.
+    delivered_by_gp: Dict[str, Dict[str, int]] = {}
+    for doc in del_docs:
+        try:
+            dl = _decrypt_del(doc)
+            dm = be.compute_delivered_by_item([dl])
+            cur = delivered_by_gp.setdefault(dl.get("gate_pass_id", ""), {})
+            for k, v in dm.items():
+                cur[k] = cur.get(k, 0) + v
+        except Exception:
+            continue
+
+    adjusted_by_gp: Dict[str, Dict[str, int]] = {}
+    async for adj_doc in balance_adjustments_collection.find():
+        gp_id = str(adj_doc.get("gate_pass_id") or "")
+        if not gp_id:
+            continue
+        am = be.compute_balance_adjustments_by_item([adj_doc])
+        cur = adjusted_by_gp.setdefault(gp_id, {})
+        for k, v in am.items():
+            cur[k] = cur.get(k, 0) + v
+
+    gp_rows: List[dict] = []
+    for doc in gp_docs:
+        try:
+            gp_rows.append(_decrypt_gp(doc))
+        except Exception:
+            continue
+
+    for stats in items_map.values():
+        stats["total_received"] = 0
+        stats["total_delivered"] = 0
+        stats["pending"] = 0
+
+    for gp in gp_rows:
+        if gp.get("status") == "CANCELLED":
+            continue
+        balance = be.compute_gate_pass_balance(
+            gp.get("items", []),
+            delivered_by_gp.get(gp["id"], {}),
+            returned_by_gp.get(gp["id"], {}),
+            marked_delivered=bool(gp.get("marked_delivered")),
+            balance_adjustment_by_item=adjusted_by_gp.get(gp["id"], {}),
+        )
+        for row in balance["items"].values():
+            stats = items_map.get(row["item_name"])
+            if stats is None:
+                continue
+            stats["total_received"] += row["received_qty"]
+            stats["total_delivered"] += row["effective_delivered_qty"]
+            stats["pending"] += row["outstanding_delivery_qty"]
+
     results = []
     for name, stats in items_map.items():
-        ret_qty = returned_global.get(name, 0)
-        stats["returned"] = ret_qty
-        stats["pending"] = max(0, stats["total_received"] - stats["total_delivered"] + ret_qty)
+        stats["returned"] = returned_global.get(name, 0)
+        stats["balance_adjusted"] = adjusted_global.get(name, 0)
         stats["client_count"] = len(stats["clients"])
         del stats["clients"]  # Remove the set before returning
         results.append(stats)
@@ -1045,6 +1226,7 @@ def aggregate(
     items_delivered = 0
     total_returned = 0
     total_adjusted = 0
+    items_pending = 0
     for gp in open_gps:
         gp_id = gp["id"]
         bal = be.compute_gate_pass_balance(
@@ -1059,13 +1241,12 @@ def aggregate(
         items_delivered += bal["totals"]["effective_delivered_qty"]
         total_returned += bal["totals"]["returned_back_qty"]
         total_adjusted += bal["totals"]["balance_adjustment_qty"]
-
-    # The headline figure has to include corrections, exactly like the per-pass
-    # list below it. Summing the parts and dropping the adjustments made this
-    # number disagree with the very list rendered under it.
-    items_pending = max(
-        0, items_received - items_delivered + total_returned + total_adjusted
-    )
+        # The headline has to be the SAME number as the per-pass list rendered
+        # under it, so it is the sum of the engine's clamped per-item figures.
+        # Collapsing it into one `max(0, received - delivered + returned +
+        # adjusted)` over the totals let a per-item over-delivery cancel a real
+        # shortfall elsewhere, and the KPI then contradicted the table below it.
+        items_pending += bal["totals"]["outstanding_delivery_qty"]
 
     active_clients = len(set(b["client_name"] for b in bills))
 
@@ -1355,7 +1536,7 @@ async def today_deliveries(
                 item_name = item.get("item_name", "")
                 spec = item.get("specification") or ""
                 qty = item.get("quantity", 0)
-                detail_key = f"{item_name}||{spec}" if spec else item_name
+                detail_key = _key(item_name, spec)
                 if detail_key not in client_map[client]["items"]:
                     client_map[client]["items"][detail_key] = {
                         "item_name": item_name,
@@ -1409,7 +1590,7 @@ async def today_deliveries(
             item_name = item.get("item_name", "")
             spec = item.get("specification") or ""
             qty = int(item.get("received_qty", 0) or 0)
-            detail_key = f"{item_name}||{spec}" if spec else item_name
+            detail_key = _key(item_name, spec)
             if detail_key not in client_map[client]["items"]:
                 client_map[client]["items"][detail_key] = {
                     "item_name": item_name,
@@ -1434,7 +1615,7 @@ async def today_deliveries(
                     item_name = item.get("item_name", "")
                     spec = item.get("specification") or ""
                     qty = item.get("received_qty", 0)
-                    detail_key = f"{item_name}||{spec}" if spec else item_name
+                    detail_key = _key(item_name, spec)
                     if detail_key not in received_map:
                         received_map[detail_key] = {"item_name": item_name, "specification": spec, "received": 0}
                     received_map[detail_key]["received"] += qty
@@ -1457,13 +1638,13 @@ async def today_deliveries(
                     for item in dl.get("items", []):
                         item_name = item.get("item_name", "")
                         spec = item.get("specification") or ""
-                        detail_key = f"{item_name}||{spec}" if spec else item_name
+                        detail_key = _key(item_name, spec)
                         m[detail_key] = m.get(detail_key, 0) + item.get("quantity", 0)
                 for item in dl.get("items", []):
                     item_name = item.get("item_name", "")
                     spec = item.get("specification") or ""
                     qty = item.get("quantity", 0)
-                    detail_key = f"{item_name}||{spec}" if spec else item_name
+                    detail_key = _key(item_name, spec)
                     delivered_map[detail_key] = delivered_map.get(detail_key, 0) + qty
             except Exception:
                 continue
@@ -1486,7 +1667,7 @@ async def today_deliveries(
                     item_name = item.get("item_name", "")
                     spec = item.get("specification") or ""
                     qty = int(item.get("received_qty", 0) or 0)
-                    detail_key = f"{item_name}||{spec}" if spec else item_name
+                    detail_key = _key(item_name, spec)
                     extra = max(0, qty - recorded.get(detail_key, 0))
                     if extra > 0:
                         delivered_map[detail_key] = delivered_map.get(detail_key, 0) + extra
@@ -1510,7 +1691,7 @@ async def today_deliveries(
                         item_name = item.get("item_name", "")
                         spec = item.get("specification") or ""
                         qty = item.get("returned_qty", 0)
-                        detail_key = f"{item_name}||{spec}" if spec else item_name
+                        detail_key = _key(item_name, spec)
                         returned_map[detail_key] = returned_map.get(detail_key, 0) + qty
             except Exception:
                 continue

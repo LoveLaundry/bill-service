@@ -15,11 +15,13 @@ from ..auth_helper import require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict
 from ..database.main_db import (
     adjustments_collection,
+    balance_adjustments_collection,
     deliveries_collection,
     gatepasses_collection,
     returns_collection,
 )
 from ..models import GatePassAdjustmentRequest
+from ..repositories.main_repository import bump_version, enqueue_sync
 from ..router_utils import parse_object_id
 from ..services import balance_engine as be
 from ..services.bill_sync import sync_bills_to_gate_pass
@@ -199,6 +201,12 @@ async def approve_adjustment(
     encrypted_gp = encrypt_dict(gp_dec, SENSITIVE_FIELDS)
     await gatepasses_collection.replace_one({"_id": gp_oid}, encrypted_gp)
 
+    # The corrected quantities and the re-derived status have to reach the
+    # replica. Without the enqueue the pass was corrected on MAIN and left
+    # showing the old quantities and status everywhere that reads SECONDARY.
+    gp_version = await bump_version("gatepass", gp_oid)
+    await enqueue_sync("gatepass", gp_oid, gp_version)
+
     # Automatic propagation: any linked, still-editable bill is re-clamped to
     # the corrected received quantities; paid bills are flagged, never rewritten.
     #
@@ -308,20 +316,36 @@ async def _apply_approved_correction(oid, adj_doc, current_user):
     # real movements — ignoring recorded deliveries/returns downgraded a fully
     # delivered pass (e.g. 50 received, 50 delivered, corrected to 47) to
     # PARTIALLY_DELIVERED/RECEIVED.
+    #
+    # The pass's POSTED balance corrections are part of that movement set too.
+    # They used to be left out, so a pass that still owed a credited piece was
+    # re-labelled DELIVERED here and vanished from the delivery form even though
+    # its balance said otherwise.
     delivered_docs = []
     async for dl in deliveries_collection.find(
         {"gate_pass_id": str(gp_oid), "status": {"$ne": "CANCELLED"}}
     ):
-        delivered_docs.append(dl)
+        try:
+            delivered_docs.append(decrypt_dict(dl, SENSITIVE_FIELDS))
+        except Exception:
+            continue
     return_docs = []
     async for rt in returns_collection.find({"gate_pass_id": str(gp_oid)}):
-        return_docs.append(rt)
+        try:
+            return_docs.append(decrypt_dict(rt, SENSITIVE_FIELDS))
+        except Exception:
+            continue
+    balance_adj_docs = []
+    async for adj in balance_adjustments_collection.find({"gate_pass_id": str(gp_oid)}):
+        balance_adj_docs.append(adj)
 
     new_gp["status"] = be.recompute_status_with_movements(
         updated_items,
-        [decrypt_dict(x, SENSITIVE_FIELDS) for x in delivered_docs],
-        [decrypt_dict(x, SENSITIVE_FIELDS) for x in return_docs],
+        delivered_docs,
+        return_docs,
         new_gp.get("status", "RECEIVED"),
+        balance_adj_docs,
+        marked_delivered=bool(new_gp.get("marked_delivered")),
     )
 
     return gp_oid, new_gp, updated_items, original_qty, history

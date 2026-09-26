@@ -139,6 +139,25 @@ def _append_note(dec: dict, line: str) -> str:
     return "\n".join(note_parts)
 
 
+def derive_payment_status(grand_total: float, paid_amount: float, current: str) -> str:
+    """Payment status implied by the money, never left behind the money.
+
+    A downward correction re-derives ``grand_total`` and ``outstanding_amount``
+    but used to leave ``payment_status`` exactly as it was. A bill whose total
+    fell to zero kept reading PARTIALLY_PAID, which is a bill the outstanding
+    list showed forever with nothing owed. DRAFT is a pre-issue workflow state
+    and ISUPDATED is a billing state, so neither is second-guessed here.
+    """
+    if current in ("CANCELLED", "DRAFT", "ISSUED"):
+        return current
+    outstanding = round(float(grand_total) - float(paid_amount), 2)
+    if outstanding <= 0.01:
+        return "PAID"
+    if float(paid_amount) > 0:
+        return "PARTIALLY_PAID"
+    return "PENDING"
+
+
 async def _persist_bill(
     bill_id,
     dec: dict,
@@ -344,6 +363,9 @@ async def sync_bills_to_gate_pass(
             "total_quantity": total_quantity,
             "grand_total": grand_total,
             "outstanding_amount": outstanding,
+            # The status is a label on the same money that just moved, so it has
+            # to move with it or the bill reads PARTIALLY_PAID with nothing owed.
+            "payment_status": derive_payment_status(grand_total, paid, status),
             "notes": _append_note(dec, "\n".join(note_lines)),
             "updated_at": datetime.now(timezone.utc),
         }
@@ -351,14 +373,15 @@ async def sync_bills_to_gate_pass(
             bill_id, dec, updates, deltas,
             gate_pass_id=gate_pass_id,
             user_id=user_id, user_name=user_name, reason=reason,
-            meta={
-                "action": "auto_adjusted",
-                "payment_status": status,
-                "grand_total_after": grand_total,
-                "outstanding_after": outstanding,
-                "underbilled_items": missing_on_bill or None,
-                "overpaid_after_correction": round(-overpaid_after, 2) if overpaid_after < 0 else None,
-            },
+        meta={
+            "action": "auto_adjusted",
+            "payment_status": updates["payment_status"],
+            "grand_total_after": grand_total,
+            "outstanding_after": outstanding,
+            "underbilled_items": missing_on_bill or None,
+            "overpaid_after_correction": round(-overpaid_after, 2) if overpaid_after < 0 else None,
+        },
+
         )
         outcomes.append({"bill_id": bill_id_str, "payment_status": status, "action": "adjusted"})
 

@@ -26,8 +26,8 @@ from ..database.main_db import (
     balance_adjustments_collection,
     deliveries_collection,
     gatepasses_collection,
-    returns_collection,
 )
+from ..gatepass_balance import load_gate_pass_balance_context
 from ..models import BalanceAdjustmentCreate, BalanceAdjustmentModel, DeliveryBalanceReport
 from ..router_utils import log_audit, parse_object_id
 from ..services import balance_engine as be
@@ -51,58 +51,57 @@ def _serialize_adjustment(doc: dict) -> dict:
     return doc
 
 
-async def _load_gate_pass(gate_pass_id: str):
-    """Fetch and decrypt a non-cancelled gate pass."""
-    oid = parse_object_id(gate_pass_id, "gate pass ID")
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Gate pass not found")
-    if doc.get("status") == "CANCELLED":
+async def _load_context(gate_pass_id: str, *, on_missing: str = "404"):
+    """Load the pass through the ONE shared balance loader.
+
+    This module used to carry its own copy of the aggregation — deliveries,
+    returns and corrections loaded and summed by hand. Every hand-rolled copy
+    drifted from the engine in a different way (this one silently ignored the
+    legacy note-closure flag, so a correction could be accepted against a
+    balance the delivery endpoint would not agree with). There is now a single
+    loader and this route goes through it.
+
+    ``on_missing`` picks the right answer for a pass that cannot be read: a
+    create names the pass up front, so "not found" is a plain 404. The void and
+    report paths are about an adjustment or delivery that already exists, so a
+    pass that has since gone away is a conflict on that record, not a 404 that
+    would send the client looking for the wrong thing.
+    """
+    if not gate_pass_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This correction is not linked to a gate pass, so its balance "
+                "can no longer be recalculated. Re-create it from the gate pass "
+                "it belongs to."
+            ),
+        )
+    try:
+        return await load_gate_pass_balance_context(gate_pass_id)
+    except HTTPException as exc:
+        if on_missing == "404":
+            raise
+        if exc.status_code == 404:
+            raise HTTPException(
+                status_code=409,
+                detail="The gate pass this record belongs to no longer exists.",
+            ) from exc
+        if exc.status_code == 400:
+            raise HTTPException(
+                status_code=409,
+                detail="The gate pass this record belongs to has an unreadable ID.",
+            ) from exc
+        raise
+
+
+async def _load_writable_context(gate_pass_id: str):
+    """Shared loader plus the cancelled-pass guard for anything that writes."""
+    ctx = await _load_context(gate_pass_id, on_missing="404")
+    if ctx.gate_pass.get("status") == "CANCELLED":
         raise HTTPException(
             status_code=409, detail="Cannot adjust the balance of a cancelled gate pass."
         )
-    return oid, decrypt_dict(doc, GP_SENSITIVE_FIELDS)
-
-
-async def _gate_pass_context(gate_pass_id: str):
-    """Load a gate pass plus its delivered / returned / adjusted item maps.
-
-    Returns ``(gp_oid, gp_decrypted, delivered_by_item, returned_by_item,
-    balance_adjustment_by_item, adjustment_docs, deliveries)`` so no caller has
-    to re-implement the aggregation. ``deliveries`` is the decrypted list
-    itself, which the print report needs in order to establish sequence.
-    """
-    gp_oid, gp_dec = await _load_gate_pass(gate_pass_id)
-
-    deliveries: List[dict] = []
-    async for dl in deliveries_collection.find(
-        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
-    ):
-        try:
-            deliveries.append(decrypt_dict(dl, DELIVERY_SENSITIVE_FIELDS))
-        except Exception:
-            continue
-
-    returns: List[dict] = []
-    async for rt in returns_collection.find({"gate_pass_id": gate_pass_id}):
-        try:
-            returns.append(decrypt_dict(rt, GP_SENSITIVE_FIELDS))
-        except Exception:
-            continue
-
-    adjustment_docs: List[dict] = []
-    async for adj in balance_adjustments_collection.find({"gate_pass_id": gate_pass_id}):
-        adjustment_docs.append(adj)
-
-    return (
-        gp_oid,
-        gp_dec,
-        be.compute_delivered_by_item(deliveries),
-        be.compute_returned_by_item(returns),
-        be.compute_balance_adjustments_by_item(adjustment_docs),
-        adjustment_docs,
-        deliveries,
-    )
+    return ctx
 
 
 @router.post(
@@ -130,23 +129,14 @@ async def post_balance_adjustment(
     if existing:
         return _serialize_adjustment(existing)
 
-    (
-        gp_oid,
-        gp_dec,
-        delivered_by_item,
-        returned_by_item,
-        _,
-        adjustment_docs,
-        _deliveries,
-    ) = await _gate_pass_context(payload.gate_pass_id)
+    ctx = await _load_writable_context(payload.gate_pass_id)
+    gp_oid = ctx.gate_pass_oid
+    gp_dec = ctx.gate_pass
 
     # The item must actually exist on the gate pass, otherwise the correction
     # would sit against nothing and silently never show up on a balance.
     target_key = be.item_key(payload.item_name, payload.specification)
-    if not any(
-        be.item_key(it.get("item_name", ""), it.get("specification")) == target_key
-        for it in gp_dec.get("items", [])
-    ):
+    if target_key not in ctx.balance["items"]:
         raise HTTPException(
             status_code=404,
             detail=(
@@ -158,22 +148,40 @@ async def post_balance_adjustment(
 
     delivery_id = payload.delivery_id
     if delivery_id:
-        parse_object_id(delivery_id, "delivery ID")
-        dl = await deliveries_collection.find_one({"_id": parse_object_id(delivery_id, "delivery ID")})
+        delivery_oid = parse_object_id(delivery_id, "delivery ID")
+        dl = await deliveries_collection.find_one({"_id": delivery_oid})
         if not dl:
             raise HTTPException(status_code=404, detail="Delivery record not found")
+        if dl.get("status") == "CANCELLED":
+            raise HTTPException(
+                status_code=409,
+                detail="That delivery was cancelled, so it cannot carry a balance correction.",
+            )
         if dl.get("gate_pass_id") != payload.gate_pass_id:
             raise HTTPException(
                 status_code=400,
                 detail="That delivery belongs to a different gate pass.",
             )
 
-    before = be.compute_gate_pass_balance(
-        gp_dec.get("items", []),
-        delivered_by_item,
-        returned_by_item,
-        balance_adjustment_by_item=be.compute_balance_adjustments_by_item(adjustment_docs),
-    )["items"].get(target_key, {}).get("outstanding_delivery_qty", 0)
+    before = int(
+        ctx.balance["items"].get(target_key, {}).get("outstanding_delivery_qty", 0) or 0
+    )
+
+    # A debit can only ever remove outstanding pieces, and the balance is
+    # clamped at zero. Posting one against an item that already has nothing
+    # outstanding therefore records a correction that can never move a single
+    # figure: it shows on the note, it can be voided, and it is a permanent lie
+    # about the balance. Refuse it and say what to do instead, rather than
+    # accepting a no-op the operator will believe was applied.
+    if payload.quantity < 0 and before == 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"'{payload.item_name}' has no outstanding balance to reduce, so a "
+                "debit correction would change nothing. Post a credit (a reason "
+                "that adds pieces) instead, or void an existing correction."
+            ),
+        )
 
     now = datetime.now(timezone.utc)
     adj_doc = {
@@ -197,10 +205,11 @@ async def post_balance_adjustment(
     # PARTIALLY_DELIVERED instead of leaving a false DELIVERED.
     balance_after = be.compute_gate_pass_balance(
         gp_dec.get("items", []),
-        delivered_by_item,
-        returned_by_item,
+        ctx.delivered_by_item,
+        ctx.returned_by_item,
+        marked_delivered=bool(gp_dec.get("marked_delivered")),
         balance_adjustment_by_item=be.compute_balance_adjustments_by_item(
-            adjustment_docs + [adj_doc]
+            ctx.adjustment_docs + [adj_doc]
         ),
     )
     new_status = be.derive_gate_pass_status(
@@ -266,8 +275,16 @@ async def list_balance_adjustments(
     delivery_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     current_user: dict = Depends(require_capability("delivery:read")),
+    *,
+    skip: int = Query(0, ge=0),
+    limit: Optional[int] = Query(None, ge=1, le=500),
 ):
-    """GET /balance-adjustments — newest first, optionally scoped."""
+    """GET /balance-adjustments — newest first, optionally scoped.
+
+    ``skip``/``limit`` are optional so an unscoped call still returns the whole
+    history, but a caller that only needs the newest page can bound the read
+    instead of pulling every correction ever posted.
+    """
     query: dict = {}
     if gate_pass_id:
         query["gate_pass_id"] = gate_pass_id
@@ -276,8 +293,25 @@ async def list_balance_adjustments(
     if status_filter:
         query["status"] = status_filter
 
+    # `created_at` alone is not a total order: two corrections posted inside the
+    # same millisecond tie, and Mongo is then free to return them in either
+    # order. On a paged read that silently repeats or skips a row, and the UI can
+    # show the same correction twice. `_id` is monotonic, so it breaks the tie.
+    cursor = (
+        balance_adjustments_collection.find(query)
+        .sort([("created_at", -1), ("_id", -1)])
+    )
+
+    # Coerced rather than trusted: when this function is called directly the
+    # "defaults" are still the raw Query marker objects, not the values.
+    skip_n = int(skip) if isinstance(skip, int) else 0
+    limit_n = int(limit) if isinstance(limit, int) else None
+    if skip_n:
+        cursor = cursor.skip(skip_n)
+    if limit_n:
+        cursor = cursor.limit(limit_n)
     out: List[dict] = []
-    async for doc in balance_adjustments_collection.find(query).sort("created_at", -1):
+    async for doc in cursor:
         out.append(_serialize_adjustment(dict(doc)))
     return out
 
@@ -304,28 +338,14 @@ async def void_balance_adjustment(
     # crediting a client reopened a closed pass, and voiding that credit must
     # close it again. Without this the pass stays stuck on the status the
     # correction produced.
-    (
-        gp_oid,
-        gp_dec,
-        delivered_by_item,
-        returned_by_item,
-        _,
-        adjustment_docs,
-        _deliveries,
-    ) = await _gate_pass_context(doc.get("gate_pass_id") or "")
+    ctx = await _load_context(doc.get("gate_pass_id") or "", on_missing="409")
+    gp_oid = ctx.gate_pass_oid
+    gp_dec = ctx.gate_pass
+    marked = bool(gp_dec.get("marked_delivered"))
 
     target_key = be.item_key(doc.get("item_name", ""), doc.get("specification"))
-    before = (
-        be.compute_gate_pass_balance(
-            gp_dec.get("items", []),
-            delivered_by_item,
-            returned_by_item,
-            balance_adjustment_by_item=be.compute_balance_adjustments_by_item(
-                adjustment_docs
-            ),
-        )["items"]
-        .get(target_key, {})
-        .get("outstanding_delivery_qty", 0)
+    before = int(
+        ctx.balance["items"].get(target_key, {}).get("outstanding_delivery_qty", 0) or 0
     )
 
     now = datetime.now(timezone.utc)
@@ -341,11 +361,12 @@ async def void_balance_adjustment(
         },
     )
 
-    remaining = [a for a in adjustment_docs if str(a.get("_id")) != str(oid)]
+    remaining = [a for a in ctx.adjustment_docs if str(a.get("_id")) != str(oid)]
     balance_after = be.compute_gate_pass_balance(
         gp_dec.get("items", []),
-        delivered_by_item,
-        returned_by_item,
+        ctx.delivered_by_item,
+        ctx.returned_by_item,
+        marked_delivered=marked,
         balance_adjustment_by_item=be.compute_balance_adjustments_by_item(remaining),
     )
     after = balance_after["items"].get(target_key, {}).get("outstanding_delivery_qty", 0)
@@ -428,26 +449,19 @@ async def delivery_balance_report(
 
     delivery = decrypt_dict(dl_doc, DELIVERY_SENSITIVE_FIELDS)
     gate_pass_id = delivery.get("gate_pass_id") or ""
-    (
-        _,
-        gp_dec,
-        _delivered_by_item,
-        returned_by_item,
-        _balance_adjustment_by_item,
-        adjustment_docs,
-        all_deliveries,
-    ) = await _gate_pass_context(gate_pass_id)
+    ctx = await _load_context(gate_pass_id, on_missing="409")
+    gp_dec = ctx.gate_pass
 
     # The note is a statement about the running sequence as of THIS delivery,
     # so later deliveries and the corrections attached to them are excluded.
-    ordered = be.order_deliveries(all_deliveries, delivery_id)
+    ordered = be.order_deliveries(ctx.deliveries, delivery_id)
 
     report = be.compute_delivery_balance_report(
         gp_dec.get("items", []),
         delivery,
         ordered,
-        returned_by_item,
-        adjustment_docs,
+        ctx.returned_by_item,
+        ctx.adjustment_docs,
     )
 
     return {
