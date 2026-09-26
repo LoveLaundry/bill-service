@@ -16,6 +16,7 @@ from ..database.main_db import (
     bills_collection,
     deliveries_collection,
     gatepasses_collection,
+    returns_collection,
 )
 from ..services import balance_engine as be
 
@@ -76,10 +77,19 @@ async def reconciliation_issues(
         async for adj_doc in balance_adjustments_collection.find({"gate_pass_id": gp_id}):
             adjustments.append(adj_doc)
 
+        # Returns live on their own collection keyed by the pass they were
+        # raised on. They used to be dropped here, so a piece the client handed
+        # back still counted as outstanding and the pass got flagged for an
+        # issue it did not have.
+        return_docs = []
+        return_cursor = returns_collection.find({"gate_pass_id": gp_id})
+        async for ret_doc in return_cursor:
+            return_docs.append(ret_doc)
+
         balance = be.compute_gate_pass_balance(
             gp.get("items", []),
             be.compute_delivered_by_item(deliveries),
-            {},
+            be.compute_returned_by_item(return_docs),
             marked_delivered=bool(gp.get("marked_delivered")),
             balance_adjustment_by_item=be.compute_balance_adjustments_by_item(
                 adjustments
