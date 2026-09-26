@@ -355,3 +355,25 @@ def test_detect_issues_bill_exceeds_received():
     issues = {i["code"] for i in be.detect_reconciliation_issues(bal, "RECEIVED", False, {"Duvet Cover": 45})}
     assert "SHORT_RECEIVED" in issues
     assert "BILL_EXCEEDS_RECEIVED" in issues
+
+
+def test_detect_issues_counts_returns_so_a_handback_is_flagged_as_unclosed():
+    """A returned piece is back with us and still owed to the client, so a
+    pass closed as DELIVERED with a hand-back outstanding is not really
+    closed. The reconciliation screen used to pass {} for returns, which
+    under-reported outstanding and hid the issue entirely."""
+    gp = [_gp_item("Towel", 10, 10)]
+    deliveries = [_delivery([_del_item("Towel", 10)])]
+
+    with_returns = _balance(
+        gp, deliveries=deliveries, returns=[{"items": [_return_item("Towel", 4)]}]
+    )
+    assert with_returns["totals"]["outstanding_delivery_qty"] == 4
+    issues = {i["code"] for i in be.detect_reconciliation_issues(with_returns, "DELIVERED", False)}
+    assert "CLOSED_WITH_OUTSTANDING" in issues
+
+    # Dropping the returns — what the endpoint used to do — hides it.
+    blind = be.compute_gate_pass_balance(gp, be.compute_delivered_by_item(deliveries), {})
+    assert blind["totals"]["outstanding_delivery_qty"] == 0
+    blind_issues = {i["code"] for i in be.detect_reconciliation_issues(blind, "DELIVERED", False)}
+    assert "CLOSED_WITH_OUTSTANDING" not in blind_issues
