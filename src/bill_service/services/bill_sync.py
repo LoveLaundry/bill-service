@@ -26,7 +26,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ..crypto_helper import decrypt_dict, encrypt_dict
-from ..database.main_db import audit_collection, bills_collection, deliveries_collection
+from ..database.main_db import (
+    audit_collection,
+    bills_collection,
+    deliveries_collection,
+    gatepasses_collection,
+)
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services.transaction_events import (
     build_item_delta,
@@ -36,9 +41,33 @@ from ..services.transaction_events import (
 from ..services.verification_service import attach_verification_to
 
 BILL_SENSITIVE_FIELDS = ["client_name", "quotation_title", "notes", "items"]
+GATEPASS_SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 
 # payment_status values that may never be auto-rewritten.
 NON_EDITABLE_STATUSES = ("PAID", "CANCELLED")
+
+
+def _object_id_or_none(value):
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    try:
+        return ObjectId(value)
+    except (InvalidId, TypeError):
+        return None
+
+
+def _bill_gate_pass_ids(bill: dict, current_gp_id: str, delivery_to_gp: dict) -> set:
+    """Every gate pass feeding this bill except the one being corrected."""
+    gids = set()
+    linked = bill.get("gate_pass_id")
+    if linked and str(linked) != str(current_gp_id):
+        gids.add(str(linked))
+    for did in bill.get("delivery_ids", []) or []:
+        gp_id = delivery_to_gp.get(str(did))
+        if gp_id and str(gp_id) != str(current_gp_id):
+            gids.add(str(gp_id))
+    return gids
 
 
 def _snapshot_received(gp_items: list[dict]) -> dict:
@@ -166,10 +195,40 @@ async def sync_bills_to_gate_pass(
     outcomes = []
 
     delivery_ids = []
+    delivery_to_gp: dict[str, str] = {}
     async for d in deliveries_collection.find(
         {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
     ):
         delivery_ids.append(str(d["_id"]))
+
+    # A bill line is the SUM of what every gate pass feeding that bill received.
+    # Clamping it to this one pass's quantity silently deleted the other passes'
+    # pieces -- including the whole line when the item belonged to another pass
+    # entirely. Resolve each bill's full set of gate passes before clamping.
+    async for d in deliveries_collection.find(
+        {"status": {"$ne": "CANCELLED"}, "gate_pass_id": {"$ne": gate_pass_id}}
+    ):
+        delivery_to_gp[str(d["_id"])] = str(d.get("gate_pass_id"))
+
+    other_gp_cache: dict[str, dict] = {}
+
+    async def _other_received(gp_id: str) -> dict:
+        """Received-by-name totals for one OTHER gate pass on this bill."""
+        if gp_id in other_gp_cache:
+            return other_gp_cache[gp_id]
+        totals: dict = {}
+        doc = await gatepasses_collection.find_one({"gate_pass_id": gp_id}) or await (
+            gatepasses_collection.find_one({"_id": _object_id_or_none(gp_id)})
+        )
+        if doc:
+            try:
+                totals = _snapshot_received(
+                    decrypt_dict(doc, GATEPASS_SENSITIVE_FIELDS).get("items", [])
+                )
+            except Exception:
+                totals = {}
+        other_gp_cache[gp_id] = totals
+        return totals
 
     billed_filter: dict = {
         "payment_status": {"$ne": "CANCELLED"},
@@ -190,12 +249,23 @@ async def sync_bills_to_gate_pass(
         new_items: list[dict] = []
         missing_on_bill: list[str] = []
 
+        # Everything this bill's line is allowed to be, across all of its passes.
+        other_totals: dict = {}
+        for other_gp_id in _bill_gate_pass_ids(dec, gate_pass_id, delivery_to_gp):
+            for other_name, other_rec in (await _other_received(other_gp_id)).items():
+                other_totals[other_name] = other_totals.get(other_name, 0) + other_rec[
+                    "received_qty"
+                ]
+
         for old in old_items:
             name = old.get("item_name", "")
             spec = old.get("specification")
             old_qty = int(old.get("quantity", 0) or 0)
             rec = received.get(name)
-            new_qty = min(old_qty, rec["received_qty"]) if rec is not None else 0
+            allowance = (rec["received_qty"] if rec is not None else 0) + other_totals.get(
+                name, 0
+            )
+            new_qty = min(old_qty, allowance)
             if new_qty != old_qty:
                 deltas.append(build_item_delta(name, spec, old_qty, new_qty))
             if new_qty <= 0:

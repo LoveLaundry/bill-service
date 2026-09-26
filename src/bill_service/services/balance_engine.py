@@ -140,7 +140,30 @@ def compute_gate_pass_balance(
     if marked_delivered:
         gp_flags.append("MARKED_DELIVERED_LEGACY")
 
+    # Two rows can share a name+spec (a second batch of the same item). Their
+    # quantities ADD UP: keying straight into `items` let the last row overwrite
+    # the earlier ones, so received pieces silently vanished from every balance,
+    # print note and status derivation. Fold them into one row instead.
+    merged: List[dict] = []
+    merged_at: Dict[str, dict] = {}
     for it in gp_items:
+        name = it.get("item_name", "")
+        spec = it.get("specification")
+        key = item_key(name, spec)
+        existing = merged_at.get(key)
+        if existing is None:
+            copy = dict(it)
+            merged.append(copy)
+            merged_at[key] = copy
+            continue
+        for field in ("client_qty", "received_qty", "rejected_qty"):
+            existing[field] = int(existing.get(field, 0) or 0) + int(it.get(field, 0) or 0)
+        # A re-wash tag is a property of the batch, so one flagged row keeps the
+        # merged row flagged rather than hiding a free re-wash.
+        if is_rewashed(it):
+            existing["rewashed"] = True
+
+    for it in merged:
         name = it.get("item_name", "")
         spec = it.get("specification")
         key = item_key(name, spec)

@@ -40,6 +40,7 @@ COLLECTION_NAMES = [
 
 # Modules whose module-level collection bindings must point at the mock.
 DEPENDENT_MODULES = [
+    "bill_service.gatepass_balance",
     "bill_service.repositories.entity_registry",
     "bill_service.repositories.main_repository",
     "bill_service.repositories.secondary_repository",

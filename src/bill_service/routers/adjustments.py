@@ -161,6 +161,115 @@ async def approve_adjustment(
             detail="Adjustments must be approved by a different user than the requester.",
         )
 
+    # Claim the request BEFORE changing anything.
+    #
+    # The status was only read above, so two supervisors pressing Approve at the
+    # same time both saw REQUESTED, both rewrote the gate pass, and both appended
+    # to the history -- the correction was applied twice. A conditional update
+    # lets exactly one of them win; the loser is told it is already approved.
+    now = datetime.now(timezone.utc)
+    claimed = await adjustments_collection.find_one_and_update(
+        {"_id": oid, "status": "REQUESTED"},
+        {
+            "$set": {
+                "status": "APPROVING",
+                "approving_started_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    if claimed is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This adjustment is already being approved by someone else.",
+        )
+
+    try:
+        gp_oid, gp_dec, updated_items, original_qty, history = await _apply_approved_correction(
+            oid, adj_doc, current_user
+        )
+    except HTTPException:
+        # Nothing was written, so hand the request back for someone else to try.
+        await adjustments_collection.update_one(
+            {"_id": oid, "status": "APPROVING"},
+            {"$set": {"status": "REQUESTED", "updated_at": datetime.now(timezone.utc)}},
+        )
+        raise
+
+    encrypted_gp = encrypt_dict(gp_dec, SENSITIVE_FIELDS)
+    await gatepasses_collection.replace_one({"_id": gp_oid}, encrypted_gp)
+
+    # Automatic propagation: any linked, still-editable bill is re-clamped to
+    # the corrected received quantities; paid bills are flagged, never rewritten.
+    #
+    # A failure here used to be logged and swallowed, and the response still
+    # said APPROVED -- so the correction was on the gate pass, the request was
+    # closed, and the bills silently disagreed with it. The outcome is now
+    # recorded on the request and reported to the caller.
+    bill_sync = "OK"
+    try:
+        await sync_bills_to_gate_pass(
+            str(gp_oid),
+            updated_items,
+            user_id=current_user.get("auth_id", "system"),
+            user_name=current_user.get("user_name"),
+            reason=adj_doc.get("reason"),
+        )
+    except Exception:
+        import logging
+
+        bill_sync = "FAILED"
+        logging.getLogger("bill_service").exception(
+            "bill_sync failed after adjustment approval %s", oid
+        )
+
+    await adjustments_collection.update_one(
+        {"_id": oid},
+        {
+            "$set": {
+                "status": "APPROVED",
+                "approved_by": current_user.get("user_name", ""),
+                "approved_by_id": current_user.get("auth_id", ""),
+                "approved_at": now,
+                "bill_sync": bill_sync,
+                "updated_at": now,
+            }
+        },
+    )
+
+    await record_event(
+        entity_type="adjustment",
+        entity_id=str(oid),
+        event_type=EVENT_ADJUSTMENT_APPROVED,
+        gate_pass_id=str(gp_oid),
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        reason=adj_doc.get("reason"),
+        item_deltas=[
+            build_item_delta(
+                adj_doc["item_name"],
+                adj_doc.get("specification"),
+                original_qty,
+                int(adj_doc.get("corrected_qty", 0) or 0),
+            )
+        ],
+        meta={
+            "approved_by": current_user.get("user_name", ""),
+            "bill_sync": bill_sync,
+        },
+    )
+
+    response = {"id": str(oid), "status": "APPROVED", "gate_pass_id": str(gp_oid)}
+    if bill_sync == "FAILED":
+        response["bill_sync"] = (
+            "FAILED: the correction is recorded, but the linked bill could not be "
+            "re-calculated. Re-run bill sync for this gate pass before invoicing."
+        )
+    return response
+
+
+async def _apply_approved_correction(oid, adj_doc, current_user):
+    """Build the corrected gate pass. Raises before any write if it no longer applies."""
     gp_oid, gp_dec = await _get_open_gp(adj_doc["gate_pass_id"])
     updated_items, original_qty = be.apply_received_correction(
         gp_dec.get("items", []),
@@ -215,59 +324,7 @@ async def approve_adjustment(
         new_gp.get("status", "RECEIVED"),
     )
 
-    encrypted_gp = encrypt_dict(new_gp, SENSITIVE_FIELDS)
-    await gatepasses_collection.replace_one({"_id": gp_oid}, encrypted_gp)
-
-    # Automatic propagation: any linked, still-editable bill is re-clamped to
-    # the corrected received quantities; paid bills are flagged, never rewritten.
-    try:
-        await sync_bills_to_gate_pass(
-            str(gp_oid),
-            updated_items,
-            user_id=current_user.get("auth_id", "system"),
-            user_name=current_user.get("user_name"),
-            reason=adj_doc.get("reason"),
-        )
-    except Exception:
-        import logging
-        logging.getLogger("bill_service").exception(
-            "bill_sync failed after adjustment approval %s", oid
-        )
-
-    await adjustments_collection.update_one(
-        {"_id": oid},
-        {
-            "$set": {
-                "status": "APPROVED",
-                "approved_by": current_user.get("user_name", ""),
-                "approved_by_id": current_user.get("auth_id", ""),
-                "approved_at": now,
-                "updated_at": now,
-            }
-        },
-    )
-
-    await record_event(
-        entity_type="adjustment",
-        entity_id=str(oid),
-        event_type=EVENT_ADJUSTMENT_APPROVED,
-        gate_pass_id=str(gp_oid),
-        user_id=current_user.get("auth_id", "system"),
-        user_name=current_user.get("user_name"),
-        reason=adj_doc.get("reason"),
-        item_deltas=[
-            build_item_delta(
-                adj_doc["item_name"],
-                adj_doc.get("specification"),
-                original_qty,
-                int(adj_doc.get("corrected_qty", 0) or 0),
-            )
-        ],
-        meta={"approved_by": current_user.get("user_name", "")},
-    )
-
-    return {"id": str(oid), "status": "APPROVED", "gate_pass_id": str(gp_oid)}
-
+    return gp_oid, new_gp, updated_items, original_qty, history
 
 @router.post("/{adjustment_id}/reject")
 async def reject_adjustment(
@@ -281,8 +338,10 @@ async def reject_adjustment(
             detail=f"Adjustment is already {adj_doc.get('status')}.",
         )
     now = datetime.now(timezone.utc)
-    await adjustments_collection.update_one(
-        {"_id": oid},
+    # Conditional, for the same reason approval is: a reject that lost the race
+    # to an approval must not overwrite the approved outcome.
+    result = await adjustments_collection.update_one(
+        {"_id": oid, "status": "REQUESTED"},
         {
             "$set": {
                 "status": "REJECTED",
@@ -292,6 +351,12 @@ async def reject_adjustment(
             }
         },
     )
+    if result.modified_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail="This adjustment is no longer awaiting a decision.",
+        )
+
     await record_event(
         entity_type="adjustment",
         entity_id=str(oid),

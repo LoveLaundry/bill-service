@@ -27,6 +27,10 @@ from ..services.transaction_events import (
     EVENT_RECEIVING_EDITED,
     EVENT_STATUS_CHANGED,
 )
+from ..gatepass_balance import (
+    load_gate_pass_balance_context,
+    outstanding_for,
+)
 from ..services.verification_service import attach_verification_to
 from ..models import (
     GatePassAdjustment,
@@ -43,6 +47,37 @@ from .adjustments import create_adjustment_request
 router = APIRouter(prefix="/gatepasses", tags=["gatepasses"])
 
 SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+
+
+def _reject_duplicate_items(items) -> None:
+    """Refuse two rows for the same item on one gate pass.
+
+    A name+spec pair identifies an item. Two rows for it used to be accepted
+    and stored, and every keyed balance, print note and status derivation then
+    had one of them win arbitrarily -- so received pieces could disappear from
+    the books with nothing on screen saying why. Operators who mean two batches
+    of the same item should record one row with the combined quantity.
+    """
+    from ..services import balance_engine as be
+
+    seen = set()
+    for item in items:
+        name = getattr(item, "item_name", None) or item.get("item_name", "")
+        spec = getattr(item, "specification", None)
+        if spec is None and isinstance(item, dict):
+            spec = item.get("specification")
+        key = be.item_key(name, spec)
+        if key in seen:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"'{name}'"
+                    + (f" ({spec})" if spec else "")
+                    + " is listed more than once. Combine the quantities into a "
+                    "single row so the balance stays unambiguous."
+                ),
+            )
+        seen.add(key)
 
 
 def _serialize(doc: dict) -> dict:
@@ -106,6 +141,8 @@ async def create_gate_pass(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Gate Pass number already exists",
         )
+
+    _reject_duplicate_items(payload.items)
 
     # Process items and calculate differences
     processed_items = []
@@ -239,47 +276,9 @@ async def get_gate_pass_balance(
     """
     from ..services import balance_engine as be
 
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
-    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
-
-    deliveries: List[dict] = []
-    dl_cursor = deliveries_collection.find(
-        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
-    )
-    async for dl_doc in dl_cursor:
-        try:
-            deliveries.append(decrypt_dict(dl_doc, SENSITIVE_FIELDS))
-        except Exception:
-            continue
-
-    returns: List[dict] = []
-    ret_cursor = returns_collection.find({"gate_pass_id": gate_pass_id})
-    async for ret_doc in ret_cursor:
-        try:
-            returns.append(decrypt_dict(ret_doc, SENSITIVE_FIELDS))
-        except Exception:
-            continue
-
-    balance_adjustments: List[dict] = []
-    adj_cursor = balance_adjustments_collection.find({"gate_pass_id": gate_pass_id})
-    async for adj_doc in adj_cursor:
-        balance_adjustments.append(adj_doc)
-
-    balance = be.compute_gate_pass_balance(
-        decrypted.get("items", []),
-        be.compute_delivered_by_item(deliveries),
-        be.compute_returned_by_item(returns),
-        marked_delivered=bool(decrypted.get("marked_delivered")),
-        balance_adjustment_by_item=be.compute_balance_adjustments_by_item(
-            balance_adjustments
-        ),
-    )
-
+    ctx = await load_gate_pass_balance_context(gate_pass_id)
+    decrypted = ctx.gate_pass
+    balance = ctx.balance
     derived_status = be.derive_gate_pass_status(balance, decrypted.get("status", ""))
 
     return {
@@ -467,49 +466,41 @@ async def catch_up_delivery(
             ),
         )
 
-    # Load existing deliveries to validate the catch-up quantities per item.
-    existing_deliveries: List[dict] = []
-    dl_cursor = deliveries_collection.find(
-        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
-    )
-    async for dl_doc in dl_cursor:
-        try:
-            existing_deliveries.append(decrypt_dict(dl_doc, SENSITIVE_FIELDS))
-        except Exception:
-            continue
-
-    delivered_map = be.compute_delivered_by_item(existing_deliveries)
-    received_map: Dict[str, int] = {}
-    for it in decrypted.get("items", []):
-        key = be.item_key(it["item_name"], it.get("specification"))
-        received_map[key] = received_map.get(key, 0) + it["received_qty"]
+    # Validate against the same engine balance the rest of the app uses. This
+    # used to compute received-minus-delivered here, which ignored returns and
+    # corrections: pieces the client had sent BACK could not be recorded as
+    # re-delivered through the one flow that exists for re-delivering them.
+    ctx = await load_gate_pass_balance_context(gate_pass_id)
+    existing_deliveries = ctx.deliveries
 
     now = datetime.now(timezone.utc)
     delivered_date = payload.delivered_date or now
     if delivered_date.tzinfo is None:
         delivered_date = delivered_date.replace(tzinfo=timezone.utc)
 
-    # Validate quantities against available balance (received - already delivered).
+    # Validate quantities against the engine's outstanding, accumulating lines
+    # so repeated rows for one item cannot add up past the balance.
     item_records = []
+    claimed: Dict[str, int] = {}
     for item in payload.items:
         key = be.item_key(item.item_name, item.specification)
-        received = received_map.get(key, 0)
-        if received <= 0:
+        if key not in ctx.balance["items"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"'{item.item_name}' was never received on this gate pass.",
             )
-        already = delivered_map.get(key, 0)
-        remaining = max(0, received - already)
-        if item.quantity > remaining:
+        outstanding, received, already = outstanding_for(ctx, item.item_name, item.specification)
+        available = max(0, outstanding - claimed.get(key, 0))
+        if item.quantity > available:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Catch-up quantity {item.quantity} for '{item.item_name}' "
-                    f"exceeds available {remaining} (received {received}, already "
+                    f"exceeds available {available} (received {received}, already "
                     f"delivered {already})."
                 ),
             )
+        claimed[key] = claimed.get(key, 0) + item.quantity
         item_records.append(
             {"item_name": item.item_name, "specification": item.specification, "quantity": item.quantity}
         )
@@ -533,17 +524,11 @@ async def catch_up_delivery(
 
     # Derive new gate pass status from the recorded quantities.
     delivered_map = be.compute_delivered_by_item(existing_deliveries + [delivery_doc])
-    existing_adjustments: List[dict] = []
-    async for adj_doc in balance_adjustments_collection.find({"gate_pass_id": gate_pass_id}):
-        existing_adjustments.append(adj_doc)
     balance = be.compute_gate_pass_balance(
         decrypted.get("items", []),
         delivered_map,
-        {},
-        marked_delivered=False,
-        balance_adjustment_by_item=be.compute_balance_adjustments_by_item(
-            existing_adjustments
-        ),
+        ctx.returned_by_item,
+        balance_adjustment_by_item=ctx.balance_adjustment_by_item,
     )
     new_gp_status = be.derive_gate_pass_status(balance, current_status)
 
@@ -816,6 +801,7 @@ async def update_gate_pass(
         # Quantities are controlled: received/client quantities may never be
         # rewritten once deliveries or returns exist — use the adjustment flow.
         if "items" in update_data and update_data["items"]:
+            _reject_duplicate_items(update_data["items"])
             has_movement = (
                 await deliveries_collection.count_documents(
                     {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}

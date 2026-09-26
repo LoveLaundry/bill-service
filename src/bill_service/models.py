@@ -114,7 +114,10 @@ class GatePassAdjustmentRequest(BaseModel):
     gate_pass_id: str
     item_name: str
     specification: Optional[str] = None
-    corrected_qty: int = Field(ge=0)
+    # A correction replaces a count, so it has to actually change something.
+    # Accepting 0 let an operator "correct" a quantity to nothing via a request
+    # that passed validation and then sat in the approval queue.
+    corrected_qty: int = Field(gt=0)
     reason: str = Field(min_length=1, description="Reason is mandatory")
 
 

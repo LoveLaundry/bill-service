@@ -14,6 +14,11 @@ from ..database.main_db import (
     returns_collection,
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
+from ..gatepass_balance import (
+    load_gate_pass_balance_context,
+    outstanding_for,
+)
+from ..services import balance_engine as be
 from ..services import idempotency
 from ..services.transaction_events import (
     build_item_delta,
@@ -80,50 +85,36 @@ async def create_delivery(
 
     gp_oid = _parse_object_id(payload.gate_pass_id)
 
-    # 1. Fetch and decrypt Gate Pass
-    gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
-    if not gp_doc:
+    # 1. The balance, from the one engine every other surface uses.
+    #
+    # This used to be re-derived here from received-minus-delivered, which was
+    # wrong in both directions: it ignored pieces the client sent BACK and
+    # balance corrections, so returning laundry made those pieces look
+    # undeliverable, and a debit correction still let the operator send pieces
+    # the ledger said were never owed.
+    ctx = await load_gate_pass_balance_context(payload.gate_pass_id)
+
+    # A cancelled pass has no live balance. Delivering against one would put
+    # pieces on the books of a pass that was written off.
+    gp_status = ctx.gate_pass.get("status")
+    if gp_status == "CANCELLED":
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Referenced Gate Pass not found"
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This gate pass is cancelled, so nothing can be delivered against it.",
         )
 
-    try:
-        gp_decrypted = decrypt_dict(gp_doc, GATEPASS_SENSITIVE_FIELDS)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Failed to decrypt Gate Pass: {str(e)}"
-        )
-
-    # Map composite_key (item_name + specification) -> actual received quantity
-    def _item_key(name: str, spec: str | None) -> str:
-        return f"{name}||{spec or ''}"
-
-    received_map: dict[str, int] = {}
-    for gp_item in gp_decrypted.get("items", []):
-        key = _item_key(gp_item["item_name"], gp_item.get("specification"))
-        received_map[key] = received_map.get(key, 0) + gp_item["received_qty"]
-
-    # 2. Query previous deliveries for this Gate Pass
-    prev_deliveries_cursor = deliveries_collection.find(
-        {"gate_pass_id": payload.gate_pass_id, "status": {"$ne": "CANCELLED"}}
-    )
-    delivered_map: dict[str, int] = {}
-    async for prev_del_doc in prev_deliveries_cursor:
-        try:
-            prev_decrypted = decrypt_dict(prev_del_doc, SENSITIVE_FIELDS)
-        except Exception:
-            continue
-        for prev_item in prev_decrypted.get("items", []):
-            key = _item_key(prev_item["item_name"], prev_item.get("specification"))
-            delivered_map[key] = delivered_map.get(key, 0) + prev_item["quantity"]
-
-    # 3. Validate new delivery quantities against available balance
+    # 2. Validate against the outstanding balance.
+    #
+    # Quantities are accumulated per item as they are checked. Validating each
+    # line independently against the same available figure let one delivery
+    # carry several lines of the same item and exceed the balance in total.
     new_delivery_items = []
+    claimed: dict[str, int] = {}
     for item in payload.items:
-        key = _item_key(item.item_name, item.specification)
+        key = be.item_key(item.item_name, item.specification)
         req_qty = item.quantity
 
-        if key not in received_map:
+        if key not in ctx.balance["items"]:
             detail_msg = f"Item '{item.item_name}'"
             if item.specification:
                 detail_msg += f" ({item.specification})"
@@ -133,20 +124,25 @@ async def create_delivery(
                 detail=detail_msg,
             )
 
-        actual_rec = received_map[key]
-        already_del = delivered_map.get(key, 0)
-        available = actual_rec - already_del
+        outstanding, received, already_del = outstanding_for(
+            ctx, item.item_name, item.specification
+        )
+        available = max(0, outstanding - claimed.get(key, 0))
 
         if req_qty > available:
             detail_msg = f"Cannot deliver {req_qty} of '{item.item_name}'"
             if item.specification:
                 detail_msg += f" ({item.specification})"
-            detail_msg += f". Only {available} available (Received: {actual_rec}, Already delivered: {already_del})."
+            detail_msg += (
+                f". Only {available} available"
+                f" (Received: {received}, Already delivered: {already_del})."
+            )
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=detail_msg,
             )
 
+        claimed[key] = claimed.get(key, 0) + req_qty
         new_delivery_items.append(
             {
                 "item_name": item.item_name,
@@ -178,21 +174,24 @@ async def create_delivery(
     await enqueue_sync("delivery", result.inserted_id, new_version)
     serialized = await attach_verification_to("delivery", result.inserted_id, serialized)
 
-    # 5. Check if Gate Pass is now fully delivered
-    # Recalculate combined delivered maps after this successful write
-    updated_delivered_map = delivered_map.copy()
+    # 5. Re-derive the gate-pass status from the engine, including the delivery
+    # that was just written. The old inline check compared delivered against
+    # received and ignored returns and corrections, so a pass whose pieces had
+    # all been returned still read DELIVERED.
+    delivered_after = dict(ctx.delivered_by_item)
     for item in new_delivery_items:
-        key = _item_key(item["item_name"], item.get("specification"))
-        updated_delivered_map[key] = updated_delivered_map.get(key, 0) + item["quantity"]
+        key = be.item_key(item["item_name"], item.get("specification"))
+        delivered_after[key] = delivered_after.get(key, 0) + item["quantity"]
 
-    fully_delivered = True
-    for key, rec_qty in received_map.items():
-        del_qty = updated_delivered_map.get(key, 0)
-        if del_qty < rec_qty:
-            fully_delivered = False
-            break
-
-    new_gp_status = "DELIVERED" if fully_delivered else "PARTIALLY_DELIVERED"
+    balance_after = be.compute_gate_pass_balance(
+        ctx.gate_pass.get("items", []),
+        delivered_after,
+        ctx.returned_by_item,
+        balance_adjustment_by_item=ctx.balance_adjustment_by_item,
+    )
+    new_gp_status = be.derive_gate_pass_status(
+        balance_after, ctx.gate_pass.get("status", "RECEIVED")
+    )
     await gatepasses_collection.update_one(
         {"_id": gp_oid},
         {
@@ -218,9 +217,12 @@ async def create_delivery(
             for item in new_delivery_items
         ],
         reason=payload.notes,
-        prev_status=gp_decrypted.get("status"),
+        prev_status=ctx.gate_pass.get("status"),
         new_status=new_gp_status,
-        meta={"delivery_date": payload.delivery_date.isoformat(), "fully_delivered": fully_delivered},
+        meta={
+            "delivery_date": payload.delivery_date.isoformat(),
+            "fully_delivered": new_gp_status == "DELIVERED",
+        },
     )
 
     await log_audit(
