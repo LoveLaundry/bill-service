@@ -13,6 +13,7 @@ from ..auth_helper import require_capability
 from ..crypto_helper import decrypt_dict
 from ..database.main_db import bills_collection, deliveries_collection, gatepasses_collection
 from ..services import balance_engine as be
+from ..services import operations_context as ctx
 
 router = APIRouter(prefix="/reconciliation", tags=["reconciliation"])
 
@@ -57,20 +58,17 @@ async def reconciliation_issues(
             continue
         gp_id = str(gp_doc["_id"])
 
-        deliveries = []
-        del_cursor = deliveries_collection.find(
-            {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
-        )
-        async for del_doc in del_cursor:
-            try:
-                deliveries.append(decrypt_dict(del_doc, DELIVERY_SENSITIVE_FIELDS))
-            except Exception:
-                continue
-
+        # Per-pass attribution from the shared context. The reconciliation
+        # report is the audit of last resort: it must see exactly the same
+        # ledger the balance screens show, so it can never disagree with them.
+        # A flat per-item sum here (and a document-level gate_pass_id lookup)
+        # made a multi-pass delivery look like an oversell on one pass and an
+        # under-delivery on the other.
+        deliveries, returns = await ctx.load_movements([gp_id])
         balance = be.compute_gate_pass_balance(
             gp.get("items", []),
-            be.compute_delivered_by_item(deliveries),
-            {},
+            ctx.delivered_by_gate_pass(deliveries).get(gp_id, {}),
+            ctx.returned_by_gate_pass(returns).get(gp_id, {}),
             marked_delivered=bool(gp.get("marked_delivered")),
         )
 

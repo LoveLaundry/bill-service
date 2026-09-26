@@ -18,6 +18,8 @@ from ..database.main_db import (
     returns_collection,
     shop_bills_collection,
 )
+from ..services import balance_engine as be
+from ..services import operations_context as ctx
 
 router = APIRouter(tags=["dashboard"])
 
@@ -65,6 +67,25 @@ def _decrypt_shop_bill(doc: dict) -> dict:
 
 def _key(name: str, spec: str = ""):
     return f"{name}||{spec}" if spec else name
+
+
+def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, int]]:
+    """``{gate_pass_id: {item_name: qty}}`` from the canonical engine.
+
+    The legacy report groupings below are keyed by bare item name (no
+    specification), while the engine keys by ``name||spec``. Every one of them
+    used to roll its own loop that bucketed by the delivery's document-level
+    ``gate_pass_id`` — so a delivery drawing from two passes charged all its
+    lines to the primary pass. They now all funnel through the engine and differ
+    only in how they flatten the key.
+    """
+    out: Dict[str, Dict[str, int]] = {}
+    for gp_id, keyed in be.compute_delivered_by_gate_pass(delivery_docs).items():
+        bucket = out.setdefault(gp_id, {})
+        for key, qty in keyed.items():
+            name = be.flatten_name(key)
+            bucket[name] = bucket.get(name, 0) + qty
+    return out
 
 
 async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
@@ -145,39 +166,11 @@ async def get_client_balances(
         gp_docs.append(decced)
         gp_ids.append(decced["id"])
 
-    # deliveries for these GPs
-    delivered_by_gp: Dict[str, Dict[str, int]] = {}
-    dl_cursor = deliveries_collection.find(
-        {"gate_pass_id": {"$in": gp_ids}, "status": {"$ne": "CANCELLED"}}
-    )
-    async for dl_doc in dl_cursor:
-        try:
-            dl = decrypt_dict(dl_doc, SENSITIVE_FIELDS_DEL)
-        except Exception:
-            continue
-        dm = be.compute_delivered_by_item([dl])
-        cur = delivered_by_gp.setdefault(dl["gate_pass_id"], {})
-        for k, v in dm.items():
-            cur[k] = cur.get(k, 0) + v
-
-    # returns on these GPs
-    returned_by_gp: Dict[str, Dict[str, int]] = {}
-    ret_cursor = returns_collection.find({"gate_pass_id": {"$in": gp_ids}})
-    async for ret_doc in ret_cursor:
-        try:
-            try:
-                ret = decrypt_dict(ret_doc, SENSITIVE_FIELDS_GP)
-            except (ValueError, KeyError):
-                ret = ret_doc
-        except Exception:
-            continue
-        gp_id = str(ret.get("gate_pass_id") or "")
-        if not gp_id:
-            continue
-        rm = be.compute_returned_by_item([ret])
-        cur = returned_by_gp.setdefault(gp_id, {})
-        for k, v in rm.items():
-            cur[k] = cur.get(k, 0) + v
+    # Deliveries and returns, attributed per gate pass by the shared context.
+    # This used to be a hand-rolled load-and-group loop that keyed deliveries
+    # off the document-level gate_pass_id, so a delivery spanning two passes
+    # charged all of its lines to the primary pass and starved the other.
+    delivered_by_gp, returned_by_gp = await ctx.movement_maps(gp_ids)
 
     result_gps = []
     totals = {
@@ -221,6 +214,151 @@ async def get_client_balances(
 
 
 # --- 1. Client Dashboard Summary ---
+@router.get(
+    "/dashboard/linen-flow",
+    dependencies=[Depends(require_capability("dashboard:read"))],
+)
+async def get_linen_flow(
+    period: str = Query("all", pattern="^(all|month|quarter|year)$"),
+):
+    """Per-hotel linen flow, with every quantity computed by the balance engine.
+
+    The hotel linen flow screen used to pull *every* gate pass and *every*
+    delivery into the browser and then work out the numbers itself:
+
+        const deliveries = rawDeliveries.filter(d => d.gate_pass_id === gpKey(gp))
+
+    That single line is the multi-pass bug — a delivery drawing from two passes
+    was credited entirely to whichever pass happened to be its primary one — and
+    the surrounding `marked_delivered` special case and `received - delivered`
+    subtotal re-implemented rules the engine already owns, so the screen could
+    disagree with the delivery form. Period filtering also happened client-side,
+    which meant loading the whole collection to draw one quarter.
+
+    The screen now renders exactly what this returns.
+    """
+    cutoff = ""
+    if period != "all":
+        now = datetime.now(timezone.utc)
+        start_month = 0 if period == "year" else (now.month - 1) // 3 * 3
+        cutoff = now.replace(
+            year=now.year, month=start_month + 1, day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+
+    def in_period(value) -> bool:
+        if not cutoff or not value:
+            return True
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value >= cutoff
+        return str(value)[:10] >= cutoff.strftime("%Y-%m-%d")
+
+    gp_query: dict = {"status": {"$ne": "CANCELLED"}}
+    gp_docs: List[dict] = []
+    for gd in await gatepasses_collection.find(gp_query).sort("receiving_date", -1).to_list(
+        length=None
+    ):
+        try:
+            decced = _decrypt_gp(gd)
+        except Exception:
+            continue
+        if in_period(decced.get("receiving_date")):
+            gp_docs.append(decced)
+
+    gp_ids = [gp["id"] for gp in gp_docs]
+    if gp_ids:
+        delivered_by_gp, returned_by_gp = await ctx.movement_maps(gp_ids)
+    else:
+        # No passes in the window. There may still be unlinked deliveries to
+        # report below, so this must not short-circuit the whole response.
+        delivered_by_gp, returned_by_gp = {}, {}
+
+    hotels: Dict[str, dict] = {}
+    for gp in gp_docs:
+        balance = be.compute_gate_pass_balance(
+            gp.get("items", []),
+            delivered_by_gp.get(gp["id"], {}),
+            returned_by_gp.get(gp["id"], {}),
+            marked_delivered=bool(gp.get("marked_delivered")),
+        )
+        name = gp.get("client_name") or "Unknown"
+        hotel = hotels.setdefault(
+            name,
+            {"client_name": name, "gate_passes": [], "totals": {
+                "received_qty": 0, "delivered_qty": 0, "outstanding_delivery_qty": 0,
+            }},
+        )
+        for key in hotel["totals"]:
+            hotel["totals"][key] += balance["totals"].get(key, 0)
+        hotel["gate_passes"].append(
+            {
+                "gate_pass_id": gp["id"],
+                "gate_pass_number": gp.get("gate_pass_number"),
+                "receiving_date": gp.get("receiving_date"),
+                "status": gp.get("status"),
+                "derived_status": be.derive_gate_pass_status(balance, gp.get("status", "")),
+                "marked_delivered": bool(gp.get("marked_delivered")),
+                "totals": balance["totals"],
+                # Only the lines still owing linen, so the screen can label a
+                # shortfall with the right item instead of listing everything the
+                # pass was received with.
+                "outstanding_items": [
+                    {
+                        "item_key": row["item_key"],
+                        "item_name": row["item_name"],
+                        "specification": row.get("specification") or "",
+                        "received_qty": row["received_qty"],
+                        "delivered_qty": row["delivered_qty"],
+                        "returned_back_qty": row["returned_back_qty"],
+                        "outstanding_delivery_qty": row["outstanding_delivery_qty"],
+                    }
+                    for row in balance["items"].values()
+                    if row["outstanding_delivery_qty"] > 0
+                ],
+            }
+        )
+
+    # Deliveries in the window whose origin passes are not in the set. They are
+    # surfaced separately rather than silently dropped, because an unlinked
+    # delivery is a real discrepancy an operator has to see.
+    known = set(gp_ids)
+    for dd in await deliveries_collection.find({"status": {"$ne": "CANCELLED"}}).to_list(length=None):
+        try:
+            decced = _decrypt_del(dd)
+        except Exception:
+            continue
+        if not in_period(decced.get("delivery_date")):
+            continue
+        if known.intersection(be.source_gate_pass_ids(decced)):
+            continue
+        name = decced.get("client_name") or "Unknown"
+        hotel = hotels.setdefault(
+            name,
+            {"client_name": name, "gate_passes": [], "totals": {
+                "received_qty": 0, "delivered_qty": 0, "outstanding_delivery_qty": 0,
+            }},
+        )
+        hotel.setdefault("unlinked_deliveries", []).append(
+            {
+                "delivery_id": decced["id"],
+                "delivery_date": decced.get("delivery_date"),
+                "pieces": sum(int(i.get("quantity", 0) or 0) for i in decced.get("items", [])),
+            }
+        )
+
+    totals = {"received_qty": 0, "delivered_qty": 0, "outstanding_delivery_qty": 0}
+    for hotel in hotels.values():
+        for key in totals:
+            totals[key] += hotel["totals"][key]
+
+    return {
+        "period": period,
+        "hotels": sorted(hotels.values(), key=lambda h: (h["client_name"] or "").lower()),
+        "totals": totals,
+    }
+
+
 @router.get(
     "/dashboard/client-summary",
     dependencies=[Depends(require_capability("dashboard:read"))],
@@ -318,15 +456,7 @@ async def get_client_summary(client_name: str = Query(...)):
     # Gate passes completed via catch-up mark-delivered count as fully delivered.
     # A marked GP might also have real delivery rows; only add the un-recorded
     # remainder so those quantities are not double counted.
-    recorded_by_gp: Dict[str, Dict[str, int]] = {}
-    for dl in deliveries:
-        if dl.get("status") == "CANCELLED":
-            continue
-        gpid = dl.get("gate_pass_id") or ""
-        m = recorded_by_gp.setdefault(gpid, {})
-        for item in dl.get("items", []):
-            nm = item.get("item_name", "")
-            m[nm] = m.get(nm, 0) + item.get("quantity", 0)
+    recorded_by_gp = _delivered_by_pass_by_name(deliveries)
 
     for gp in gps:
         if not gp.get("marked_delivered"):
@@ -496,21 +626,13 @@ async def get_client_wise_report():
         except Exception:
             continue
 
-    recorded_by_gp: Dict[str, Dict[str, int]] = {}
+    decrypted_dels = []
     for doc in del_docs:
         try:
-            dl = _decrypt_del(doc)
-            if dl.get("status") == "CANCELLED":
-                continue
-            gpid = dl.get("gate_pass_id") or ""
-            m = recorded_by_gp.setdefault(gpid, {})
-            for item in dl.get("items", []):
-                ik_ = item.get("item_name", "")
-                sp_ = item.get("specification") or ""
-                key = f"{ik_}||{sp_}" if sp_ else ik_
-                m[key] = m.get(key, 0) + item.get("quantity", 0)
+            decrypted_dels.append(_decrypt_del(doc))
         except Exception:
             continue
+    recorded_by_gp = _delivered_by_pass_by_name(decrypted_dels)
 
     # Gate passes completed via catch-up mark-delivered count as fully delivered.
     # Only add the un-recorded remainder per item so recorded deliveries on the
@@ -633,19 +755,13 @@ async def get_item_wise_report():
     # Gate passes completed via catch-up mark-delivered count as fully delivered.
     # Only add the un-recorded remainder per item so recorded deliveries on the
     # same gate pass are not double counted.
-    recorded_by_gp: Dict[str, Dict[str, int]] = {}
+    decrypted_dels = []
     for doc in del_docs:
         try:
-            dl = _decrypt_del(doc)
-            if dl.get("status") == "CANCELLED":
-                continue
-            gpid = dl.get("gate_pass_id") or ""
-            m = recorded_by_gp.setdefault(gpid, {})
-            for item in dl.get("items", []):
-                nm = item.get("item_name", "")
-                m[nm] = m.get(nm, 0) + item.get("quantity", 0)
+            decrypted_dels.append(_decrypt_del(doc))
         except Exception:
             continue
+    recorded_by_gp = _delivered_by_pass_by_name(decrypted_dels)
     for doc in md_docs:
         try:
             gp = _decrypt_gp(doc)
@@ -693,16 +809,22 @@ async def get_gatepass_wise_report():
         except Exception:
             continue
     del_docs = await deliveries_collection.find(
-        {"gate_pass_id": {"$in": list(gp_by_id.keys())}, "status": {"$ne": "CANCELLED"}}
+        {"status": {"$ne": "CANCELLED"}}
     ).to_list(length=None) if gp_by_id else []
 
+    # A delivery that drew lines from two passes must appear under BOTH, and
+    # contribute only the lines that came from each. Bucketing on the
+    # document-level gate_pass_id (as this used to) listed the delivery once and
+    # summed every line into the primary pass.
     dels_by_gp: Dict[str, List[dict]] = {}
     for d_doc in del_docs:
         try:
             dl = _decrypt_del(d_doc)
-            dels_by_gp.setdefault(dl.get("gate_pass_id"), []).append(dl)
         except Exception:
-            pass
+            continue
+        for gp_id in be.source_gate_pass_ids(dl):
+            if gp_id in gp_by_id:
+                dels_by_gp.setdefault(gp_id, []).append(dl)
 
     results = []
 
@@ -889,12 +1011,30 @@ async def _fetch_gate_passes(start: datetime, end: datetime):
 
 
 async def _fetch_deliveries(gate_pass_ids: List[str]):
+    """Deliveries touching any of the given passes, with per-line attribution.
+
+    The filter has to include ``source_gate_pass_ids``: a delivery that drew
+    lines from two passes stores the second pass only at item level, so a
+    document-level ``gate_pass_id`` lookup silently dropped it. Each line keeps
+    its own ``gate_pass_id`` so the caller can attribute it correctly.
+    """
     if not gate_pass_ids:
         return []
     out = []
+    source_filter = {
+        "$or": [c for g in gate_pass_ids for c in ctx.source_filter(g)["$or"]]
+    }
     cursor = deliveries_collection.find(
-        {"gate_pass_id": {"$in": gate_pass_ids}},
-        {"gate_pass_id": 1, "items": 1, "created_at": 1, "encryption_metadata": 1, "_id": 1},
+        source_filter,
+        {
+            "gate_pass_id": 1,
+            "source_gate_pass_ids": 1,
+            "items": 1,
+            "status": 1,
+            "created_at": 1,
+            "encryption_metadata": 1,
+            "_id": 1,
+        },
     )
     async for d in cursor:
         try:
@@ -905,10 +1045,12 @@ async def _fetch_deliveries(gate_pass_ids: List[str]):
         out.append(
             {
                 "gate_pass_id": d.get("gate_pass_id"),
+                "status": d.get("status"),
                 "items": [
                     {
                         "item_name": it.get("item_name"),
                         "specification": it.get("specification") or "",
+                        "gate_pass_id": it.get("gate_pass_id") or d.get("gate_pass_id"),
                         "quantity": int(it.get("quantity") or 0),
                     }
                     for it in items
@@ -960,12 +1102,9 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
     # below come from balance_engine so no other page can compute them differently.
     from ..services import balance_engine as be
 
-    delivered_by_gp: Dict[str, Dict[str, int]] = {}
-    for d in deliveries:
-        dm = be.compute_delivered_by_item([d])
-        cur = delivered_by_gp.setdefault(d["gate_pass_id"], {})
-        for k, v in dm.items():
-            cur[k] = cur.get(k, 0) + v
+    # Per-pass attribution from the engine, not a flat sum keyed on the
+    # delivery's document-level gate_pass_id.
+    delivered_by_gp: Dict[str, Dict[str, int]] = be.compute_delivered_by_gate_pass(deliveries)
 
     balances = []
     items_received = 0
@@ -1351,30 +1490,30 @@ async def today_deliveries(
 
         # Get ALL delivered qty for this client across ALL gate passes
         delivered_map: Dict[str, int] = {}
-        recorded_by_gp: Dict[str, Dict[str, int]] = {}
         del_cursor2 = deliveries_collection.find({
             "client_name_search": get_search_token(client),
             "status": {"$ne": "CANCELLED"},
         })
+        client_deliveries = []
         async for doc in del_cursor2:
             try:
-                dl = _decrypt_del(doc)
-                gpid = dl.get("gate_pass_id") or ""
-                if gpid:
-                    m = recorded_by_gp.setdefault(gpid, {})
-                    for item in dl.get("items", []):
-                        item_name = item.get("item_name", "")
-                        spec = item.get("specification") or ""
-                        detail_key = f"{item_name}||{spec}" if spec else item_name
-                        m[detail_key] = m.get(detail_key, 0) + item.get("quantity", 0)
-                for item in dl.get("items", []):
-                    item_name = item.get("item_name", "")
-                    spec = item.get("specification") or ""
-                    qty = item.get("quantity", 0)
-                    detail_key = f"{item_name}||{spec}" if spec else item_name
-                    delivered_map[detail_key] = delivered_map.get(detail_key, 0) + qty
+                client_deliveries.append(_decrypt_del(doc))
             except Exception:
                 continue
+        recorded_by_gp = _delivered_by_pass_by_name(client_deliveries)
+
+        # The client's total delivered quantity, independent of which pass each
+        # line came from.
+        delivered_map: Dict[str, int] = {}
+        for dl in client_deliveries:
+            if dl.get("status") == "CANCELLED":
+                continue
+            for item in dl.get("items", []):
+                item_name = item.get("item_name", "")
+                spec = item.get("specification") or ""
+                qty = item.get("quantity", 0)
+                detail_key = f"{item_name}||{spec}" if spec else item_name
+                delivered_map[detail_key] = delivered_map.get(detail_key, 0) + qty
 
         # Mark-delivered gate passes count as fully delivered for pending math.
         # Only add the un-recorded remainder per gate pass so a marked pass that

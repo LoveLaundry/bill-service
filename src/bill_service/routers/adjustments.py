@@ -198,21 +198,17 @@ async def approve_adjustment(
     # Re-derive gate pass status from the corrected quantities INCLUDING all
     # real movements — ignoring recorded deliveries/returns downgraded a fully
     # delivered pass (e.g. 50 received, 50 delivered, corrected to 47) to
-    # PARTIALLY_DELIVERED/RECEIVED.
-    delivered_docs = []
-    async for dl in deliveries_collection.find(
-        {"gate_pass_id": str(gp_oid), "status": {"$ne": "CANCELLED"}}
-    ):
-        delivered_docs.append(dl)
-    return_docs = []
-    async for rt in returns_collection.find({"gate_pass_id": str(gp_oid)}):
-        return_docs.append(rt)
+    # PARTIALLY_DELIVERED/RECEIVED. A correction must never be able to make a
+    # pass look less delivered than it really is.
+    from ..services import operations_context as ctx
 
+    deliveries, returns = await ctx.load_movements([str(gp_oid)])
     new_gp["status"] = be.recompute_status_with_movements(
         updated_items,
-        [decrypt_dict(x, SENSITIVE_FIELDS) for x in delivered_docs],
-        [decrypt_dict(x, SENSITIVE_FIELDS) for x in return_docs],
+        deliveries,
+        returns,
         new_gp.get("status", "RECEIVED"),
+        gate_pass_id=str(gp_oid),
     )
 
     encrypted_gp = encrypt_dict(new_gp, SENSITIVE_FIELDS)

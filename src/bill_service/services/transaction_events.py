@@ -21,6 +21,14 @@ EVENT_RECEIVING_EDITED = "RECEIVING_EDITED"
 EVENT_RECEIVING_DATE_CHANGED = "RECEIVING_DATE_CHANGED"
 EVENT_DELIVERY_CREATED = "DELIVERY_CREATED"
 EVENT_DELIVERY_DATE_CHANGED = "DELIVERY_DATE_CHANGED"
+# Quantity correction of an already-recorded delivery. Carries the original and
+# corrected quantities in ``item_deltas`` plus the resulting balance in
+# ``meta.resulting_balance``; the delivery document keeps the full before/after
+# in its own ``corrections`` history. History is appended, never overwritten.
+EVENT_DELIVERY_CORRECTED = "DELIVERY_CORRECTED"
+# A delivery voided in full. Its quantities return to the source gate passes'
+# balances, which are re-derived rather than decremented by hand.
+EVENT_DELIVERY_CANCELLED = "DELIVERY_CANCELLED"
 EVENT_RETURN_CREATED = "RETURN_CREATED"
 EVENT_RETURN_UPDATED = "RETURN_UPDATED"
 EVENT_RETURN_RESENT = "RETURN_RESENT"

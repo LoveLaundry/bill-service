@@ -50,6 +50,18 @@ async def ensure_indexes():
     await deliveries_collection.create_index("gate_pass_id")
     await deliveries_collection.create_index("client_name_search")
     await deliveries_collection.create_index("created_at")
+    # A delivery can draw items from several gate passes, so every per-pass
+    # balance, listing and availability query matches on this denormalised list
+    # rather than on the document-level gate_pass_id. Sparse so legacy rows
+    # (written before the field existed) are simply absent from the index and
+    # keep matching through their own gate_pass_id.
+    await deliveries_collection.create_index("source_gate_pass_ids", sparse=True)
+    # Gate-pass detail screens list a pass's deliveries newest-first, so the
+    # source list and the dispatch date are queried together.
+    await deliveries_collection.create_index(
+        [("source_gate_pass_ids", 1), ("delivery_date", -1)],
+        sparse=True,
+    )
 
     # Dispatch jobs indexes
     await dispatch_jobs_collection.create_index("client_name_search")

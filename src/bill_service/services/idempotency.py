@@ -73,3 +73,15 @@ async def record_created(
     except Exception:
         # Duplicate key insert (concurrent retry already recorded) — fine.
         pass
+
+
+async def clear(request: Request, user_id: str) -> None:
+    """Forget a key whose create was rolled back.
+
+    Without this, a request that lost a concurrency check would burn its
+    idempotency key and every later retry would resolve to nothing.
+    """
+    key = _get_key(request, user_id)
+    if not key:
+        return
+    await idempotency_collection.delete_one({"key": key})

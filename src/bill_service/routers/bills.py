@@ -90,10 +90,23 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str, deta
     await audit_collection.insert_one(audit_doc)
 
 
-async def get_quotation_prices(quotation_id: str) -> dict:
-    """Fetch quotation pricing via the MAIN cluster client (read-only)."""
+async def get_quotation_prices(quotation_id: str) -> tuple:
+    """Fetch quotation pricing (the agreed price list) for a client.
+
+    A quotation is a PRICE LIST, not a transaction: this function reads only
+    item names and agreed unit prices from it. It returns
+    ``(prices_by_item_name, quotation_client_name)`` so the caller can refuse
+    to price one hotel's laundry with another hotel's contract.
+
+    Failures return an empty map rather than raising: an unreachable
+    quotation database must not 500 a bill, but it is logged so the silent
+    "no prices" degradation is visible instead of invisible.
+    """
+    import logging
+
     from ..database.connection_manager import get_client
 
+    log = logging.getLogger("bill_service")
     motor_client = get_client("MAIN")
 
     try:
@@ -118,20 +131,28 @@ async def get_quotation_prices(quotation_id: str) -> dict:
 
     if not quotation_doc:
         # Return empty price map — prices will fall back to manual item prices
-        return {}
+        return {}, None
 
     try:
         q_decrypted = decrypt_dict(quotation_doc, QUOTATION_SENSITIVE_FIELDS)
-    except Exception:
-        return {}
+    except Exception as exc:
+        # A MASTER_KEY mismatch silently turning every price into "0.0" is far
+        # worse than a loud log line.
+        log.error("Could not decrypt quotation %s for pricing: %s", quotation_id, exc)
+        return {}, None
 
     prices = {}
-    for item in q_decrypted.get("line_items", []):
-        prices[item["item_name"]] = {
+    for item in q_decrypted.get("line_items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("item_name")
+        if not name:
+            continue
+        prices[name] = {
             "price": item.get("unit_price") or item.get("price") or 0.0,
             "category": item.get("category"),
         }
-    return prices
+    return prices, (q_decrypted.get("client_name") or "").strip() or None
 
 
 @router.post("", response_model=BillModel, status_code=status.HTTP_201_CREATED)
@@ -166,10 +187,30 @@ async def create_bill(
             )
         gp_dec = decrypt_dict(gp_doc, GATEPASS_SENSITIVE_FIELDS)
 
+    # ── Hotel separation: a bill can only ever be priced and issued for ONE
+    # hotel. Refuse to mix, and refuse to price hotel A's laundry with hotel
+    # B's contract.
+    if gp_dec is not None and not be.same_client(payload.client_name, gp_dec.get("client_name")):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Hotel mismatch: the bill is for '{payload.client_name}' but gate pass "
+                f"{gp_dec.get('gate_pass_number')} belongs to '{gp_dec.get('client_name')}'."
+            ),
+        )
+
     gp_quotation_id = payload.quotation_id or (
         gp_dec.get("quotation_id") if gp_doc else None
     )
-    price_map = await get_quotation_prices(gp_quotation_id) if gp_quotation_id else {}
+    price_map, quotation_client = await get_quotation_prices(gp_quotation_id) if gp_quotation_id else ({}, None)
+    if quotation_client and not be.same_client(payload.client_name, quotation_client):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Hotel mismatch: quotation {gp_quotation_id} is the price list for "
+                f"'{quotation_client}', not '{payload.client_name}'."
+            ),
+        )
 
     # 2. Prevent Double Billing & Auto populate or validate quantities
     bill_items_to_save = []
@@ -177,7 +218,7 @@ async def create_bill(
 
     if del_ids_to_save:
         # The billable event is the RECEIVED quantity (business decision).
-        # Gather the gate passes these deliveries belong to, then compute
+        # Gather every gate pass these deliveries draw from, then compute
         # what is still billable = received - already billed per item name.
         gp_ids_for_del = []
         for d_id in del_ids_to_save:
@@ -190,9 +231,16 @@ async def create_bill(
                 )
 
             d_dec = decrypt_dict(d_doc, DELIVERY_SENSITIVE_FIELDS)
-            gpid = d_dec.get("gate_pass_id")
-            if gpid and gpid not in gp_ids_for_del:
-                gp_ids_for_del.append(gpid)
+            if d_dec.get("status") == "CANCELLED":
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Delivery '{d_id}' is cancelled and cannot be billed.",
+                )
+            # A delivery may draw lines from several gate passes; the billable
+            # base is every one of them, not just the primary.
+            for gpid in be.source_gate_pass_ids(d_dec):
+                if gpid not in gp_ids_for_del:
+                    gp_ids_for_del.append(gpid)
 
         gp_items_list = []
         for gpid in gp_ids_for_del:
@@ -204,6 +252,19 @@ async def create_bill(
             if not g_doc:
                 continue
             g_dec = decrypt_dict(g_doc, GATEPASS_SENSITIVE_FIELDS)
+            # Every source pass, not just the one in `payload.gate_pass_id`.
+            # A delivery may draw lines from two hotels' passes; billing it must
+            # not slip hotel B's linen through on hotel A's contract.
+            if not be.same_client(payload.client_name, g_dec.get("client_name")):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Hotel mismatch: the bill is for '{payload.client_name}' but one of "
+                        f"the referenced deliveries draws from gate pass "
+                        f"{g_dec.get('gate_pass_number')}, which belongs to "
+                        f"'{g_dec.get('client_name')}'."
+                    ),
+                )
             gp_items_list.extend(g_dec.get("items", []))
 
         # Free re-washes are never billed — reject them explicitly with a clear
@@ -302,9 +363,11 @@ async def create_bill(
         # Derive billable items from the gate pass RECEIVED quantities,
         # minus whatever has already been billed for the pass (GP-leg bills
         # reference gate_pass_id; delivery-leg bills reference its deliveries).
+        from ..services.operations_context import source_filter
+
         gp_del_ids = []
         gp_del_cursor = deliveries_collection.find(
-            {"gate_pass_id": payload.gate_pass_id, "status": {"$ne": "CANCELLED"}}
+            {**source_filter(payload.gate_pass_id), "status": {"$ne": "CANCELLED"}}
         )
         async for del_doc in gp_del_cursor:
             gp_del_ids.append(str(del_doc["_id"]))
@@ -640,6 +703,7 @@ async def get_unbilled_gatepasses(
     Optionally filter by client name.
     """
     from ..database.main_db import gatepasses_collection
+    from ..services import operations_context as ctx
 
     query = {"status": {"$nin": ["CANCELLED"]}}
 
@@ -656,26 +720,20 @@ async def get_unbilled_gatepasses(
             gp["id"] = str(gp_doc["_id"])
             gp_id = gp["id"]
 
-            # Identify this pass's (non-cancelled) delivery records
-            del_cursor = deliveries_collection.find(
-                {"gate_pass_id": gp_id, "status": {"$ne": "CANCELLED"}}
-            )
+            # Identify this pass's (non-cancelled) delivery records. Only the
+            # lines that came from THIS pass count for this pass — a delivery
+            # that also drew from another gate pass must not inflate this
+            # pass's delivered totals.
+            deliveries, _returns = await ctx.load_movements([gp_id])
+            delivery_ids = [d["id"] for d in deliveries if d.get("id")]
 
-            delivery_ids = []
             delivered_items = {}
-
-            async for del_doc in del_cursor:
-                try:
-                    delivery = decrypt_dict(del_doc, DELIVERY_SENSITIVE_FIELDS)
-                    delivery_id = str(del_doc["_id"])
-                    delivery_ids.append(delivery_id)
-
-                    for item in delivery.get("items", []):
-                        item_name = item["item_name"]
-                        qty = item.get("quantity", 0)
-                        delivered_items[item_name] = delivered_items.get(item_name, 0) + qty
-                except Exception:
-                    pass
+            for key, qty in be.compute_delivered_by_gate_pass(deliveries).get(
+                gp_id, {}
+            ).items():
+                delivered_items[be.flatten_name(key)] = (
+                    delivered_items.get(be.flatten_name(key), 0) + qty
+                )
 
             # What's already billed against this pass (either leg)
             billed_items = {}

@@ -140,11 +140,15 @@ class GatePassModel(BaseModel):
     adjustments: Optional[List[dict]] = []
     marked_delivered: Optional[dict] = None
 
-
 # --- Delivery ---
 class DeliveryItem(BaseModel):
     item_name: str
     specification: Optional[str] = None
+    # The gate pass THIS line was drawn from. A delivery may draw from several
+    # gate passes, so traceability has to live on the line, not the document.
+    # Optional for backwards compatibility: legacy lines without it fall back to
+    # the delivery's `gate_pass_id`.
+    gate_pass_id: Optional[str] = None
     quantity: int = Field(gt=0)
     # Quantity the client's own representative counted on taking delivery.
     # None means the client did not count (the common case). When present it is
@@ -160,7 +164,15 @@ class DeliveryItem(BaseModel):
 
 
 class DeliveryCreate(BaseModel):
-    gate_pass_id: str
+    """Record items delivered back to one hotel.
+
+    ``gate_pass_id`` stays supported for the common single-pass case. When a
+    delivery draws from several passes, put ``gate_pass_id`` on each item and
+    omit the document-level one — the server then derives the full source list
+    and validates every line against the pass it came from.
+    """
+
+    gate_pass_id: Optional[str] = None
     client_name: str
     delivery_date: datetime
     delivered_by: str
@@ -171,8 +183,54 @@ class DeliveryCreate(BaseModel):
 
 class DeliveryDateUpdate(BaseModel):
     """Special-case correction of a recorded delivery's dispatch date."""
+
     delivery_date: datetime
     reason: Optional[str] = None
+
+
+class DeliveryItemCorrection(BaseModel):
+    """One line's corrected quantity. ``item_name`` + ``specification`` + the
+    line's ``gate_pass_id`` identify exactly which line is being corrected."""
+
+    item_name: str
+    specification: Optional[str] = None
+    gate_pass_id: Optional[str] = None
+    quantity: int = Field(ge=0, description="Corrected delivered quantity. 0 removes the line.")
+
+
+class DeliveryCorrection(BaseModel):
+    """A safe, audited correction of an already-recorded delivery.
+
+    The original quantities are never destroyed: they are copied into the
+    delivery's ``corrections`` history and into the immutable event journal
+    before the new values are applied.
+    """
+
+    items: List[DeliveryItemCorrection] = Field(min_length=1)
+    reason: str = Field(min_length=1, description="Reason is mandatory for every correction")
+    notes: Optional[str] = None
+
+
+class DeliveryCancel(BaseModel):
+    """Void a mis-recorded delivery.
+
+    A cancellation releases real quantities back to the hotels' balances, so it
+    carries the same mandatory reason a correction does — a blank "why" here
+    would be the one hole in an otherwise complete audit trail.
+    """
+
+    reason: str = Field(min_length=1, description="Reason is mandatory for every cancellation")
+    notes: Optional[str] = None
+
+
+class DeliveryCorrectionRecord(BaseModel):
+    """One applied correction, as stored on the delivery document."""
+
+    corrected_at: datetime
+    corrected_by: str
+    corrected_by_id: Optional[str] = None
+    reason: str
+    changes: List[dict] = Field(default_factory=list)
 
 
 class DeliveryModel(BaseModel):
@@ -184,7 +242,10 @@ class DeliveryModel(BaseModel):
     )
 
     verification: Optional[Verification] = None
+    # Primary / legacy single source. Always set for backwards compatibility;
+    # use `source_gate_pass_ids` to know every pass a delivery draws from.
     gate_pass_id: str
+    source_gate_pass_ids: List[str] = Field(default_factory=list)
     client_name: str
     delivery_date: datetime
     delivered_by: str
@@ -192,6 +253,7 @@ class DeliveryModel(BaseModel):
     items: List[DeliveryItem]
     status: str  # DELIVERED, CANCELLED
     notes: Optional[str] = None
+    corrections: List[DeliveryCorrectionRecord] = Field(default_factory=list)
     created_at: datetime
     updated_at: Optional[datetime] = None
 

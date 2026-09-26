@@ -58,3 +58,49 @@ def test_cancelled_deliveries_are_ignored():
         [_gpi("Large", 50, 50)], [_dl("Large", 50), _nl("Small", 5)], [], "READY_FOR_DELIVERY"
     )
     assert status == "DELIVERED"
+
+def test_scoped_status_ignores_other_passes_lines():
+    """A multi-pass delivery must contribute only the line from THIS pass.
+
+    Without scoping, a delivery of 6 Pillows from pass A and 4 from pass B is
+    6+4=10 for each pass, so a pass that received 6 would appear to have 10
+    delivered and be closed, while the other appears to have 10 too.
+    """
+    delivery = {
+        "gate_pass_id": "A",
+        "source_gate_pass_ids": ["A", "B"],
+        "status": "DELIVERED",
+        "items": [
+            {"item_name": "Pillow", "specification": None, "gate_pass_id": "A", "quantity": 6},
+            {"item_name": "Pillow", "specification": None, "gate_pass_id": "B", "quantity": 4},
+        ],
+    }
+    # Pass A received 6 and had 6 delivered -> closed.
+    assert (
+        recompute_status_with_movements(
+            [_gpi(None, 6, 6)], [delivery], [], "PARTIALLY_DELIVERED", gate_pass_id="A"
+        )
+        == "DELIVERED"
+    )
+    # Pass B received 10 and had 4 delivered -> still partial.
+    assert (
+        recompute_status_with_movements(
+            [_gpi(None, 10, 10)], [delivery], [], "PARTIALLY_DELIVERED", gate_pass_id="B"
+        )
+        == "PARTIALLY_DELIVERED"
+    )
+
+
+def test_scoped_status_legacy_line_falls_back_to_delivery_gate_pass():
+    """A line with no own gate_pass_id is attributed to the delivery's pass."""
+    delivery = {
+        "gate_pass_id": "A",
+        "status": "DELIVERED",
+        "items": [{"item_name": "Pillow", "specification": None, "quantity": 5}],
+    }
+    assert (
+        recompute_status_with_movements(
+            [_gpi(None, 5, 5)], [delivery], [], "PARTIALLY_DELIVERED", gate_pass_id="A"
+        )
+        == "DELIVERED"
+    )
