@@ -146,6 +146,17 @@ class DeliveryItem(BaseModel):
     item_name: str
     specification: Optional[str] = None
     quantity: int = Field(gt=0)
+    # Quantity the client's own representative counted on taking delivery.
+    # None means the client did not count (the common case). When present it is
+    # reconciled against `quantity` into `discrepancy`, and a non-zero
+    # discrepancy is a quantity balance owed to the client -- deliberately kept
+    # out of the money ledger, so a disputed count never silently changes an
+    # invoice.
+    client_counted_qty: Optional[int] = Field(default=None, ge=0)
+    # recorded - counted (>0 short-delivered, <0 over-delivered). Server-owned.
+    discrepancy: int = 0
+    mismatch_reason: Optional[str] = None  # MISSING, EXTRA, COUNTING_ERROR, DAMAGED, OTHER
+    mismatch_notes: Optional[str] = None
 
 
 class DeliveryCreate(BaseModel):

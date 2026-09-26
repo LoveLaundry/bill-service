@@ -13,6 +13,15 @@ tracked independently and NEVER derived from a note or a status label:
   not_received_qty          expected - received (>= 0), the shortage
   extra_received_qty        received - expected (>= 0), over-received quantity
 
+Delivery-time count reconciliation (reported, never billed):
+  client_counted_qty        what the client's representative counted on handover
+  discrepancy_qty           delivered - counted (>0 short, <0 over); 0 when the
+                            client did not count. This is a QUANTITY balance
+                            owed back to the client and is intentionally NOT
+                            folded into outstanding_delivery_qty or any money
+                            figure, so disputing a count can never silently
+                            change an invoice.
+
 The engine is pure (no database access). Callers pass decrypted documents.
 """
 from typing import Dict, List, Optional
@@ -48,6 +57,26 @@ def compute_delivered_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
     return out
 
 
+def compute_counted_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
+    """Sum the CLIENT-COUNTED quantities across non-cancelled deliveries.
+
+    Only lines where the client actually counted (``client_counted_qty`` is a
+    number) contribute. A delivery with no count contributes nothing, so a
+    pass that was never reconciled does not look like a zero-count pass.
+    """
+    out: Dict[str, int] = {}
+    for dl in delivery_docs:
+        if dl.get("status") == "CANCELLED":
+            continue
+        for it in dl.get("items", []):
+            counted = it.get("client_counted_qty")
+            if counted is None:
+                continue
+            key = item_key(it.get("item_name", ""), it.get("specification"))
+            out[key] = out.get(key, 0) + int(counted or 0)
+    return out
+
+
 def compute_returned_by_item(return_docs: List[dict]) -> Dict[str, int]:
     """Sum return-back quantities that still need re-sending.
 
@@ -77,6 +106,7 @@ def compute_gate_pass_balance(
     returned_by_item: Optional[Dict[str, int]] = None,
     *,
     marked_delivered: bool = False,
+    counted_by_item: Optional[Dict[str, int]] = None,
 ) -> dict:
     """Compute the full per-item balance for one gate pass.
 
@@ -96,6 +126,10 @@ def compute_gate_pass_balance(
         "returned_back_qty": 0,
         "outstanding_delivery_qty": 0,
         "not_received_qty": 0,
+        # Delivery-time count reconciliation. Purely additive reporting: these
+        # never feed outstanding_delivery_qty, billing, or any money figure.
+        "client_counted_qty": 0,
+        "discrepancy_qty": 0,
     }
     gp_flags: List[str] = []
     if marked_delivered:
@@ -110,6 +144,13 @@ def compute_gate_pass_balance(
         rejected = 0
         delivered = int(delivered_by_item.get(key, 0) or 0)
         returned = int((returned_by_item or {}).get(key, 0) or 0)
+
+        counted = (counted_by_item or {}).get(key)
+        has_count = counted is not None
+        # Positive => we recorded more than the client counted (short-delivered,
+        # owed back to the client). Negative => we recorded less than they
+        # counted (over-delivered).
+        discrepancy = (delivered - int(counted)) if has_count else 0
 
         effective_delivered = max(delivered, received) if marked_delivered else delivered
         outstanding = max(0, received - effective_delivered + returned)
@@ -127,6 +168,10 @@ def compute_gate_pass_balance(
             item_flags.append("EXTRA_RECEIVED")
         if marked_delivered and delivered < received:
             item_flags.append("LEGACY_NOTE_CLOSURE_HIDES_OUTSTANDING")
+        if has_count and discrepancy > 0:
+            item_flags.append("DELIVERY_SHORT_COUNTED")
+        elif has_count and discrepancy < 0:
+            item_flags.append("DELIVERY_OVER_COUNTED")
 
         items[key] = {
             "item_key": key,
@@ -144,6 +189,9 @@ def compute_gate_pass_balance(
             "outstanding_delivery_qty": outstanding,
             "not_received_qty": not_received,
             "extra_received_qty": extra_received,
+            "client_counted_qty": int(counted) if has_count else None,
+            "discrepancy_qty": discrepancy,
+            "has_count": has_count,
             "flags": item_flags,
         }
         totals["expected_qty"] += expected
@@ -153,6 +201,8 @@ def compute_gate_pass_balance(
         totals["returned_back_qty"] += returned
         totals["outstanding_delivery_qty"] += outstanding
         totals["not_received_qty"] += not_received
+        totals["client_counted_qty"] += int(counted) if has_count else 0
+        totals["discrepancy_qty"] += discrepancy
 
     return {
         "items": items,
