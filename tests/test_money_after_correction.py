@@ -186,7 +186,7 @@ async def test_a_payment_cannot_exceed_a_stale_cached_outstanding(mocked_db):
         mocked_db,
         _bill(
             gp_id="gp-stale",
-            qty=4,
+            qty=10,
             paid=600.0,
             status="PARTIALLY_PAID",
             # A stale cache left over from before the correction.
@@ -215,7 +215,7 @@ async def test_a_payment_within_the_real_outstanding_is_accepted(mocked_db):
 
     bill_id = await _store_bill(
         mocked_db,
-        _bill(gp_id="gp-ok", qty=4, paid=600.0, status="PARTIALLY_PAID", outstanding_amount=1000.0),
+        _bill(gp_id="gp-ok", qty=10, paid=600.0, status="PARTIALLY_PAID", outstanding_amount=1000.0),
     )
     await bills_router.create_payment(
         bill_id,
