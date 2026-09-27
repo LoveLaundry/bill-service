@@ -73,13 +73,19 @@ async def gatepass_pending(
             entries.append(
                 {
                     "gate_pass_id": gp["id"],
-                    "gate_pass_number": gp.get("gate_pass_number"),
-                    "client_name": gp.get("client_name"),
+                    # The three label fields are defaulted to "" rather than
+                    # left as None: the client types them as strings and calls
+                    # .toLowerCase() on them directly, so a null here surfaces
+                    # as a render crash on the notifications page instead of a
+                    # blank cell. A gate pass written before these were
+                    # denormalised can legitimately be missing them.
+                    "gate_pass_number": gp.get("gate_pass_number") or "",
+                    "client_name": gp.get("client_name") or "",
                     # Echoed so the close-day screen can scope outstanding
                     # quantity to the day a pass was received, without
                     # rebuilding the balance per pass.
                     "receiving_date": gp.get("receiving_date"),
-                    "item_name": row.get("item_name"),
+                    "item_name": row.get("item_name") or "",
                     "specification": row.get("specification") or None,
                     "item_key": row.get("item_key"),
                     "received": row.get("received_qty", 0),
