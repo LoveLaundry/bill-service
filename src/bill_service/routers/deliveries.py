@@ -219,6 +219,7 @@ async def create_delivery(
         # Denormalised, non-sensitive index field (see _source_filter).
         "source_gate_pass_ids": source_ids,
         "client_name": canonical_client,
+        "client_name_search": get_search_token(canonical_client),
         "delivery_date": delivery_date,
         "delivered_by": payload.delivered_by,
         "received_by": payload.received_by,

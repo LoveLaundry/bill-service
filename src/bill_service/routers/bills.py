@@ -509,6 +509,7 @@ async def create_bill(
     doc = {
         "quotation_id": payload.quotation_id or "",
         "client_name": payload.client_name,
+        "client_name_search": get_search_token(payload.client_name),
         "quotation_title": payload.quotation_title,
         "items": bill_items_to_save,
         "total_quantity": total_quantity,
@@ -1050,6 +1051,7 @@ async def create_payment(
     payment_doc = {
         "bill_id": bill_id,
         "client_name": dec_bill["client_name"],
+        "client_name_search": get_search_token(dec_bill["client_name"]),
         "amount": payload.amount,
         "payment_method": payload.payment_method,
         "payment_date": payload.payment_date.replace(tzinfo=timezone.utc),

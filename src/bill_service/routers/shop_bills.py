@@ -355,6 +355,7 @@ async def create_bill(
     doc = {
         "bill_number": bill_number,
         "client_name": payload.client_name,
+        "client_name_search": _get_search_token(payload.client_name),
         "quotation_id": payload.quotation_id,
         "items": items,
         "total_quantity": totals["total_quantity"],
@@ -701,6 +702,7 @@ async def split_bill(
     new_doc = {
         "bill_number": new_bn,
         "client_name": doc.get("client_name", ""),
+        "client_name_search": _get_search_token(doc.get("client_name", "")),
         "quotation_id": doc.get("quotation_id"),
         "items": moved_items,
         "total_quantity": moved_totals_data["total_quantity"],
@@ -984,6 +986,7 @@ async def quick_bill(
     doc = {
         "bill_number": bn,
         "client_name": body.get("client_name", ""),
+        "client_name_search": _get_search_token(body.get("client_name", "")),
         "quotation_id": None,
         "items": items,
         "total_quantity": totals["total_quantity"],
@@ -1035,6 +1038,7 @@ async def manual_bill(
     doc = _build_bill_doc(body, bn, now)
     doc["status"] = body.get("status", "PENDING")
     doc["payment_status"] = body.get("payment_status", "DRAFT")
+    doc["client_name_search"] = _get_search_token(doc.get("client_name", ""))
 
     result = await shop_bills_collection.insert_one(_enc(doc))
     doc["id"] = str(result.inserted_id)

@@ -87,6 +87,8 @@ async def create_return(
 
     encrypted = encrypt_dict(doc, SENSITIVE_FIELDS)
     result = await returns_collection.insert_one(encrypted)
+    # ensure searchable token present for filters
+    await returns_collection.update_one({"_id": result.inserted_id}, {"$set": {"client_name_search": get_search_token(doc.get("client_name"))}})
     doc["_id"] = str(result.inserted_id)
 
     await log_audit(

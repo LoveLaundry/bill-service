@@ -128,6 +128,7 @@ async def create_gate_pass(
     doc = {
         "gate_pass_number": payload.gate_pass_number,
         "client_name": payload.client_name,
+        "client_name_search": get_search_token(payload.client_name),
         "receiving_date": payload.receiving_date.replace(tzinfo=timezone.utc),
         "received_by": payload.received_by,
         "items": processed_items,
@@ -536,6 +537,7 @@ async def catch_up_delivery(
         "gate_pass_id": gate_pass_id,
         "source_gate_pass_ids": [gate_pass_id],
         "client_name": decrypted.get("client_name"),
+        "client_name_search": get_search_token(decrypted.get("client_name")),
         "delivery_date": delivered_date,
         "delivered_by": current_user.get("user_name", "system"),
         "received_by": current_user.get("user_name", "system"),
