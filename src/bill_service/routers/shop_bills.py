@@ -815,6 +815,7 @@ async def duplicate_bill(
     doc = {
         "bill_number": new_bn,
         "client_name": src_doc.get("client_name", ""),
+        "client_name_search": _get_search_token(src_doc.get("client_name", "")),
         "quotation_id": src_doc.get("quotation_id"),
         "items": items,
         "total_quantity": totals["total_quantity"],

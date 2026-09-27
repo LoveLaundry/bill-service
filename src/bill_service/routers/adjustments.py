@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth_helper import require_capability
-from ..crypto_helper import decrypt_dict, encrypt_dict
+from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     adjustments_collection,
     deliveries_collection,
@@ -78,6 +78,7 @@ async def create_adjustment_request(
         "original_qty": original_qty,
         "corrected_qty": payload.corrected_qty,
         "reason": payload.reason,
+        "client_name_search": get_search_token(decrypted.get("client_name")),
         "status": "REQUESTED",
         "requested_by": current_user.get("user_name", ""),
         "requested_by_id": current_user.get("auth_id", ""),

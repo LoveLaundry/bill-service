@@ -92,7 +92,7 @@ async def create_linen(
         "size": payload.size,
         "color": payload.color,
         "client_name": payload.client_name,
-        "client_name_search": payload.client_name,
+        "client_name_search": get_search_token(payload.client_name),
         "department": payload.department,
         "status": "IN_STOCK",
         "condition": "NEW",
