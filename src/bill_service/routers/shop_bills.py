@@ -1,6 +1,7 @@
 import csv
 import io
 import random
+import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
@@ -99,6 +100,39 @@ def _get_search_token(name: str) -> str:
     return get_search_token(name)
 
 
+# A search term longer than this is a scan, not a lookup.
+MAX_SEARCH_LENGTH = 120
+
+
+def _bounded_limit(body: dict, default: int = 50, cap: int = 200) -> int:
+    """Read a caller-supplied page size from a free-form body, bounded.
+
+    These two routes take a raw dict rather than a validated model, so
+    `limit` was passed straight to the driver: `{"limit": 10000000}` asked the
+    server to materialise the entire collection in one response.
+    """
+    try:
+        value = int(body.get("limit", default))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, cap))
+
+
+def _search_pattern(term) -> str:
+    """Build a literal, bounded Mongo `$regex` body from user input.
+
+    The raw term used to be interpolated straight into `$regex`, which let a
+    caller write its own expression: `.*` matched every bill in the collection,
+    and nested quantifiers like `(a+)+$` sent the matcher into catastrophic
+    backtracking, pinning a CPU. Searches here are substring lookups, so the
+    metacharacters are escaped and the term capped.
+    """
+    if term is None:
+        return ""
+    text = str(term)[:MAX_SEARCH_LENGTH]
+    return re.escape(text)
+
+
 def _as_dt(value):
     """Coerce a stored date value to a timezone-aware datetime, or None."""
     if value is None:
@@ -149,6 +183,24 @@ def _calc_totals(items: list, discounts: float = 0, transport_fee: float = 0, ta
     }
 
 
+def _clamp_paid(requested, grand_total: float) -> float:
+    """Resolve the opening paid amount for a new bill.
+
+    Payments are recorded through the payment endpoint, which appends to
+    ``payments`` and recomputes ``paid_amount``. Trusting this field from the
+    request body let any caller mark a bill paid without paying: an amount
+    above the total produced negative outstanding, and a negative amount
+    inflated it. It is now bounded to what the bill can actually owe.
+    """
+    try:
+        amount = float(requested)
+    except (TypeError, ValueError):
+        return 0.0
+    if amount != amount or amount in (float("inf"), float("-inf")):
+        return 0.0
+    return round(min(max(amount, 0.0), max(grand_total, 0.0)), 2)
+
+
 def _build_bill_doc(body: dict, bill_number: str, now: datetime) -> dict:
     """Build a full shop bill document from a request body dict."""
     items = body.get("items", []) or []
@@ -158,6 +210,7 @@ def _build_bill_doc(body: dict, bill_number: str, now: datetime) -> dict:
     taxes = body.get("taxes", 0) or 0
     totals = _calc_totals(items, discounts, transport_fee, taxes)
     grand_total = totals["grand_total"]
+    paid_amount = _clamp_paid(body.get("paid_amount"), grand_total)
 
     return {
         "bill_number": bill_number,
@@ -172,8 +225,8 @@ def _build_bill_doc(body: dict, bill_number: str, now: datetime) -> dict:
         "grand_total": grand_total,
         "status": body.get("status", "PENDING"),
         "payment_status": body.get("payment_status", "DRAFT"),
-        "paid_amount": body.get("paid_amount", 0) or 0,
-        "outstanding_amount": grand_total - (body.get("paid_amount", 0) or 0),
+        "paid_amount": paid_amount,
+        "outstanding_amount": round(grand_total - paid_amount, 2),
         "notes": body.get("notes"),
         "notes_history": [],
         "delivery_date": body.get("delivery_date"),
@@ -417,9 +470,9 @@ async def list_bills(
         query["client_name_search"] = _get_search_token(client_name)
     if search:
         query["$or"] = [
-            {"bill_number": {"$regex": search, "$options": "i"}},
+            {"bill_number": {"$regex": _search_pattern(search), "$options": "i"}},
             {"client_name_search": {"$regex": _get_search_token(search), "$options": "i"}},
-            {"notes": {"$regex": search, "$options": "i"}},
+            {"notes": {"$regex": _search_pattern(search), "$options": "i"}},
         ]
 
     sort_field = sort_by if sort_by in ("created_at", "updated_at", "grand_total", "bill_number") else "created_at"
@@ -1613,9 +1666,9 @@ async def advanced_search(
 
     if q:
         query["$or"] = [
-            {"bill_number": {"$regex": q, "$options": "i"}},
-            {"client_name_search": {"$regex": q, "$options": "i"}},
-            {"notes": {"$regex": q, "$options": "i"}},
+            {"bill_number": {"$regex": _search_pattern(q), "$options": "i"}},
+            {"client_name_search": {"$regex": _search_pattern(q), "$options": "i"}},
+            {"notes": {"$regex": _search_pattern(q), "$options": "i"}},
         ]
 
     for f in ("status", "payment_status"):
@@ -1623,7 +1676,7 @@ async def advanced_search(
             query[f] = filters[f]
 
     items = []
-    async for doc in shop_bills_collection.find(query).sort("created_at", -1).limit(body.get("limit", 50)):
+    async for doc in shop_bills_collection.find(query).sort("created_at", -1).limit(_bounded_limit(body)):
         items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
@@ -1828,7 +1881,7 @@ async def fulltext(body: dict = Body(...), current_user: dict = Depends(require_
     q = body.get("q", "")
     if not q: return {"items": [], "total": 0}
     items = []
-    async for doc in shop_bills_collection.find({"$or": [{"bill_number": {"$regex": q, "$options": "i"}}, {"client_name": {"$regex": q, "$options": "i"}}, {"notes": {"$regex": q, "$options": "i"}}]}).limit(body.get("limit", 50)):
+    async for doc in shop_bills_collection.find({"$or": [{"bill_number": {"$regex": _search_pattern(q), "$options": "i"}}, {"client_name": {"$regex": _search_pattern(q), "$options": "i"}}, {"notes": {"$regex": _search_pattern(q), "$options": "i"}}]}).limit(_bounded_limit(body)):
         items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
@@ -2011,7 +2064,7 @@ async def batch(body: dict = Body(...), current_user: dict = Depends(require_cap
 @router.get("/lookup")
 async def lookup(q: str = Query(..., min_length=1), current_user: dict = Depends(require_capability("bill:read"))):
     items = []
-    async for doc in shop_bills_collection.find({"$or": [{"bill_number": {"$regex": q, "$options": "i"}}, {"client_name_search": {"$regex": q, "$options": "i"}}]}).limit(10):
+    async for doc in shop_bills_collection.find({"$or": [{"bill_number": {"$regex": _search_pattern(q), "$options": "i"}}, {"client_name_search": {"$regex": _search_pattern(q), "$options": "i"}}]}).limit(10):
         d = _dec(doc); items.append({"id": d.get("id"), "bill_number": d.get("bill_number"), "client_name": d.get("client_name"), "grand_total": d.get("grand_total", 0)})
     return {"items": items}
 
@@ -2176,7 +2229,7 @@ async def list_templates(
 ):
     query: dict = {}
     if search:
-        query["name"] = {"$regex": search, "$options": "i"}
+        query["name"] = {"$regex": _search_pattern(search), "$options": "i"}
     total = await bill_templates_collection.count_documents(query)
     items = []
     async for doc in bill_templates_collection.find(query).sort("created_at", -1).skip(skip).limit(limit):
