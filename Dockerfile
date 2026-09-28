@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 FROM python:3.13-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+# tzdata + TZ so anything the host defaults to UTC still renders
+# Sri Lankan time (see app_time.py, which does not rely on this).
+ENV TZ=Asia/Colombo \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HOME=/var/www

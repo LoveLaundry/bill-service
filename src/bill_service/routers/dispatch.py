@@ -12,6 +12,7 @@ from ..database.main_db import (
 )
 from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..services.verification_service import attach_verification_to
+from ..app_time import wall_clock
 from ..models import DispatchCreate, DispatchUpdate, DispatchModel, DispatchOptimize
 
 router = APIRouter(prefix="/dispatch", tags=["dispatch"])
@@ -73,7 +74,7 @@ async def create_dispatch_job(
         "address": payload.address,
         "contact_name": payload.contact_name,
         "contact_phone": payload.contact_phone,
-        "scheduled_at": payload.scheduled_at.replace(tzinfo=timezone.utc)
+        "scheduled_at": wall_clock(payload.scheduled_at)
         if payload.scheduled_at
         else None,
         "status": "SCHEDULED",
@@ -182,7 +183,7 @@ async def update_dispatch_job(
     if payload.assigned_to is not None:
         update_data["assigned_to"] = payload.assigned_to
     if payload.scheduled_at is not None:
-        update_data["scheduled_at"] = payload.scheduled_at.replace(tzinfo=timezone.utc)
+        update_data["scheduled_at"] = wall_clock(payload.scheduled_at)
     if payload.latitude is not None:
         update_data["latitude"] = payload.latitude
     if payload.longitude is not None:

@@ -37,6 +37,7 @@ from ..models import (
     GatePassModel,
     GatePassUpdate,
 )
+from ..app_time import day_query, day_query_end, wall_clock
 from .adjustments import create_adjustment_request
 
 router = APIRouter(prefix="/gatepasses", tags=["gatepasses"])
@@ -129,7 +130,7 @@ async def create_gate_pass(
         "gate_pass_number": payload.gate_pass_number,
         "client_name": payload.client_name,
         "client_name_search": get_search_token(payload.client_name),
-        "receiving_date": payload.receiving_date.replace(tzinfo=timezone.utc),
+        "receiving_date": wall_clock(payload.receiving_date),
         "received_by": payload.received_by,
         "items": processed_items,
         "status": "RECEIVED",
@@ -196,9 +197,9 @@ async def list_gate_passes(
     if date_from or date_to:
         date_query = {}
         if date_from:
-            date_query["$gte"] = date_from.replace(tzinfo=timezone.utc)
+            date_query["$gte"] = day_query(date_from)
         if date_to:
-            date_query["$lte"] = date_to.replace(tzinfo=timezone.utc)
+            date_query["$lte"] = day_query_end(date_to)
         query["receiving_date"] = date_query
 
     cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
@@ -516,7 +517,7 @@ async def catch_up_delivery(
     now = datetime.now(timezone.utc)
     delivered_date = payload.delivered_date or now
     if delivered_date.tzinfo is None:
-        delivered_date = delivered_date.replace(tzinfo=timezone.utc)
+        delivered_date = wall_clock(delivered_date)
 
     try:
         item_records = be.plan_delivery_lines(

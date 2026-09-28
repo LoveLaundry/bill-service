@@ -6,10 +6,9 @@ of a day without cross-querying the whole collection. Money fields are stored
 plain-text on the documents (only client/notes/items are encrypted), so a
 projection is safe here.
 """
-from datetime import datetime, timedelta, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from ..app_time import day_bounds, parse_day
 from ..auth_helper import require_capability
 from ..database.main_db import bills_collection, payments_collection
 
@@ -18,10 +17,9 @@ router = APIRouter(prefix="/day-money", tags=["day-money"])
 UNPAID_STATUSES = ["PENDING", "PARTIALLY_PAID", "OVERDUE"]
 
 
-def _validate_day(date: str) -> datetime:
+def _validate_day(date: str):
     try:
-        day = datetime.strptime(date, "%Y-%m-%d")
-        return day.replace(tzinfo=timezone.utc)
+        return parse_day(date)
     except ValueError:
         raise HTTPException(status_code=422, detail="date must be YYYY-MM-DD")
 
@@ -32,8 +30,7 @@ async def day_money(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     """Snapshot of the money recorded for the given calendar day."""
-    start = _validate_day(date)
-    end = start + timedelta(days=1)
+    start, end = day_bounds(_validate_day(date))
 
     bills_created = 0
     billed_amount = 0.0

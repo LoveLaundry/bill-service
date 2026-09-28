@@ -7,6 +7,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from ..app_time import UTC, add_months, day_bounds, lkt, month_start, today
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, get_search_token
 from ..database.main_db import (
@@ -239,19 +240,17 @@ async def get_linen_flow(
     """
     cutoff = ""
     if period != "all":
-        now = datetime.now(timezone.utc)
-        start_month = 0 if period == "year" else (now.month - 1) // 3 * 3
-        cutoff = now.replace(
-            year=now.year, month=start_month + 1, day=1, hour=0, minute=0, second=0, microsecond=0
-        )
+        # Start of the current Sri Lankan quarter (or year).
+        now = today()
+        start_month = 1 if period == "year" else (now.month - 1) // 3 * 3 + 1
+        cutoff = month_start(now.year, start_month)
 
     def in_period(value) -> bool:
         if not cutoff or not value:
             return True
         if isinstance(value, datetime):
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
-            return value >= cutoff
+            return lkt(value) >= cutoff
+        # A bare YYYY-MM-DD is already a Sri Lankan calendar date.
         return str(value)[:10] >= cutoff.strftime("%Y-%m-%d")
 
     gp_query: dict = {"status": {"$ne": "CANCELLED"}}
@@ -925,15 +924,16 @@ PERIOD_DAYS = {
 
 
 def _utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalise a stored timestamp to aware UTC. Storage stays UTC."""
     if dt is None:
         return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _windows(period: str):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     span = PERIOD_DAYS.get(period, 30)
     cur_start = now - timedelta(days=span)
     prev_end = cur_start - timedelta(microseconds=1)
@@ -1328,10 +1328,11 @@ async def yearly_trend(
     current_user: dict = Depends(require_capability("dashboard:read")),
 ):
     from datetime import timedelta
-    now = datetime.now(timezone.utc)
     months = []
+    # Step back whole months on the Sri Lankan calendar rather than by 30-day
+    # chunks, so every bucket lines up with a real calendar month.
     for i in range(11, -1, -1):
-        d = now - timedelta(days=30 * i)
+        d = add_months(today(), -i)
         months.append({
             "key": d.strftime("%Y-%m"),
             "label": d.strftime("%b %y"),
@@ -1375,9 +1376,7 @@ async def today_deliveries(
     """Today's delivery breakdown by client with pending items from ALL open gate passes."""
     from datetime import timedelta as td
 
-    now = datetime.now(timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = today_start + td(days=1)
+    today_start, today_end = day_bounds(today())
 
     # Step 1: Get today's deliveries grouped by client
     client_map: Dict[str, dict] = {}
@@ -1422,10 +1421,7 @@ async def today_deliveries(
     def _md_in_window(cand) -> bool:
         if not isinstance(cand, datetime):
             return False
-        d = cand if cand.tzinfo is None else cand.astimezone(timezone.utc)
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return today_start <= d < today_end
+        return today_start <= lkt(cand) < today_end
 
     md_cursor = gatepasses_collection.find({"marked_delivered": {"$exists": True}})
     async for doc in md_cursor:

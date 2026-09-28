@@ -19,6 +19,7 @@ from ..services import balance_engine as be
 from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
 from pydantic import BaseModel
+from ..app_time import day_query, day_query_end, wall_clock
 from ..models import (
     BillCreate,
     BillItemIn,
@@ -153,6 +154,90 @@ async def get_quotation_prices(quotation_id: str) -> tuple:
             "category": item.get("category"),
         }
     return prices, (q_decrypted.get("client_name") or "").strip() or None
+
+
+async def _load_universe_deliveries(gp_ids: List[str]) -> List[dict]:
+    """Every non-cancelled delivery that draws from any of ``gp_ids``.
+
+    This is the movement universe a bill may draw its billable quantity from.
+    Both billing legs use it so the already-billed lookup and the delivered
+    quantity are always computed over the same set of deliveries — which is what
+    stops a second bill against the same gate pass from re-billing the first
+    bill's pieces.
+    """
+    deliveries: List[dict] = []
+    for gpid in gp_ids or []:
+        cursor = deliveries_collection.find(
+            {**source_filter(gpid), "status": {"$ne": "CANCELLED"}}
+        )
+        async for del_doc in cursor:
+            deliveries.append(del_doc)
+    return deliveries
+
+
+async def _assert_items_within_billable_ceiling(
+    bill_doc: dict, items: List["BillItemIn"]
+) -> None:
+    """Reject bill line items that exceed the delivered-and-unbilled quantity.
+
+    ``bill_doc`` is the decrypted bill. The ceiling is the delivered quantity of
+    the bill's own movement universe, minus whatever OTHER non-cancelled bills
+    have already charged for it. This bill's existing lines are excluded from
+    the already-billed total, so raising a line's quantity by exactly what is
+    added stays legal while any jump beyond the real delivery ceiling fails.
+    """
+    gp_ids: List[str] = []
+    raw_gp = bill_doc.get("gate_pass_id")
+    if raw_gp:
+        gp_ids.append(str(raw_gp))
+    universe = await _load_universe_deliveries(gp_ids)
+    # A manual bill (no gate pass) has no delivery universe to check against.
+    if not gp_ids and not universe:
+        return
+
+    if not gp_ids:
+        for d in universe:
+            for gpid in be.source_gate_pass_ids(d):
+                if gpid not in gp_ids:
+                    gp_ids.append(gpid)
+
+    all_del_ids = [d["_id"] for d in universe] + [
+        ObjectId(d_id) for d_id in (bill_doc.get("delivery_ids") or []) if ObjectId.is_valid(str(d_id))
+    ]
+    already_billed: Dict[str, int] = {}
+    or_clauses = []
+    if all_del_ids:
+        or_clauses.append({"delivery_ids": {"$in": all_del_ids}})
+    if gp_ids:
+        or_clauses.append({"gate_pass_id": {"$in": gp_ids}})
+    if not or_clauses:
+        return
+
+    async for pb_doc in bills_collection.find(
+        {"payment_status": {"$ne": "CANCELLED"}, "$or": or_clauses}
+    ):
+        if str(pb_doc.get("_id")) == str(bill_doc.get("id") or bill_doc.get("_id") or ""):
+            continue  # this bill's own lines are replaced, not added
+        pb_dec = decrypt_dict(pb_doc, SENSITIVE_FIELDS)
+        for it in pb_dec.get("items") or []:
+            name = it.get("item_name")
+            if name:
+                already_billed[name] = already_billed.get(name, 0) + be.as_qty(it.get("quantity"))
+
+    ceiling = be.compute_billable_delivered_by_name(universe, already_billed)
+    for item in items or []:
+        name = (item.item_name or "").strip()
+        allowed = ceiling.get(name, 0)
+        if item.quantity > allowed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Double-Billing constraint violation. Item '{name}' requested: "
+                    f"{item.quantity}, but only {allowed} delivered and not yet billable."
+                ),
+            )
+
+
 
 
 @router.post("", response_model=BillModel, status_code=status.HTTP_201_CREATED)
@@ -414,7 +499,7 @@ async def create_bill(
                         status_code=400,
                         detail=(
                             f"Item '{name}' requested: {qty}, but only "
-                            f"{allowed} received on this gate pass."
+                            f"{allowed} delivered (and not yet billed) on this gate pass."
                         ),
                     )
                 price_info = price_map.get(
@@ -616,9 +701,9 @@ async def list_bills(
         # Filter by gate pass receiving_date (handles null gate_pass_id too)
         gp_date_match: dict = {}
         if gate_pass_date_from:
-            gp_date_match["$gte"] = gate_pass_date_from.replace(tzinfo=timezone.utc)
+            gp_date_match["$gte"] = day_query(gate_pass_date_from)
         if gate_pass_date_to:
-            gp_date_match["$lte"] = gate_pass_date_to.replace(tzinfo=timezone.utc)
+            gp_date_match["$lte"] = day_query_end(gate_pass_date_to)
         pipeline.append({
             "$match": {
                 "gp": {"$ne": []},
@@ -665,9 +750,9 @@ async def list_bills(
     if date_from or date_to:
         date_filter: dict = {}
         if date_from:
-            date_filter["$gte"] = date_from.replace(tzinfo=timezone.utc)
+            date_filter["$gte"] = day_query(date_from)
         if date_to:
-            date_filter["$lte"] = date_to.replace(tzinfo=timezone.utc)
+            date_filter["$lte"] = day_query_end(date_to)
         query["created_at"] = date_filter
 
     if search:
@@ -916,6 +1001,12 @@ async def edit_bill(
     if dec.get("payment_status") in ("PAID", "CANCELLED"):
         raise HTTPException(status_code=400, detail="Cannot edit a paid or cancelled bill")
 
+    # Editing must not become a way around the double-billing guard: every line
+    # is re-validated against the same delivered-minus-already-billed ceiling
+    # create_bill enforces, computed over this bill's own movement universe.
+    if payload.items is not None:
+        await _assert_items_within_billable_ceiling(dec, payload.items)
+
     update_fields: dict = {}
     for field in ("client_name", "quotation_title", "notes", "discounts", "transport_fee", "taxes", "additional_charges"):
         val = getattr(payload, field)
@@ -923,7 +1014,6 @@ async def edit_bill(
             update_fields[field] = val
 
     # Recalculate totals from items (new or existing)
-    items_out = None
     if payload.items is not None:
         items_out = []
         for item in payload.items:
@@ -934,12 +1024,9 @@ async def edit_bill(
                 "quantity": item.quantity,
                 "line_total": round(item.unit_price * item.quantity, 2),
             })
-        update_fields["items"] = items_out
         total_amount = sum(i["line_total"] for i in items_out)
-        update_fields["total_amount"] = total_amount
-        update_fields["total_quantity"] = sum(i["quantity"] for i in items_out)
     else:
-        items_out = dec.get("items", [])
+        items_out = dec.get("items") or []
         total_amount = dec.get("total_amount", 0) or 0
 
     # Always recalculate grand_total from (possibly updated) fees + total_amount
@@ -950,15 +1037,44 @@ async def edit_bill(
         + (update_fields.get("taxes", dec.get("taxes", 0)) or 0)
         + (update_fields.get("additional_charges", dec.get("additional_charges", 0)) or 0)
     )
-    update_fields["grand_total"] = round(grand_total, 2)
-    paid = dec.get("paid_amount", 0) or 0
-    update_fields["outstanding_amount"] = max(0.0, round(grand_total - paid, 2))
+    # Clamp exactly like create_bill does, so a discount larger than the
+    # subtotal can never store a negative invoice total.
+    grand_total = round(grand_total, 2)
+    if grand_total < 0:
+        grand_total = 0.0
 
-    if not update_fields:
+    paid = dec.get("paid_amount", 0) or 0
+    outstanding = round(grand_total - paid, 2)
+    if outstanding < 0:
+        outstanding = 0.0
+    payment_status = dec.get("payment_status", "DRAFT")
+    if outstanding <= 0 and payment_status not in ("CANCELLED",):
+        payment_status = "PAID"
+    elif outstanding > 0 and payment_status == "PAID":
+        payment_status = "PARTIALLY_PAID"
+
+    if not update_fields and payload.items is None:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    update_fields["updated_at"] = datetime.now(timezone.utc)
-    await bills_collection.update_one({"_id": oid}, {"$set": update_fields})
+    # Merge into the DECRYPTED document and re-encrypt the whole thing. A bare
+    # $set would write client_name/notes/items in cleartext, silently defeating
+    # field-level encryption, and would leave client_name_search stale so a
+    # renamed client becomes unlistable.
+    merged = {**dec, **update_fields}
+    if payload.items is not None:
+        merged["items"] = items_out
+    merged["total_amount"] = round(total_amount, 2)
+    merged["total_quantity"] = sum(i["quantity"] for i in items_out)
+    merged["grand_total"] = grand_total
+    merged["outstanding_amount"] = outstanding
+    merged["payment_status"] = payment_status
+    merged["updated_at"] = datetime.now(timezone.utc)
+    if merged.get("client_name") is not None:
+        merged["client_name_search"] = get_search_token(merged["client_name"])
+
+    await bills_collection.replace_one(
+        {"_id": oid}, encrypt_dict(merged, SENSITIVE_FIELDS)
+    )
 
     updated_doc = await bills_collection.find_one({"_id": oid})
     serialized = _serialize(updated_doc)
@@ -1054,7 +1170,7 @@ async def create_payment(
         "client_name_search": get_search_token(dec_bill["client_name"]),
         "amount": payload.amount,
         "payment_method": payload.payment_method,
-        "payment_date": payload.payment_date.replace(tzinfo=timezone.utc),
+        "payment_date": wall_clock(payload.payment_date),
         "reference": payload.reference,
         "notes": payload.notes,
         "created_at": now,

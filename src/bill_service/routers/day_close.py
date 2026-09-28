@@ -6,16 +6,17 @@ deliveries, outstanding pieces, open adjustments, reconciliation issues).
 It never locks the day and never mutates any document — it is a signed-off,
 point-in-time picture of the day.
 
-The event is timestamped at the end of the business day (UTC) so it appears
-at the end of that day's timeline; the real wall-clock close time is kept in
-``meta.closed_at``.
+The event is timestamped at the end of that Sri Lankan business day (LKT,
+UTC+05:30) so it appears at the end of that day's timeline; the real
+wall-clock close time is kept in ``meta.closed_at``.
 """
-from datetime import datetime, date, time, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
 
+from ..app_time import day_end, parse_day, today
 from ..auth_helper import require_capability
 from ..database.main_db import linen_events_collection
 from ..services.transaction_events import EVENT_DAY_CLOSED, record_event
@@ -31,26 +32,26 @@ class DayCloseRequest(BaseModel):
 
 def _parse_day(value: str) -> date:
     try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
+        return parse_day(value)
     except ValueError:
         raise HTTPException(status_code=422, detail="date must be YYYY-MM-DD")
 
 
-def ensure_not_future(day: date, today: date) -> None:
+def ensure_not_future(day: date, reference_day: date) -> None:
     """Guardrail: never close a business day that is ahead of "today".
 
-    ``today`` is compared with one day of headroom because the service runs
-    on UTC while the caller operates on a local calendar day (e.g. +5:30).
-    A genuinely future date (next week) is always rejected.
+    ``reference_day`` is the current Sri Lankan date. Closing it is allowed so a
+    supervisor can close the day out during the evening; a genuinely future date
+    (tomorrow onwards) is always rejected.
     """
-    if day > today + timedelta(days=1):
+    if day > reference_day:
         raise HTTPException(
             status_code=409, detail=f"Cannot close a future day ({day.isoformat()})."
         )
 
 
 def _validate_date(value: str) -> datetime:
-    return datetime.combine(_parse_day(value), time(hour=23, minute=59, second=59, tzinfo=timezone.utc))
+    return day_end(_parse_day(value))
 
 
 @router.get("")
@@ -76,8 +77,8 @@ async def close_day(
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     """Record an end-of-day snapshot. Append-only; safe to run repeatedly."""
-    day_end = _validate_date(payload.date)
-    ensure_not_future(day_end.date(), datetime.now(timezone.utc).date())
+    day_end_value = _validate_date(payload.date)
+    ensure_not_future(day_end_value.date(), today())
 
     # Guardrail: never close a day out of order. If a later day already has a
     # snapshot, closing this one would silently imply an un-closed gap exists.
@@ -85,7 +86,7 @@ async def close_day(
         {
             "entity_type": "day",
             "event_type": EVENT_DAY_CLOSED,
-            "occurred_at": {"$gt": day_end},
+            "occurred_at": {"$gt": day_end_value},
         },
         sort=[("occurred_at", 1)],
     )
@@ -108,7 +109,7 @@ async def close_day(
         user_name=current_user.get("user_name", ""),
         reason=payload.note or None,
         meta={"totals": payload.totals, "closed_at": now.isoformat()},
-        occurred_at=day_end,
+        occurred_at=day_end_value,
     )
     doc = await linen_events_collection.find_one({"_id": event_id})
     if doc:

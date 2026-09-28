@@ -40,6 +40,7 @@ from ..services.transaction_events import (
     EVENT_DELIVERY_DATE_CHANGED,
 )
 from ..services.verification_service import attach_verification_to
+from ..app_time import day_query, day_query_end, wall_clock
 from ..models import (
     DeliveryCancel,
     DeliveryCorrection,
@@ -237,7 +238,7 @@ async def create_delivery(
     primary_gp_id = payload.gate_pass_id or source_ids[0]
     delivery_date = payload.delivery_date
     if delivery_date.tzinfo is None:
-        delivery_date = delivery_date.replace(tzinfo=timezone.utc)
+        delivery_date = wall_clock(delivery_date)
 
     delivery_doc = {
         "gate_pass_id": primary_gp_id,
@@ -365,7 +366,7 @@ async def update_delivery_date(
     previous_date = doc.get("delivery_date")
     new_date = payload.delivery_date
     if new_date.tzinfo is None:
-        new_date = new_date.replace(tzinfo=timezone.utc)
+        new_date = wall_clock(new_date)
 
     await deliveries_collection.update_one(
         {"_id": oid},
@@ -954,9 +955,9 @@ async def list_deliveries(
     if date_from or date_to:
         date_query = {}
         if date_from:
-            date_query["$gte"] = date_from if date_from.tzinfo else date_from.replace(tzinfo=timezone.utc)
+            date_query["$gte"] = day_query(date_from)
         if date_to:
-            date_query["$lte"] = date_to if date_to.tzinfo else date_to.replace(tzinfo=timezone.utc)
+            date_query["$lte"] = day_query_end(date_to)
         query["delivery_date"] = date_query
 
     cursor = deliveries_collection.find(query).sort("delivery_date", -1)

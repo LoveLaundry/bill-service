@@ -11,6 +11,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from ..app_time import day_bounds, day_start, lkt, MONGO_TIME_ZONE, month_bounds, month_start, parse_day, this_month_number, this_year, today, week_start, year_bounds
 from ..auth_helper import require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
@@ -275,8 +276,12 @@ async def _find_legacy_invoice(invoice_id: str) -> dict:
 
 
 def _generate_legacy_invoice_number(now: datetime) -> str:
-    """INV-YYYYMMDD-XXXXXX with a confusable-safe suffix."""
-    return f"INV-{now.strftime('%Y%m%d')}-" + "".join(random.choices(BILL_NUMBER_CHARS, k=6))
+    """INV-YYYYMMDD-XXXXXX with a confutable-safe suffix.
+
+    Numbered by the Sri Lankan calendar date, so an invoice raised at 02:00 LKT
+    still belongs to the previous working day.
+    """
+    return f"INV-{lkt(now).strftime('%Y%m%d')}-" + "".join(random.choices(BILL_NUMBER_CHARS, k=6))
 
 
 def _calc_legacy_grand_total(entries: list) -> float:
@@ -1929,30 +1934,37 @@ async def from_quotation(quotation_id: str, current_user: dict = Depends(require
 
 @router.get("/stats/daily")
 async def daily_summary(date: Optional[str] = Query(None), current_user: dict = Depends(require_capability("bill:read"))):
-    now = datetime.now(timezone.utc); target = datetime.fromisoformat(date) if date else now
-    start = target.replace(hour=0, minute=0, second=0, microsecond=0)
-    result = await shop_bills_collection.aggregate([{"$match": {"created_at": {"$gte": start, "$lt": start + timedelta(days=1)}}}, {"$group": {"_id": "$status", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}}]).to_list(length=20)
+    target = parse_day(date) if date else today()
+    start, end = day_bounds(target)
+    result = await shop_bills_collection.aggregate([{"$match": {"created_at": {"$gte": start, "$lt": end}}}, {"$group": {"_id": "$status", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}}]).to_list(length=20)
     return {"date": start.strftime("%Y-%m-%d"), "total_bills": sum(r["count"] for r in result), "total_revenue": round(sum(r["total"] for r in result), 2)}
 
 @router.get("/stats/weekly")
 async def weekly_summary(current_user: dict = Depends(require_capability("bill:read"))):
-    now = datetime.now(timezone.utc); start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    result = await shop_bills_collection.aggregate([{"$match": {"created_at": {"$gte": start, "$lt": start + timedelta(days=7)}}}, {"$group": {"_id": {"day": {"$dayOfWeek": "$created_at"}}, "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}}]).to_list(length=7)
+    start = week_start(today())
+    result = await shop_bills_collection.aggregate([
+        {"$match": {"created_at": {"$gte": start, "$lt": start + timedelta(days=7)}}},
+        # $dayOfWeek is UTC-only, so bucket on a Sri Lankan-local date string.
+        {"$group": {"_id": {"day": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at", "timezone": MONGO_TIME_ZONE}}}, "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}},
+    ]).to_list(length=7)
     return {"week_start": start.strftime("%Y-%m-%d"), "total_bills": sum(r["count"] for r in result), "total_revenue": round(sum(r["total"] for r in result), 2)}
 
 @router.get("/stats/monthly")
 async def monthly_summary(year: Optional[int] = Query(None), month: Optional[int] = Query(None), current_user: dict = Depends(require_capability("bill:read"))):
-    now = datetime.now(timezone.utc); y, m = year or now.year, month or now.month
-    start = datetime(y, m, 1, tzinfo=timezone.utc)
-    end = datetime(y + 1, 1, 1, tzinfo=timezone.utc) if m == 12 else datetime(y, m + 1, 1, tzinfo=timezone.utc)
+    y, m = year or this_year(), month or this_month_number()
+    start, end = month_bounds(y, m)
     result = await shop_bills_collection.aggregate([{"$match": {"created_at": {"$gte": start, "$lt": end}}}, {"$group": {"_id": None, "count": {"$sum": 1}, "revenue": {"$sum": "$grand_total"}, "paid": {"$sum": "$paid_amount"}}}]).to_list(length=1)
     r = result[0] if result else {"count": 0, "revenue": 0, "paid": 0}
     return {"year": y, "month": m, "total_bills": r["count"], "total_revenue": round(r["revenue"], 2), "total_paid": round(r["paid"], 2), "outstanding": round(r["revenue"] - r["paid"], 2)}
 
 @router.get("/stats/yearly")
 async def yearly_summary(year: Optional[int] = Query(None), current_user: dict = Depends(require_capability("bill:read"))):
-    y = year or datetime.now(timezone.utc).year; start, end = datetime(y, 1, 1, tzinfo=timezone.utc), datetime(y + 1, 1, 1, tzinfo=timezone.utc)
-    result = await shop_bills_collection.aggregate([{"$match": {"created_at": {"$gte": start, "$lt": end}}}, {"$group": {"_id": {"month": {"$month": "$created_at"}}, "count": {"$sum": 1}, "revenue": {"$sum": "$grand_total"}, "paid": {"$sum": "$paid_amount"}}}]).to_list(length=12)
+    y = year or this_year(); start, end = year_bounds(y)
+    result = await shop_bills_collection.aggregate([
+        {"$match": {"created_at": {"$gte": start, "$lt": end}}},
+        # $month is UTC-only; bucket on a Sri Lankan-local month string instead.
+        {"$group": {"_id": {"month": {"$dateToString": {"format": "%m", "date": "$created_at", "timezone": MONGO_TIME_ZONE}}}, "count": {"$sum": 1}, "revenue": {"$sum": "$grand_total"}, "paid": {"$sum": "$paid_amount"}}},
+    ]).to_list(length=12)
     total, rev, paid = sum(r["count"] for r in result), sum(r["revenue"] for r in result), sum(r["paid"] for r in result)
     return {"year": y, "total_bills": total, "total_revenue": round(rev, 2), "total_paid": round(paid, 2), "outstanding": round(rev - paid, 2)}
 
@@ -2075,21 +2087,21 @@ async def client_cnt(client_name: str, current_user: dict = Depends(require_capa
 
 @router.get("/today")
 async def bills_today(current_user: dict = Depends(require_capability("bill:read"))):
-    now = datetime.now(timezone.utc); start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start, end = day_bounds(today())
     items = []
-    async for doc in shop_bills_collection.find({"created_at": {"$gte": start, "$lt": start + timedelta(days=1)}}).sort("created_at", -1): items.append(_dec(doc))
+    async for doc in shop_bills_collection.find({"created_at": {"$gte": start, "$lt": end}}).sort("created_at", -1): items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
 @router.get("/this-week")
 async def bills_this_week(current_user: dict = Depends(require_capability("bill:read"))):
-    now = datetime.now(timezone.utc); start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = week_start(today())
     items = []
     async for doc in shop_bills_collection.find({"created_at": {"$gte": start}}).sort("created_at", -1): items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
 @router.get("/this-month")
 async def bills_this_month(current_user: dict = Depends(require_capability("bill:read"))):
-    now = datetime.now(timezone.utc); start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    start = month_start(this_year(), this_month_number())
     items = []
     async for doc in shop_bills_collection.find({"created_at": {"$gte": start}}).sort("created_at", -1): items.append(_dec(doc))
     return {"items": items, "total": len(items)}
@@ -2485,8 +2497,8 @@ async def date_range_stats(
     end_date: str = Query(...),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
-    end = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    start = day_start(parse_day(start_date))
+    end = day_start(parse_day(end_date)) + timedelta(days=1)
     count = 0; revenue = 0.0; paid = 0.0
     async for doc in shop_bills_collection.find({}):
         d = _dec(doc); created = _as_dt(d.get("created_at"))
@@ -2501,8 +2513,8 @@ async def tax_report(
     end_date: Optional[str] = Query(None),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc) if start_date else None
-    end = (datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)) if end_date else None
+    start = day_start(parse_day(start_date)) if start_date else None
+    end = (day_start(parse_day(end_date)) + timedelta(days=1)) if end_date else None
     taxes = 0.0; revenue = 0.0; count = 0
     async for doc in shop_bills_collection.find({}):
         d = _dec(doc); created = _as_dt(d.get("created_at"))
