@@ -72,10 +72,35 @@ def _serialize(doc: dict) -> dict:
 
     decrypted["id"] = str(decrypted["_id"])
     del decrypted["_id"]
-    decrypted.setdefault("source_gate_pass_ids", [])
-    if not decrypted["source_gate_pass_ids"]:
-        decrypted["source_gate_pass_ids"] = [decrypted["gate_pass_id"]]
-    decrypted.setdefault("corrections", [])
+
+    # Legacy rows predate source_gate_pass_ids, and a hand-written or partially
+    # migrated row can hold null, a non-list, or blanks. Two bugs came from
+    # that, both fixed at this read boundary:
+    #   1. `decrypted["gate_pass_id"]` raised KeyError on a row with no primary
+    #      id. KeyError is not HTTPException, so the `except HTTPException` in
+    #      the list endpoint did not catch it and one bad row 500'd the whole
+    #      /deliveries list even though every other row was healthy.
+    #   2. a non-list value was iterated character-by-character further down, so
+    #      the balance engine would validate a correction against the wrong
+    #      gate passes -- silently corrupting an outstanding balance rather
+    #      than raising.
+    # The raw value is normalised to a list first; be.source_gate_pass_ids is
+    # the canonical resolver (all .get(), deduped, and it also picks up
+    # per-item gate_pass_id, so cancel/correct refresh every pass that moved).
+    raw_sources = decrypted.get("source_gate_pass_ids")
+    if not isinstance(raw_sources, list):
+        raw_sources = [] if raw_sources is None else [raw_sources]
+    decrypted["source_gate_pass_ids"] = raw_sources
+    primary = decrypted.get("gate_pass_id")
+    # "" rather than None: the print sheet slices this, and DeliveryModel types
+    # it as str, so an absent legacy id stays falsy without breaking either.
+    decrypted["gate_pass_id"] = str(primary) if primary else ""
+    decrypted["source_gate_pass_ids"] = be.source_gate_pass_ids(decrypted)
+
+    corrections = decrypted.get("corrections")
+    if not isinstance(corrections, list):
+        decrypted["corrections"] = []
+
     items = decrypted.get("items")
     if not isinstance(items, list):
         decrypted["items"] = []

@@ -88,6 +88,13 @@ def source_gate_pass_ids(delivery: dict) -> List[str]:
 
     Includes the delivery's ``gate_pass_id`` so a legacy single-pass delivery
     still reports exactly one source.
+
+    Defensive on purpose: this drives the balance maths, so a legacy or
+    hand-written row holding ``null``, a bare string, or ``null`` entries inside
+    ``items`` must still resolve to real gate-pass ids. Iterating a string
+    would yield one "source" per character and validate a delivery against
+    phantom gate passes, which silently corrupts the outstanding balance rather
+    than raising.
     """
     out: List[str] = []
     seen: Set[str] = set()
@@ -95,15 +102,32 @@ def source_gate_pass_ids(delivery: dict) -> List[str]:
     def _add(value) -> None:
         if not value:
             return
-        key = str(value)
+        key = str(value).strip()
+        if not key:
+            return
         if key not in seen:
             seen.add(key)
             out.append(key)
 
-    _add((delivery or {}).get("gate_pass_id"))
-    for raw in (delivery or {}).get("source_gate_pass_ids") or []:
+    def _as_rows(value) -> list:
+        """Treat a missing/null value as empty and a scalar as a single row."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, (str, bytes, dict)):
+            # A scalar string is one id, not a sequence of ids.
+            return [value] if isinstance(value, str) and value else []
+        try:
+            return list(value)
+        except TypeError:
+            return []
+
+    doc = delivery or {}
+    _add(doc.get("gate_pass_id"))
+    for raw in _as_rows(doc.get("source_gate_pass_ids")):
         _add(raw)
-    for it in (delivery or {}).get("items", []) or []:
+    for it in _as_rows(doc.get("items")):
         if isinstance(it, dict):
             _add(it.get("gate_pass_id"))
     return out
