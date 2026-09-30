@@ -5,6 +5,7 @@ status re-derivation fix: approving a correction MUST account for recorded
 deliveries/returns (previously they were ignored, so a pass whose outstanding
 was fully delivered could never resolve to DELIVERED).
 """
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -168,6 +169,88 @@ async def test_approve_requires_different_user(mocked_db):
     with pytest.raises(HTTPException) as exc:
         await adjustments.approve_adjustment(created["id"], current_user=auth_user("Alice"))
     assert exc.value.status_code == 400
+
+
+async def test_concurrent_approvals_apply_adjustment_once(mocked_db):
+    gp_id = await seed_gp(mocked_db, items=[_gp_item(spec="Large", received=30)])
+    req = GatePassAdjustmentRequest(
+        gate_pass_id=gp_id, item_name="Pillow", specification="Large",
+        corrected_qty=22, reason="damaged",
+    )
+    created = await adjustments.create_adjustment_request(req, current_user=auth_user("Alice"))
+
+    results = await asyncio.gather(
+        adjustments.approve_adjustment(created["id"], current_user=auth_user("Bob")),
+        adjustments.approve_adjustment(created["id"], current_user=auth_user("Casey")),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, dict) for result in results) == 1
+    conflicts = [result for result in results if isinstance(result, HTTPException)]
+    assert len(conflicts) == 1
+    assert conflicts[0].status_code == 409
+
+    gp = await read_gp(mocked_db, gp_id)
+    assert gp["items"][0]["received_qty"] == 22
+    assert len(gp["adjustments"]) == 1
+
+
+async def test_concurrent_adjustments_do_not_overwrite_gate_pass(monkeypatch, mocked_db):
+    gp_id = await seed_gp(
+        mocked_db,
+        items=[
+            _gp_item(name="Pillow", spec="Large", received=30),
+            _gp_item(name="Towel", spec="Bath", received=20),
+        ],
+    )
+    first_request = await adjustments.create_adjustment_request(
+        GatePassAdjustmentRequest(
+            gate_pass_id=gp_id, item_name="Pillow", specification="Large",
+            corrected_qty=22, reason="recount pillow",
+        ),
+        current_user=auth_user("Alice"),
+    )
+    second_request = await adjustments.create_adjustment_request(
+        GatePassAdjustmentRequest(
+            gate_pass_id=gp_id, item_name="Towel", specification="Bath",
+            corrected_qty=15, reason="recount towel",
+        ),
+        current_user=auth_user("Alice"),
+    )
+
+    original_get_open_gp = adjustments._get_open_gp
+    both_read = asyncio.Event()
+    read_count = 0
+
+    async def synchronized_get_open_gp(gate_pass_id):
+        nonlocal read_count
+        result = await original_get_open_gp(gate_pass_id)
+        read_count += 1
+        if read_count == 2:
+            both_read.set()
+        await both_read.wait()
+        return result
+
+    monkeypatch.setattr(adjustments, "_get_open_gp", synchronized_get_open_gp)
+    results = await asyncio.gather(
+        adjustments.approve_adjustment(
+            first_request["id"], current_user=auth_user("Bob")
+        ),
+        adjustments.approve_adjustment(
+            second_request["id"], current_user=auth_user("Casey")
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, dict) for result in results) == 1
+    conflicts = [result for result in results if isinstance(result, HTTPException)]
+    assert len(conflicts) == 1
+    assert conflicts[0].status_code == 409
+
+    gp = await read_gp(mocked_db, gp_id)
+    assert len(gp["adjustments"]) == 1
+    quantities = {item["item_name"]: item["received_qty"] for item in gp["items"]}
+    assert quantities in ({"Pillow": 22, "Towel": 20}, {"Pillow": 30, "Towel": 15})
 
 
 async def test_approve_applies_correction_and_status_accounts_for_deliveries(mocked_db):

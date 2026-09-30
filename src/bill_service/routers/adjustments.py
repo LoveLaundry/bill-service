@@ -212,8 +212,39 @@ async def approve_adjustment(
         gate_pass_id=str(gp_oid),
     )
 
+    claim = await adjustments_collection.update_one(
+        {"_id": oid, "status": "REQUESTED"},
+        {"$set": {"status": "APPROVING", "updated_at": now}},
+    )
+    if claim.matched_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Adjustment is no longer awaiting approval.",
+        )
+
     encrypted_gp = encrypt_dict(new_gp, SENSITIVE_FIELDS)
-    await gatepasses_collection.replace_one({"_id": gp_oid}, encrypted_gp)
+    gp_version_filter = {"_id": gp_oid}
+    if "updated_at" in gp_dec:
+        gp_version_filter["updated_at"] = gp_dec["updated_at"]
+    else:
+        gp_version_filter["updated_at"] = {"$exists": False}
+    write_result = await gatepasses_collection.replace_one(
+        gp_version_filter, encrypted_gp
+    )
+    if write_result.matched_count != 1:
+        await adjustments_collection.update_one(
+            {"_id": oid, "status": "APPROVING"},
+            {
+                "$set": {
+                    "status": "REQUESTED",
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Gate pass changed during approval. Review and retry the request.",
+        )
 
     # Automatic propagation: any linked, still-editable bill is re-clamped to
     # the corrected received quantities; paid bills are flagged, never rewritten.
@@ -232,7 +263,7 @@ async def approve_adjustment(
         )
 
     await adjustments_collection.update_one(
-        {"_id": oid},
+        {"_id": oid, "status": "APPROVING"},
         {
             "$set": {
                 "status": "APPROVED",
@@ -278,8 +309,8 @@ async def reject_adjustment(
             detail=f"Adjustment is already {adj_doc.get('status')}.",
         )
     now = datetime.now(timezone.utc)
-    await adjustments_collection.update_one(
-        {"_id": oid},
+    result = await adjustments_collection.update_one(
+        {"_id": oid, "status": "REQUESTED"},
         {
             "$set": {
                 "status": "REJECTED",
@@ -289,6 +320,11 @@ async def reject_adjustment(
             }
         },
     )
+    if result.matched_count != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="Adjustment is no longer awaiting a decision.",
+        )
     await record_event(
         entity_type="adjustment",
         entity_id=str(oid),
