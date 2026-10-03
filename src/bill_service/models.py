@@ -1,6 +1,6 @@
 from pydantic import AliasChoices
 from datetime import datetime, timezone
-from typing import Annotated, List, Optional
+from typing import Annotated, Dict, List, Optional
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 PyObjectId = Annotated[str, BeforeValidator(str)]
@@ -42,6 +42,8 @@ class GatePassCreate(BaseModel):
     items: List[GatePassItem] = Field(min_length=1)
     notes: Optional[str] = None
     quotation_id: Optional[str] = None
+    status: str = "RECEIVED"  # RECEIVED or DRAFT (monthly-generated passes start in DRAFT)
+    origin: Optional[dict] = None  # {"kind": "monthly", "year": int, "month": int, "day": int, "quotation_id": str}
 
 
 class GatePassAdjustment(BaseModel):
@@ -179,6 +181,8 @@ class DeliveryCreate(BaseModel):
     received_by: str  # Customer representative signature name
     items: List[DeliveryItem] = Field(min_length=1)
     notes: Optional[str] = None
+    status: str = "DELIVERED"  # DELIVERED or DRAFT (monthly-generated deliveries start in DRAFT)
+    origin: Optional[dict] = None  # {"kind": "monthly", "year": int, "month": int, "day": int, "quotation_id": str}
 
 
 class DeliveryDateUpdate(BaseModel):
@@ -251,9 +255,10 @@ class DeliveryModel(BaseModel):
     delivered_by: str
     received_by: str
     items: List[DeliveryItem]
-    status: str  # DELIVERED, CANCELLED
+    status: str  # DELIVERED, DRAFT, CANCELLED
     notes: Optional[str] = None
     corrections: List[DeliveryCorrectionRecord] = Field(default_factory=list)
+    origin: Optional[dict] = None  # provenance of a monthly-generated record
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -795,3 +800,122 @@ class BillTemplateModel(BaseModel):
     use_count: int = 0
     created_at: datetime
     updated_at: datetime
+
+
+# --- Rewash (operational record, separate from the legacy GatePassItem flag) ---
+class RewashItem(BaseModel):
+    item_name: str
+    specification: Optional[str] = None
+    category: Optional[str] = None
+    quantity: int = Field(gt=0)
+    reason: Optional[str] = None
+    source_gate_pass_id: Optional[str] = None
+    source_delivery_id: Optional[str] = None
+    unit_price: Optional[float] = None  # snapshot when chargeable
+
+
+class RewashCreate(BaseModel):
+    rewash_number: str
+    client_name: str
+    date: datetime
+    items: List[RewashItem] = Field(min_length=1)
+    chargeable: bool = False
+    notes: Optional[str] = None
+    origin: Optional[dict] = None  # {"kind": "monthly", "year": int, "month": int, "day": int, "quotation_id": str}
+
+
+class RewashModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    id: PyObjectId = Field(
+        validation_alias=AliasChoices("_id", "id"),
+        serialization_alias="id",
+    )
+    rewash_number: str
+    client_name: str
+    date: datetime
+    items: List[RewashItem]
+    chargeable: bool = False
+    status: str  # DRAFT, RECORDED, CANCELLED
+    notes: Optional[str] = None
+    origin: Optional[dict] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+
+# --- Monthly Operations (Receiving / Deliveries / Rewash grids) ---
+MONTHLY_KINDS = ("receiving", "delivery", "rewash")
+MONTHLY_DAY_STATUSES = ("DRAFT", "CONFIRMED", "CANCELLED")
+
+
+class MonthlyQuantitiesUpdate(BaseModel):
+    """Persist edited cells on a DRAFT monthly day. Keys are ``name||spec``."""
+
+    quantities: Dict[str, int]
+
+
+class MonthlyDeliverySource(BaseModel):
+    """One manual delivery-day source: a gate pass plus its line quantities."""
+
+    gate_pass_id: str
+    items: List[DeliveryItem] = Field(min_length=1)
+
+
+class MonthlyDayConfirm(BaseModel):
+    """Confirm one monthly day. Creates real records (starting in DRAFT).
+
+    ``source_mode`` only applies to kind=delivery:
+      same_day  reference the same day's receiving gate pass (default)
+      auto      FIFO across the client's pending gate passes
+      manual    use ``sources`` exactly as supplied
+    """
+
+    quotation_id: Optional[str] = None
+    source_mode: Optional[str] = None  # same_day | auto | manual
+    sources: Optional[List[MonthlyDeliverySource]] = None
+    received_by: Optional[str] = None
+    delivered_by: Optional[str] = None
+    chargeable: Optional[bool] = None  # rewash billing flag
+    notes: Optional[str] = None
+
+
+class MonthlyDayState(BaseModel):
+    """Serialized view of one monthly day."""
+
+    day: int
+    date: str  # YYYY-MM-DD
+    status: str  # EMPTY (not created), DRAFT, CONFIRMED, CANCELLED
+    total_qty: int
+    quantities: Dict[str, int] = {}
+    gate_pass_ids: List[str] = []
+    delivery_ids: List[str] = []
+    rewash_ids: List[str] = []
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[datetime] = None
+    notes: Optional[str] = None
+
+
+class MonthlyItemRow(BaseModel):
+    """One row of the monthly matrix (item + price resolution)."""
+
+    item_name: str
+    specification: str = ""
+    category: Optional[str] = None
+    unit_price: float = 0.0
+    has_price: bool = False
+    usage_qty: int = 0
+
+
+class MonthlyMatrixResponse(BaseModel):
+    """Full monthly grid payload."""
+
+    client_name: str
+    kind: str
+    year: int
+    month: int
+    month_length: int
+    quotation_id: Optional[str] = None
+    rows: List[MonthlyItemRow]
+    days: List[MonthlyDayState]
+    cells: Dict[str, Dict[str, int]] = {}  # item_key -> { day: quantity }

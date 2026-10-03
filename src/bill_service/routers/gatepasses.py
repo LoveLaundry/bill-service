@@ -14,13 +14,13 @@ from ..database.main_db import (
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
+from ..services.gate_pass_records import create_gate_pass_record
 from ..error_responses import NotFoundError, ValidationError, ConflictError, ForbiddenError
 from ..services.bill_sync import sync_bills_to_gate_pass
 from ..services.transaction_events import (
     build_item_delta,
     record_event,
     EVENT_CATCH_UP_DELIVERY,
-    EVENT_GATE_PASS_CREATED,
     EVENT_LEGACY_FLAG,
     EVENT_RECEIVING_DATE_CHANGED,
     EVENT_RECEIVING_EDITED,
@@ -107,65 +107,17 @@ async def create_gate_pass(
             detail="Gate Pass number already exists",
         )
 
-    # Process items and calculate differences
-    processed_items = []
-    for item in payload.items:
-        diff = item.received_qty - item.client_qty
-        processed_items.append(
-            {
-                "item_name": item.item_name,
-                "category": item.category,
-                "specification": item.specification,
-                "client_qty": item.client_qty,
-                "received_qty": item.received_qty,
-                "difference": diff,
-                "mismatch_reason": item.mismatch_reason,
-                "mismatch_notes": item.mismatch_notes,
-                "rewashed": bool(getattr(item, "rewashed", False)),
-            }
+    # Shared builder keeps the full journal/sync/verify chain identical for the
+    # normal (RECEIVED) and monthly DRAFT paths.
+    try:
+        serialized = await create_gate_pass_record(
+            payload,
+            current_user,
+            status=payload.status,
+            origin=payload.origin,
         )
-
-    now = datetime.now(timezone.utc)
-    doc = {
-        "gate_pass_number": payload.gate_pass_number,
-        "client_name": payload.client_name,
-        "client_name_search": get_search_token(payload.client_name),
-        "receiving_date": wall_clock(payload.receiving_date),
-        "received_by": payload.received_by,
-        "items": processed_items,
-        "status": "RECEIVED",
-        "notes": payload.notes,
-        "quotation_id": payload.quotation_id,
-        "created_at": now,
-        "updated_at": now,
-        "adjustments": [],
-    }
-
-    # Envelope Encrypt Document
-    encrypted_doc = encrypt_dict(doc, SENSITIVE_FIELDS)
-
-    result = await gatepasses_collection.insert_one(encrypted_doc)
-    created = await gatepasses_collection.find_one({"_id": result.inserted_id})
-
-    serialized = _serialize(created)
-
-    new_version = await bump_version("gatepass", result.inserted_id)
-    await enqueue_sync("gatepass", result.inserted_id, new_version)
-    serialized = await attach_verification_to("gatepass", result.inserted_id, serialized)
-
-    await record_event(
-        entity_type="gatepass",
-        entity_id=serialized["id"],
-        event_type=EVENT_GATE_PASS_CREATED,
-        user_id=current_user.get("auth_id", "system"),
-        user_name=current_user.get("user_name"),
-        new_status="RECEIVED",
-        item_deltas=[
-            build_item_delta(item["item_name"], item.get("specification"), 0, item["received_qty"])
-            for item in processed_items
-        ],
-        meta={"gate_pass_number": payload.gate_pass_number},
-    )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
     await log_audit(
         current_user.get("auth_id", "system"),
@@ -338,6 +290,7 @@ async def update_gate_pass_status(
     """Guarded status transition.
 
     Only the open workflow states can be moved manually:
+      DRAFT -> RECEIVED (activate a monthly-generated pass) or CANCELLED
       RECEIVED -> PROCESSING -> READY_FOR_DELIVERY (and back to PROCESSING)
       any open state -> CANCELLED (only if no deliveries were recorded)
     DELIVERED / PARTIALLY_DELIVERED / CLOSED are DERIVED from recorded
@@ -355,6 +308,7 @@ async def update_gate_pass_status(
         )
 
     allowed_transitions = {
+        "DRAFT": ["RECEIVED", "CANCELLED"],
         "RECEIVED": ["PROCESSING", "CANCELLED"],
         "PROCESSING": ["READY_FOR_DELIVERY", "CANCELLED"],
         "READY_FOR_DELIVERY": ["PROCESSING", "CANCELLED"],

@@ -29,6 +29,14 @@ EVENT_DELIVERY_CORRECTED = "DELIVERY_CORRECTED"
 # A delivery voided in full. Its quantities return to the source gate passes'
 # balances, which are re-derived rather than decremented by hand.
 EVENT_DELIVERY_CANCELLED = "DELIVERY_CANCELLED"
+# A DRAFT delivery promoted to DELIVERED. Drafts are invisible to balance math
+# until this event, which is why the gate pass status is re-derived here.
+EVENT_DELIVERY_ACTIVATED = "DELIVERY_ACTIVATED"
+# A monthly grid day confirmed, creating its gate pass / delivery / rewash
+# records as DRAFT for later activation.
+EVENT_MONTHLY_DAY_CONFIRMED = "MONTHLY_DAY_CONFIRMED"
+# Rewash quantities recorded for a day. Free unless explicitly chargeable.
+EVENT_REWASH_RECORDED = "REWASH_RECORDED"
 EVENT_RETURN_CREATED = "RETURN_CREATED"
 EVENT_RETURN_UPDATED = "RETURN_UPDATED"
 EVENT_RETURN_RESENT = "RETURN_RESENT"

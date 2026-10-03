@@ -34,6 +34,7 @@ from ..services import operations_context as ctx
 from ..services.transaction_events import (
     build_item_delta,
     record_event,
+    EVENT_DELIVERY_ACTIVATED,
     EVENT_DELIVERY_CANCELLED,
     EVENT_DELIVERY_CORRECTED,
     EVENT_DELIVERY_CREATED,
@@ -52,6 +53,10 @@ from ..models import (
 router = APIRouter(prefix="/deliveries", tags=["deliveries"])
 
 SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+
+# Gate-pass documents are encrypted with the same three sensitive fields; the
+# alias keeps the intent explicit where a delivery reads its source pass.
+GATE_PASS_SENSITIVE_FIELDS = SENSITIVE_FIELDS
 
 
 def _parse_object_id(id_str: str, label: str = "Invalid ID format") -> ObjectId:
@@ -232,13 +237,17 @@ async def create_delivery(
     for line in planned:
         line["discrepancy"] = _recompute_discrepancy(line)
 
-    # ── 4. Persist ───────────────────────────────────────────────────────────
+# ── 4. Persist ───────────────────────────────────────────────────────────
     now = datetime.now(timezone.utc)
     source_ids = list(dict.fromkeys(str(l["gate_pass_id"]) for l in planned))
     primary_gp_id = payload.gate_pass_id or source_ids[0]
     delivery_date = payload.delivery_date
     if delivery_date.tzinfo is None:
         delivery_date = wall_clock(delivery_date)
+
+    # A DRAFT delivery (monthly grid) is persisted but stays invisible to
+    # availability and does NOT move its source gate pass forward.
+    is_draft = payload.status == "DRAFT"
 
     delivery_doc = {
         "gate_pass_id": primary_gp_id,
@@ -249,10 +258,11 @@ async def create_delivery(
         "delivery_date": delivery_date,
         "delivered_by": payload.delivered_by,
         "received_by": payload.received_by,
-        "items": planned,
-        "status": "DELIVERED",
+"items": planned,
+        "status": payload.status,
         "notes": payload.notes,
         "corrections": [],
+        "origin": payload.origin,
         "created_at": now,
         "updated_at": now,
     }
@@ -272,10 +282,16 @@ async def create_delivery(
     check_deliveries, check_returns = await ctx.load_movements(gp_ids)
     check_delivered = ctx.delivered_by_gate_pass(check_deliveries)
     check_returned = ctx.returned_by_gate_pass(check_returns)
-    violations = be.find_oversell_violations(
-        list(gate_passes.values()),
-        check_delivered,
-        check_returned,
+    # A DRAFT contributes nothing to the movements (drafts are filtered out of
+    # every aggregate), so it can never trip the invariant against itself.
+    violations = (
+        []
+        if is_draft
+        else be.find_oversell_violations(
+            list(gate_passes.values()),
+            check_delivered,
+            check_returned,
+        )
     )
     if violations:
         await deliveries_collection.delete_one({"_id": result.inserted_id})
@@ -299,8 +315,10 @@ async def create_delivery(
         check_delivered,
         check_returned,
     )
-    await ctx.refresh_gate_pass_statuses(source_ids)
-    await ctx.sync_gate_passes(source_ids)
+    # Drafts must not move any pass forward; activation does that later.
+    if not is_draft:
+        await ctx.refresh_gate_pass_statuses(source_ids)
+        await ctx.sync_gate_passes(source_ids)
 
     new_version = await bump_version("delivery", result.inserted_id)
     await enqueue_sync("delivery", result.inserted_id, new_version)
@@ -309,8 +327,17 @@ async def create_delivery(
     serialized = _serialize(created_doc)
     serialized = await attach_verification_to("delivery", result.inserted_id, serialized)
 
+# Journal one event per source gate pass so each pass's ledger stays
+    # self-describing. A DRAFT records the creation only: no status movement
+    # happens until the delivery is explicitly activated.
     for gp_id in source_ids:
-        balance = balances.get(gp_id, {})
+        gp_status_before = (gate_passes.get(gp_id) or {}).get("status")
+        if is_draft:
+            derived_status = gp_status_before
+        else:
+            derived_status = be.derive_gate_pass_status(
+                balances.get(gp_id, {}), gp_status_before or ""
+            )
         await record_event(
             entity_type="delivery",
             entity_id=delivery_id,
@@ -324,12 +351,14 @@ async def create_delivery(
                 if str(line.get("gate_pass_id")) == gp_id
             ],
             reason=payload.notes,
-            prev_status=gate_passes[gp_id].get("status"),
-            new_status=be.derive_gate_pass_status(balance, gate_passes[gp_id].get("status", "")),
+            prev_status=gp_status_before,
+            new_status=derived_status,
             meta={
                 "delivery_date": delivery_date.isoformat(),
                 "source_gate_pass_ids": source_ids,
                 "client_name": canonical_client,
+                "draft": is_draft,
+                "origin": payload.origin,
             },
         )
 
@@ -341,6 +370,140 @@ async def create_delivery(
         {"source_gate_pass_ids": source_ids, "client_name": canonical_client},
     )
     await idempotency.record_created(request, auth_id, "delivery", delivery_id)
+    return serialized
+
+
+@router.post("/{delivery_id}/activate", response_model=DeliveryModel)
+async def activate_delivery(
+    delivery_id: str,
+    current_user: dict = Depends(require_capability("delivery:write")),
+):
+    """Activate a DRAFT delivery created by the monthly flow.
+
+    A DRAFT delivery is a daily-manifest placeholder: balance math, pending
+    lists and the destination gate pass are all unaffected while it stays
+    DRAFT. Activating turns it into a real DELIVERED record, re-validates
+    every line against the LIVE available balance on its source gate pass
+    (received - already delivered by other active deliveries +/- returns),
+    then re-derives the gate pass status from recorded quantities.
+    """
+    oid = _parse_object_id(delivery_id)
+    doc = await deliveries_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
+        )
+    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+    if decrypted.get("status") != "DRAFT":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Delivery is '{decrypted.get('status')}' and cannot be activated.",
+        )
+
+    gp_id = decrypted.get("gate_pass_id")
+    gp_oid = _parse_object_id(gp_id)
+    gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
+    if not gp_doc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Referenced Gate Pass no longer exists; cannot activate this delivery.",
+        )
+    gp_decrypted = decrypt_dict(gp_doc, GATE_PASS_SENSITIVE_FIELDS)
+
+    received_map: Dict[str, int] = {}
+    for gp_item in gp_decrypted.get("items", []):
+        key = be.item_key(gp_item["item_name"], gp_item.get("specification"))
+        received_map[key] = received_map.get(key, 0) + gp_item["received_qty"]
+
+    # Live availability excludes this DRAFT itself (and other drafts): only
+    # active (DELIVERED) records consume the balance. Attribution is per source
+    # gate pass, so stock delivered from a DIFFERENT pass for the same hotel
+    # cannot shrink this pass's availability.
+    active_deliveries: List[dict] = []
+    prev_cursor = deliveries_collection.find(
+        {"gate_pass_id": gp_id, "status": {"$nin": ["CANCELLED", "DRAFT"]}}
+    )
+    async for prev_doc in prev_cursor:
+        try:
+            active_deliveries.append(decrypt_dict(prev_doc, SENSITIVE_FIELDS))
+        except Exception:
+            continue
+    delivered_map = be.compute_delivered_by_gate_pass(active_deliveries).get(gp_id, {})
+
+    # Re-validate every line at the moment of activation.
+    for item in decrypted.get("items", []):
+        key = be.item_key(item["item_name"], item.get("specification"))
+        received = received_map.get(key, 0)
+        if received <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"'{item['item_name']}' was never received on the source gate pass.",
+            )
+        already = delivered_map.get(key, 0)
+        available = max(0, received - already)
+        if item["quantity"] > available:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Cannot deliver {item['quantity']} of '{item['item_name']}'"
+                    f" (available {available}, received {received}, already "
+                    f"delivered {already}). Activate deliveries in an order that "
+                    "respects the gate pass balance."
+                ),
+            )
+
+    now = datetime.now(timezone.utc)
+    decrypted["status"] = "DELIVERED"
+    decrypted["updated_at"] = now
+    encrypted = encrypt_dict(decrypted, SENSITIVE_FIELDS)
+    await deliveries_collection.replace_one({"_id": oid}, encrypted)
+
+    new_version = await bump_version("delivery", oid)
+    await enqueue_sync("delivery", oid, new_version)
+    serialized = _serialize(await deliveries_collection.find_one({"_id": oid}))
+    serialized = await attach_verification_to("delivery", oid, serialized)
+
+    # Re-derive the gate pass status from recorded quantities.
+    delivered_map_now = be.compute_delivered_by_gate_pass(
+        active_deliveries + [decrypted]
+    ).get(gp_id, {})
+    returns: List[dict] = []
+    ret_cursor = returns_collection.find({"gate_pass_id": gp_id})
+    async for ret_doc in ret_cursor:
+        try:
+            returns.append(decrypt_dict(ret_doc, ["client_name", "items", "notes"]))
+        except Exception:
+            continue
+    returned_map = be.compute_returned_by_item(returns)
+    balance = be.compute_gate_pass_balance(
+        gp_decrypted.get("items", []), delivered_map_now, returned_map
+    )
+    new_gp_status = be.derive_gate_pass_status(balance, gp_decrypted.get("status", ""))
+    await gatepasses_collection.update_one(
+        {"_id": gp_oid},
+        {"$set": {"status": new_gp_status, "updated_at": now}},
+    )
+    gp_new_version = await bump_version("gatepass", gp_oid)
+    await enqueue_sync("gatepass", gp_oid, gp_new_version)
+
+    await record_event(
+        entity_type="delivery",
+        entity_id=serialized["id"],
+        event_type=EVENT_DELIVERY_ACTIVATED,
+        gate_pass_id=gp_id,
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        prev_status="DRAFT",
+        new_status="DELIVERED",
+        meta={"activated": True, "new_gate_pass_status": new_gp_status},
+    )
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "DELIVERY_ACTIVATE",
+        "delivery",
+        serialized["id"],
+    )
     return serialized
 
 
@@ -828,10 +991,12 @@ async def pending_gatepasses(
     matches the number they are shown.
     """
     gate_passes = await ctx.load_gate_passes()
+    # DRAFT passes are excluded: an unactivated monthly grid is not yet stock
+    # anyone may deliver against. `build_availability` filters them again.
     gate_passes = [
         gp
         for gp in gate_passes
-        if gp.get("status") != be.CANCELLED_STATUS
+        if gp.get("status") not in (be.CANCELLED_STATUS, be.DRAFT_STATUS)
         and (not client_name or be.same_client(gp.get("client_name"), client_name))
     ]
     gp_ids = [str(gp["gate_pass_id"]) for gp in gate_passes]

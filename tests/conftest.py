@@ -7,8 +7,23 @@ bindings (``from ..database.main_db import X``) resolve to the mock.
 
 ``asyncio_mode = auto`` (pytest.ini) lets tests and fixtures be plain
 ``async def`` with no decorators.
+
+The service modules refuse to import without their secrets (deliberate: a
+missing MASTER_KEY must never silently fall back to a hard-coded key in
+production). The platform injects those in a real deployment, so the harness
+supplies deterministic test-only values *before* any bill_service import.
+Real environment variables always win, and nothing here weakens the
+production check.
 """
 import importlib
+import os
+
+# Must run before the bill_service imports below.
+os.environ.setdefault("JWT_SECRET", "test-only-jwt-secret")
+os.environ.setdefault("MASTER_KEY", "test-only-master-key-love-laundry")
+os.environ.setdefault("SECONDARY_MASTER_KEY", "test-only-secondary-master-key")
+os.environ.setdefault("LOCAL_MASTER_KEY", "test-only-local-master-key")
+os.environ.setdefault("ENCRYPTION_MODE", "single")
 
 import pytest
 from mongomock_motor import AsyncMongoMockClient
@@ -30,8 +45,10 @@ COLLECTION_NAMES = [
     "linen_events_collection",
     "linens_collection",
     "loyalty_collection",
+    "monthly_entries_collection",
     "payments_collection",
     "returns_collection",
+    "rewashes_collection",
     "shop_bills_collection",
     "sync_logs_collection",
     "sync_queue_collection",
@@ -50,12 +67,14 @@ DEPENDENT_MODULES = [
     "bill_service.services.bill_sync",
     "bill_service.services.balance_engine",
     "bill_service.services.operations_context",
+    "bill_service.services.gate_pass_records",
     "bill_service.routers.bills",
     "bill_service.routers.gatepasses",
     "bill_service.routers.deliveries",
     "bill_service.routers.returns",
     "bill_service.routers.adjustments",
     "bill_service.routers.day_close",
+    "bill_service.routers.monthly",
 ]
 
 

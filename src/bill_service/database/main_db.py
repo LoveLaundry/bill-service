@@ -26,6 +26,8 @@ idempotency_collection: AsyncIOMotorCollection = _db.get_collection("idempotency
 shop_bills_collection: AsyncIOMotorCollection = _db.get_collection("shop_bills")
 bill_templates_collection: AsyncIOMotorCollection = _db.get_collection("bill_templates")
 legacy_invoices_collection: AsyncIOMotorCollection = _db.get_collection("legacy_invoices")
+rewashes_collection: AsyncIOMotorCollection = _db.get_collection("rewashes")
+monthly_entries_collection: AsyncIOMotorCollection = _db.get_collection("monthly_entries")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")
@@ -132,6 +134,21 @@ async def ensure_indexes():
     await legacy_invoices_collection.create_index("invoice_number", unique=True)
     await legacy_invoices_collection.create_index("shop_name_search")
     await legacy_invoices_collection.create_index("created_at")
+
+    # Rewash indexes
+    await rewashes_collection.create_index("rewash_number", unique=True)
+    await rewashes_collection.create_index("client_name_search")
+    await rewashes_collection.create_index("date")
+    await rewashes_collection.create_index("status")
+
+    # Monthly entries: one doc per (client_name, kind, year, month).
+    # The unique index prevents duplicate month docs; day-level uniqueness is
+    # enforced inside the single day map (no cross-document race possible).
+    await monthly_entries_collection.create_index(
+        [("client_name", 1), ("kind", 1), ("year", 1), ("month", 1)], unique=True
+    )
+    await monthly_entries_collection.create_index("client_name_search")
+    await monthly_entries_collection.create_index([("year", 1), ("month", 1)])
 
     # Sync infrastructure indexes
     await sync_status_collection.create_index([("entity", 1), ("record_id", 1)], unique=True)
