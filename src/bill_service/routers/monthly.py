@@ -251,12 +251,35 @@ def _row_lookup(rows: List[dict]) -> Dict[str, dict]:
 # Matrix read
 # --------------------------------------------------------------------------
 def _day_states(doc: Optional[dict], month_length: int) -> List[dict]:
+    """Serialize every day of the month.
+
+    Every day carries the FULL shape - including its quantities and the IDs of
+    the records it generated - because the grid's day dialog reads them to
+    re-open a day as it was entered and to offer "Activate" on the records a
+    confirmed day created. Returning a partial dict here would not error: the
+    response model would silently substitute empty defaults, and the operator
+    would see a day they had entered as blank with nothing to activate.
+    """
     days_map = (doc or {}).get("days") or {}
     out = []
     for day in range(1, month_length + 1):
         st = days_map.get(str(day))
         if not st:
-            out.append({"day": day, "date": "", "status": "EMPTY", "total_qty": 0})
+            out.append(
+                {
+                    "day": day,
+                    "date": "",
+                    "status": "EMPTY",
+                    "total_qty": 0,
+                    "quantities": {},
+                    "gate_pass_ids": [],
+                    "delivery_ids": [],
+                    "rewash_ids": [],
+                    "confirmed_by": None,
+                    "confirmed_at": None,
+                    "notes": None,
+                }
+            )
             continue
         out.append(
             {
@@ -264,6 +287,15 @@ def _day_states(doc: Optional[dict], month_length: int) -> List[dict]:
                 "date": st.get("date", ""),
                 "status": st.get("status", "DRAFT"),
                 "total_qty": int(st.get("total_qty", 0) or 0),
+                "quantities": {
+                    str(k): int(v) for k, v in (st.get("quantities") or {}).items()
+                },
+                "gate_pass_ids": list(st.get("gate_pass_ids") or []),
+                "delivery_ids": list(st.get("delivery_ids") or []),
+                "rewash_ids": list(st.get("rewash_ids") or []),
+                "confirmed_by": st.get("confirmed_by"),
+                "confirmed_at": st.get("confirmed_at"),
+                "notes": st.get("notes"),
             }
         )
     return out
