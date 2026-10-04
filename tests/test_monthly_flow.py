@@ -140,6 +140,7 @@ async def test_monthly_manual_references_round_trip_to_gate_pass(mocked_db):
         user(),
         request=_req(),
     )
+    assert bill["receiving_date"] == gate_pass["receiving_date"]
     assert bill["manual_bill_number"] == "DAY-BILL-17"
     assert bill["manual_gate_pass_number"] == "HOTEL-GP-17"
     assert bill["alrs_number"] == "ALRS-17"

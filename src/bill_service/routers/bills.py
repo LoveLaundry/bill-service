@@ -57,6 +57,42 @@ def _serialize(doc: dict) -> dict:
     return decrypted
 
 
+async def _attach_receiving_date(bill_doc: dict, serialized: dict) -> dict:
+    """Expose the linked gate pass's received date on bills for invoice rows."""
+    gate_pass = None
+    gate_pass_id = bill_doc.get("gate_pass_id")
+    if gate_pass_id and ObjectId.is_valid(str(gate_pass_id)):
+        gate_pass = await gatepasses_collection.find_one(
+            {"_id": ObjectId(str(gate_pass_id))}
+        )
+
+    if gate_pass is None:
+        for delivery_id in bill_doc.get("delivery_ids") or []:
+            if not ObjectId.is_valid(str(delivery_id)):
+                continue
+            delivery = await deliveries_collection.find_one(
+                {"_id": ObjectId(str(delivery_id))}
+            )
+            if not delivery:
+                continue
+            source_ids = delivery.get("source_gate_pass_ids") or [
+                delivery.get("gate_pass_id")
+            ]
+            for source_id in source_ids:
+                if source_id and ObjectId.is_valid(str(source_id)):
+                    gate_pass = await gatepasses_collection.find_one(
+                        {"_id": ObjectId(str(source_id))}
+                    )
+                    if gate_pass:
+                        break
+            if gate_pass:
+                break
+
+    if gate_pass:
+        serialized["receiving_date"] = gate_pass.get("receiving_date")
+    return serialized
+
+
 def _item_unit(item_name: str, unit: Optional[str] = None) -> str:
     return unit or ("kg" if "curtain" in item_name.casefold() else "pcs")
 
@@ -643,6 +679,7 @@ async def create_bill(
         "outstanding_amount": outstanding_amount,
         "delivery_ids": del_ids_to_save,
         "gate_pass_id": payload.gate_pass_id,
+        "receiving_date": gp_dec.get("receiving_date") if gp_dec else None,
         "manual_bill_number": gp_dec.get("manual_bill_number") if gp_dec else None,
         "manual_gate_pass_number": gp_dec.get("manual_gate_pass_number") if gp_dec else None,
         "alrs_number": gp_dec.get("alrs_number") if gp_dec else None,
@@ -748,7 +785,19 @@ async def list_bills(
             }
         })
 
-        # Drop the gp join field before returning
+        pipeline.append(
+            {
+                "$addFields": {
+                    "receiving_date": {
+                        "$ifNull": [
+                            "$receiving_date",
+                            {"$arrayElemAt": ["$gp.receiving_date", 0]},
+                        ]
+                    }
+                }
+            }
+        )
+        # Drop the gate-pass join field after exposing the date.
         pipeline.append({"$project": {"gp": 0}})
 
         # Count total before sort/skip/limit
@@ -766,6 +815,7 @@ async def list_bills(
         async for doc in cursor:
             try:
                 serialized = _serialize(doc)
+                serialized = await _attach_receiving_date(doc, serialized)
                 docs.append(await attach_verification_to("bill", doc["_id"], serialized))
             except HTTPException:
                 pass
@@ -807,6 +857,7 @@ async def list_bills(
     async for doc in cursor:
         try:
             serialized = _serialize(doc)
+            serialized = await _attach_receiving_date(doc, serialized)
             docs.append(await attach_verification_to("bill", doc["_id"], serialized))
         except HTTPException:
             pass

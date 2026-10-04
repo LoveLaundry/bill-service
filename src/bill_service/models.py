@@ -385,6 +385,7 @@ class BillModel(BaseModel):
     paid_amount: float = 0.0
     outstanding_amount: float
     delivery_ids: Optional[List[str]] = []
+    receiving_date: Optional[datetime] = None
     notes: Optional[str] = None
     created_at: datetime
     updated_at: datetime
