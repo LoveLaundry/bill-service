@@ -38,6 +38,7 @@ would be duplicated between passes.
 
 The engine is pure (no database access). Callers pass decrypted documents.
 """
+import math
 from typing import Dict, Iterable, List, Optional, Set
 
 
@@ -140,7 +141,7 @@ def source_gate_pass_ids(delivery: dict) -> List[str]:
 
 def compute_delivered_by_gate_pass(
     delivery_docs: Iterable[dict],
-) -> Dict[str, Dict[str, int]]:
+) -> Dict[str, Dict[str, float]]:
     """Delivered quantities grouped by the gate pass each line came from.
 
     This is the ONLY correct way to derive a per-gate-pass balance. Summing a
@@ -150,7 +151,7 @@ def compute_delivered_by_gate_pass(
     DRAFT deliveries are excluded for the same reason as in the hotel-wide
     view: an unactivated monthly grid must not consume the pass's stock.
     """
-    out: Dict[str, Dict[str, int]] = {}
+    out: Dict[str, Dict[str, float]] = {}
     for dl in delivery_docs or []:
         if dl.get("status") in (CANCELLED_STATUS, DRAFT_STATUS):
             continue
@@ -162,34 +163,34 @@ def compute_delivered_by_gate_pass(
                 continue
             key = item_key(it.get("item_name", ""), it.get("specification"))
             bucket = out.setdefault(gp_id, {})
-            bucket[key] = bucket.get(key, 0) + int(it.get("quantity", 0) or 0)
+            bucket[key] = bucket.get(key, 0) + float(it.get("quantity", 0) or 0)
     return out
 
 
-def gate_pass_received_map(gp_items: List[dict]) -> Dict[str, int]:
+def gate_pass_received_map(gp_items: List[dict]) -> Dict[str, float]:
     """Received quantities for one gate pass, keyed canonically."""
-    out: Dict[str, int] = {}
+    out: Dict[str, float] = {}
     for it in gp_items or []:
         key = item_key(it.get("item_name", ""), it.get("specification"))
-        out[key] = out.get(key, 0) + int(it.get("received_qty", 0) or 0)
+        out[key] = out.get(key, 0) + float(it.get("received_qty", 0) or 0)
     return out
 
 
 def compute_available(
-    received_by_item: Dict[str, int],
-    delivered_by_item: Optional[Dict[str, int]] = None,
-    returned_by_item: Optional[Dict[str, int]] = None,
-) -> Dict[str, int]:
+    received_by_item: Dict[str, float],
+    delivered_by_item: Optional[Dict[str, float]] = None,
+    returned_by_item: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
     """Quantity still deliverable per item, never negative.
 
     available = received - delivered + returned-but-not-yet-resent
     """
     delivered_by_item = delivered_by_item or {}
     returned_by_item = returned_by_item or {}
-    out: Dict[str, int] = {}
+    out: Dict[str, float] = {}
     for key, received in received_by_item.items():
-        value = int(received or 0) - int(delivered_by_item.get(key, 0) or 0)
-        value += int(returned_by_item.get(key, 0) or 0)
+        value = float(received or 0) - float(delivered_by_item.get(key, 0) or 0)
+        value += float(returned_by_item.get(key, 0) or 0)
         out[key] = max(0, value)
     return out
 
@@ -204,7 +205,7 @@ def flatten_name(key: str) -> str:
     return key.split("||", 1)[0]
 
 
-def compute_delivered_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
+def compute_delivered_by_item(delivery_docs: List[dict]) -> Dict[str, float]:
     """Sum delivered quantities across non-cancelled, non-draft deliveries.
 
     This is a HOTEL-WIDE view only (used for cross-pass totals such as
@@ -216,24 +217,24 @@ def compute_delivered_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
     they are explicitly activated to DELIVERED, so an unconfirmed grid never
     consumes stock.
     """
-    out: Dict[str, int] = {}
+    out: Dict[str, float] = {}
     for dl in delivery_docs:
         if dl.get("status") in (CANCELLED_STATUS, DRAFT_STATUS):
             continue
         for it in dl.get("items", []):
             key = item_key(it.get("item_name", ""), it.get("specification"))
-            out[key] = out.get(key, 0) + int(it.get("quantity", 0) or 0)
+            out[key] = out.get(key, 0) + float(it.get("quantity", 0) or 0)
     return out
 
 
-def compute_counted_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
+def compute_counted_by_item(delivery_docs: List[dict]) -> Dict[str, float]:
     """Sum the CLIENT-COUNTED quantities across non-cancelled, non-draft deliveries.
 
     Only lines where the client actually counted (``client_counted_qty`` is a
     number) contribute. A delivery with no count contributes nothing, so a
     pass that was never reconciled does not look like a zero-count pass.
     """
-    out: Dict[str, int] = {}
+    out: Dict[str, float] = {}
     for dl in delivery_docs:
         if dl.get("status") in (CANCELLED_STATUS, DRAFT_STATUS):
             continue
@@ -242,18 +243,18 @@ def compute_counted_by_item(delivery_docs: List[dict]) -> Dict[str, int]:
             if counted is None:
                 continue
             key = item_key(it.get("item_name", ""), it.get("specification"))
-            out[key] = out.get(key, 0) + int(counted or 0)
+            out[key] = out.get(key, 0) + float(counted or 0)
     return out
 
 
-def compute_returned_by_item(return_docs: List[dict]) -> Dict[str, int]:
+def compute_returned_by_item(return_docs: List[dict]) -> Dict[str, float]:
     """Sum return-back quantities that still need re-sending.
 
     Only RECEIVE_BACK / RE_WASH items that have NOT been re-sent yet count
     as pending. Returns are attributed to the gate pass they carry; the
     caller is responsible for grouping by gate_pass_id.
     """
-    out: Dict[str, int] = {}
+    out: Dict[str, float] = {}
     for ret in return_docs:
         for it in ret.get("items", []):
             if not isinstance(it, dict):
@@ -263,7 +264,7 @@ def compute_returned_by_item(return_docs: List[dict]) -> Dict[str, int]:
             if it.get("resend_status") == "SENT":
                 continue
             key = item_key(it.get("item_name", ""), it.get("specification"))
-            qty = int(it.get("returned_qty", 0) or 0)
+            qty = float(it.get("returned_qty", 0) or 0)
             if qty > 0:
                 out[key] = out.get(key, 0) + qty
     return out
@@ -271,11 +272,11 @@ def compute_returned_by_item(return_docs: List[dict]) -> Dict[str, int]:
 
 def compute_gate_pass_balance(
     gp_items: List[dict],
-    delivered_by_item: Dict[str, int],
-    returned_by_item: Optional[Dict[str, int]] = None,
+    delivered_by_item: Dict[str, float],
+    returned_by_item: Optional[Dict[str, float]] = None,
     *,
     marked_delivered: bool = False,
-    counted_by_item: Optional[Dict[str, int]] = None,
+    counted_by_item: Optional[Dict[str, float]] = None,
 ) -> dict:
     """Compute the full per-item balance for one gate pass.
 
@@ -308,18 +309,18 @@ def compute_gate_pass_balance(
         name = it.get("item_name", "")
         spec = it.get("specification")
         key = item_key(name, spec)
-        expected = int(it.get("client_qty", 0) or 0)
-        received = int(it.get("received_qty", 0) or 0)
+        expected = float(it.get("client_qty", 0) or 0)
+        received = float(it.get("received_qty", 0) or 0)
         rejected = 0
-        delivered = int(delivered_by_item.get(key, 0) or 0)
-        returned = int((returned_by_item or {}).get(key, 0) or 0)
+        delivered = float(delivered_by_item.get(key, 0) or 0)
+        returned = float((returned_by_item or {}).get(key, 0) or 0)
 
         counted = (counted_by_item or {}).get(key)
         has_count = counted is not None
         # Positive => we recorded more than the client counted (short-delivered,
         # owed back to the client). Negative => we recorded less than they
         # counted (over-delivered).
-        discrepancy = (delivered - int(counted)) if has_count else 0
+        discrepancy = (delivered - float(counted)) if has_count else 0
 
         effective_delivered = max(delivered, received) if marked_delivered else delivered
         outstanding = max(0, received - effective_delivered + returned)
@@ -358,7 +359,7 @@ def compute_gate_pass_balance(
             "outstanding_delivery_qty": outstanding,
             "not_received_qty": not_received,
             "extra_received_qty": extra_received,
-            "client_counted_qty": int(counted) if has_count else None,
+            "client_counted_qty": float(counted) if has_count else None,
             "discrepancy_qty": discrepancy,
             "has_count": has_count,
             "flags": item_flags,
@@ -370,7 +371,7 @@ def compute_gate_pass_balance(
         totals["returned_back_qty"] += returned
         totals["outstanding_delivery_qty"] += outstanding
         totals["not_received_qty"] += not_received
-        totals["client_counted_qty"] += int(counted) if has_count else 0
+        totals["client_counted_qty"] += float(counted) if has_count else 0
         totals["discrepancy_qty"] += discrepancy
 
     return {
@@ -445,8 +446,8 @@ def compute_outstanding_per_item(gp_items: List[dict], balance: dict) -> List[di
 
 def compute_billable_on_received(
     gp_items: List[dict],
-    billed_by_item: Optional[Dict[str, int]] = None,
-) -> Dict[str, int]:
+    billed_by_item: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
     """Billable quantity per item based on the approved RECEIVED quantity.
 
     The billable event is the received quantity (business decision). Billable
@@ -455,21 +456,21 @@ def compute_billable_on_received(
     are skipped entirely so they can never leak into a bill.
     """
     billed_by_item = billed_by_item or {}
-    out: Dict[str, int] = {}
+    out: Dict[str, float] = {}
     for it in gp_items:
         if is_rewashed(it):
             continue
         key = item_key(it.get("item_name", ""), it.get("specification"))
-        received = int(it.get("received_qty", 0) or 0)
-        billed = int(billed_by_item.get(key, 0) or 0)
+        received = float(it.get("received_qty", 0) or 0)
+        billed = float(billed_by_item.get(key, 0) or 0)
         out[key] = max(0, received - billed)
     return out
 
 
 def compute_billable_received_by_name(
     gp_items_list: List[dict],
-    billed_by_name: Optional[Dict[str, int]] = None,
-) -> Dict[str, int]:
+    billed_by_name: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
     """Billable quantities for billing, aggregated by item NAME.
 
     Billing lines are item-name based (spec is not part of a bill line), so
@@ -478,12 +479,12 @@ def compute_billable_received_by_name(
     are excluded so they are never billed.
     """
     billed_by_name = billed_by_name or {}
-    received_by_name: Dict[str, int] = {}
+    received_by_name: Dict[str, float] = {}
     for it in gp_items_list:
         if is_rewashed(it):
             continue
         name = it.get("item_name", "")
-        received_by_name[name] = received_by_name.get(name, 0) + int(it.get("received_qty", 0) or 0)
+        received_by_name[name] = received_by_name.get(name, 0) + float(it.get("received_qty", 0) or 0)
     return {
         name: max(0, received_by_name[name] - billed_by_name.get(name, 0))
         for name in received_by_name
@@ -494,7 +495,7 @@ def detect_reconciliation_issues(
     balance: dict,
     status: str,
     legacy_marked: bool,
-    billed_by_name: Optional[Dict[str, int]] = None,
+    billed_by_name: Optional[Dict[str, float]] = None,
 ) -> List[dict]:
     """Detect reconciliation issues for one gate pass (pure, DB-free).
 
@@ -557,9 +558,9 @@ def detect_reconciliation_issues(
                 }
             )
 
-    received_by_name: Dict[str, int] = {}
-    delivered_by_name: Dict[str, int] = {}
-    expected_by_name: Dict[str, int] = {}
+    received_by_name: Dict[str, float] = {}
+    delivered_by_name: Dict[str, float] = {}
+    expected_by_name: Dict[str, float] = {}
     for it in (balance.get("items") or {}).values():
         name = it.get("item_name", "")
         received_by_name[name] = received_by_name.get(name, 0) + it.get("received_qty", 0)
@@ -593,7 +594,7 @@ def apply_received_correction(
     gp_items: List[dict],
     item_name: str,
     specification: Optional[str],
-    corrected_qty: int,
+    corrected_qty: float,
 ):
     """Apply an APPROVED received-quantity correction without mutating history.
 
@@ -602,18 +603,18 @@ def apply_received_correction(
     record in the journal; the source documents themselves are never edited.
     """
     updated: List[dict] = []
-    original: Optional[int] = None
+    original: Optional[float] = None
     found = False
     for it in gp_items:
         if (
             it.get("item_name") == item_name
             and (it.get("specification") or "") == (specification or "")
         ):
-            original = int(it.get("received_qty", 0) or 0)
+            original = float(it.get("received_qty", 0) or 0)
             new_item = dict(it)
             new_item["received_qty"] = corrected_qty
             try:
-                new_item["difference"] = corrected_qty - int(it.get("client_qty", 0) or 0)
+                new_item["difference"] = corrected_qty - float(it.get("client_qty", 0) or 0)
             except Exception:
                 new_item["difference"] = 0
             updated.append(new_item)
@@ -647,8 +648,8 @@ class DeliveryValidationError(ValueError):
 
 def find_oversell_violations(
     gate_pass_docs: List[dict],
-    delivered_by_gp: Dict[str, Dict[str, int]],
-    returned_by_gp: Optional[Dict[str, Dict[str, int]]] = None,
+    delivered_by_gp: Dict[str, Dict[str, float]],
+    returned_by_gp: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> List[dict]:
     """Any (gate pass, item) whose confirmed OUT exceeds its received IN.
 
@@ -673,8 +674,8 @@ def find_oversell_violations(
             if not isinstance(gp_item, dict):
                 continue
             key = item_key(gp_item.get("item_name"), gp_item.get("specification"))
-            received_qty = int(gp_item.get("received_qty", 0) or 0)
-            out_qty = int(delivered.get(key, 0) or 0) - int(returned.get(key, 0) or 0)
+            received_qty = float(gp_item.get("received_qty", 0) or 0)
+            out_qty = float(delivered.get(key, 0) or 0) - float(returned.get(key, 0) or 0)
             if out_qty > received_qty:
                 violations.append(
                     {
@@ -683,8 +684,8 @@ def find_oversell_violations(
                         "item_name": gp_item.get("item_name"),
                         "specification": gp_item.get("specification") or "",
                         "received_qty": received_qty,
-                        "delivered_qty": int(delivered.get(key, 0) or 0),
-                        "returned_qty": int(returned.get(key, 0) or 0),
+                        "delivered_qty": float(delivered.get(key, 0) or 0),
+                        "returned_qty": float(returned.get(key, 0) or 0),
                         "detail": (
                             f"{gp_item.get('item_name')}: {out_qty} out exceeds "
                             f"{received_qty} received on gate pass {gp_id}"
@@ -697,7 +698,7 @@ def find_oversell_violations(
 def plan_delivery_lines(
     requested_lines: List[dict],
     gate_passes: Dict[str, dict],
-    available_by_gp: Dict[str, Dict[str, int]],
+    available_by_gp: Dict[str, Dict[str, float]],
     *,
     default_gate_pass_id: Optional[str] = None,
     exclude_delivery_id: Optional[str] = None,
@@ -729,7 +730,7 @@ def plan_delivery_lines(
         item_name = (raw.get("item_name") or "").strip()
         spec = (raw.get("specification") or "") or None
         try:
-            qty = int(raw.get("quantity") or 0)
+            qty = float(raw.get("quantity") or 0)
         except (TypeError, ValueError):
             qty = 0
         gp_id = str(raw.get("gate_pass_id") or default_gate_pass_id or "")
@@ -739,12 +740,21 @@ def plan_delivery_lines(
                 {"item_name": "", "specification": spec or "", "detail": "Item name is required."}
             )
             continue
-        if qty <= 0:
+        if not math.isfinite(qty) or qty <= 0:
             errors.append(
                 {
                     "item_name": item_name,
                     "specification": spec or "",
-                    "detail": f"Quantity must be at least 1 (received {qty}).",
+                    "detail": f"Quantity must be greater than 0 (received {qty}).",
+                }
+            )
+            continue
+        if "curtain" not in item_name.casefold() and not qty.is_integer():
+            errors.append(
+                {
+                    "item_name": item_name,
+                    "specification": spec or "",
+                    "detail": "Only curtain quantities may use fractional kilograms.",
                 }
             )
             continue
@@ -832,7 +842,7 @@ def plan_delivery_lines(
             )
             continue
 
-        received = int((available_by_gp.get(gp_id) or {}).get(key, 0) or 0)
+        received = float((available_by_gp.get(gp_id) or {}).get(key, 0) or 0)
         if received <= 0:
             # Either the item was never received on this pass, or it is already
             # fully delivered. Distinguish so the operator knows which.
@@ -892,8 +902,8 @@ def plan_delivery_lines(
 
 def build_availability(
     gate_pass_docs: List[dict],
-    delivered_by_gp: Dict[str, Dict[str, int]],
-    returned_by_gp: Optional[Dict[str, Dict[str, int]]] = None,
+    delivered_by_gp: Dict[str, Dict[str, float]],
+    returned_by_gp: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> List[dict]:
     """Per-gate-pass deliverable inventory, with full origin traceability.
 

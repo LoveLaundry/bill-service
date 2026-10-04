@@ -26,9 +26,11 @@ class GatePassItem(BaseModel):
     item_name: str
     category: Optional[str] = None
     specification: Optional[str] = None
-    client_qty: int = Field(ge=0)
-    received_qty: int = Field(ge=0)
-    difference: int = 0
+    client_qty: float = Field(ge=0)
+    received_qty: float = Field(ge=0)
+    difference: float = 0
+    unit: Optional[str] = None
+    piece_count: int = Field(default=0, ge=0)
     mismatch_reason: Optional[str] = None  # MISSING, EXTRA, COUNTING_ERROR, DAMAGED, OTHER
     mismatch_notes: Optional[str] = None
     rewashed: bool = Field(default=False, description="Tagged as a free re-wash; never billed")
@@ -56,7 +58,7 @@ class GatePassAdjustment(BaseModel):
 
     item_name: str
     specification: Optional[str] = None
-    corrected_qty: int = Field(ge=0)
+    corrected_qty: float = Field(ge=0)
     reason: str = Field(min_length=1, description="Reason is mandatory")
 
 
@@ -89,7 +91,7 @@ class GatePassMarkDelivered(BaseModel):
 class CatchUpDeliveryItem(BaseModel):
     item_name: str
     specification: Optional[str] = None
-    quantity: int = Field(gt=0)
+    quantity: float = Field(gt=0)
 
 
 class GatePassCatchUpDelivery(BaseModel):
@@ -116,7 +118,7 @@ class GatePassAdjustmentRequest(BaseModel):
     gate_pass_id: str
     item_name: str
     specification: Optional[str] = None
-    corrected_qty: int = Field(ge=0)
+    corrected_qty: float = Field(ge=0)
     reason: str = Field(min_length=1, description="Reason is mandatory")
 
 
@@ -151,16 +153,16 @@ class DeliveryItem(BaseModel):
     # Optional for backwards compatibility: legacy lines without it fall back to
     # the delivery's `gate_pass_id`.
     gate_pass_id: Optional[str] = None
-    quantity: int = Field(gt=0)
+    quantity: float = Field(gt=0)
     # Quantity the client's own representative counted on taking delivery.
     # None means the client did not count (the common case). When present it is
     # reconciled against `quantity` into `discrepancy`, and a non-zero
     # discrepancy is a quantity balance owed to the client -- deliberately kept
     # out of the money ledger, so a disputed count never silently changes an
     # invoice.
-    client_counted_qty: Optional[int] = Field(default=None, ge=0)
+    client_counted_qty: Optional[float] = Field(default=None, ge=0)
     # recorded - counted (>0 short-delivered, <0 over-delivered). Server-owned.
-    discrepancy: int = 0
+    discrepancy: float = 0
     mismatch_reason: Optional[str] = None  # MISSING, EXTRA, COUNTING_ERROR, DAMAGED, OTHER
     mismatch_notes: Optional[str] = None
 
@@ -199,7 +201,7 @@ class DeliveryItemCorrection(BaseModel):
     item_name: str
     specification: Optional[str] = None
     gate_pass_id: Optional[str] = None
-    quantity: int = Field(ge=0, description="Corrected delivered quantity. 0 removes the line.")
+    quantity: float = Field(ge=0, description="Corrected delivered quantity. 0 removes the line.")
 
 
 class DeliveryCorrection(BaseModel):
@@ -320,15 +322,19 @@ class BillItemIn(BaseModel):
     item_name: str
     category: Optional[str] = None
     unit_price: float = Field(ge=0)
-    quantity: int = Field(gt=0)
+    quantity: float = Field(gt=0)
+    piece_count: int = Field(default=0, ge=0)
+    unit: Optional[str] = None
 
 
 class BillItemOut(BaseModel):
     item_name: str
     category: Optional[str] = None
     unit_price: float
-    quantity: int
+    quantity: float
     line_total: float
+    piece_count: int = 0
+    unit: Optional[str] = None
 
 
 class BillCreate(BaseModel):
@@ -359,7 +365,7 @@ class BillModel(BaseModel):
     client_name: str
     quotation_title: Optional[str] = None
     items: List[BillItemOut]
-    total_quantity: int
+    total_quantity: float
     total_amount: float  # Base amount before adjustments
     discounts: float = 0.0
     transport_fee: float = 0.0
@@ -604,7 +610,7 @@ RETURN_STATUSES = ["PENDING", "RECEIVED", "PROCESSED"]
 class ReturnItem(BaseModel):
     item_name: str
     specification: Optional[str] = None
-    returned_qty: int = Field(gt=0)
+    returned_qty: float = Field(gt=0)
     reason: str  # WRONG_ITEM, DAMAGED, MISSING, OTHER
     condition: str = "GOOD"  # GOOD, DAMAGED, STAINED, LOST
     action: str = "RECEIVE_BACK"  # RECEIVE_BACK, RE_WASH, DISCARD, COMPENSATE
@@ -807,7 +813,7 @@ class RewashItem(BaseModel):
     item_name: str
     specification: Optional[str] = None
     category: Optional[str] = None
-    quantity: int = Field(gt=0)
+    quantity: float = Field(gt=0)
     reason: Optional[str] = None
     source_gate_pass_id: Optional[str] = None
     source_delivery_id: Optional[str] = None
@@ -852,7 +858,8 @@ MONTHLY_DAY_STATUSES = ("DRAFT", "CONFIRMED", "CANCELLED")
 class MonthlyQuantitiesUpdate(BaseModel):
     """Persist edited cells on a DRAFT monthly day. Keys are ``name||spec``."""
 
-    quantities: Dict[str, int]
+    quantities: Dict[str, float]
+    piece_quantities: Dict[str, int] = {}
 
 
 class MonthlyDeliverySource(BaseModel):
@@ -886,8 +893,9 @@ class MonthlyDayState(BaseModel):
     day: int
     date: str  # YYYY-MM-DD
     status: str  # EMPTY (not created), DRAFT, CONFIRMED, CANCELLED
-    total_qty: int
-    quantities: Dict[str, int] = {}
+    total_qty: float
+    quantities: Dict[str, float] = {}
+    piece_quantities: Dict[str, int] = {}
     gate_pass_ids: List[str] = []
     delivery_ids: List[str] = []
     rewash_ids: List[str] = []
@@ -904,7 +912,8 @@ class MonthlyItemRow(BaseModel):
     category: Optional[str] = None
     unit_price: float = 0.0
     has_price: bool = False
-    usage_qty: int = 0
+    unit: str = "pcs"
+    usage_qty: float = 0
 
 
 class MonthlyMatrixResponse(BaseModel):
@@ -918,4 +927,4 @@ class MonthlyMatrixResponse(BaseModel):
     quotation_id: Optional[str] = None
     rows: List[MonthlyItemRow]
     days: List[MonthlyDayState]
-    cells: Dict[str, Dict[str, int]] = {}  # item_key -> { day: quantity }
+    cells: Dict[str, Dict[str, float]] = {}  # item_key -> { day: quantity }

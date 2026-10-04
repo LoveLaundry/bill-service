@@ -90,6 +90,8 @@ async def create_gate_pass_record(
                 "client_qty": item.client_qty,
                 "received_qty": item.received_qty,
                 "difference": item.received_qty - item.client_qty,
+                "unit": item.unit,
+                "piece_count": item.piece_count,
                 "mismatch_reason": item.mismatch_reason,
                 "mismatch_notes": item.mismatch_notes,
                 "rewashed": bool(item.rewashed),

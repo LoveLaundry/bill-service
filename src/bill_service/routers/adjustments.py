@@ -62,7 +62,7 @@ async def create_adjustment_request(
             it.get("item_name") == payload.item_name
             and (it.get("specification") or "") == (payload.specification or "")
         ):
-            original_qty = int(it.get("received_qty", 0) or 0)
+            original_qty = float(it.get("received_qty", 0) or 0)
             break
     if original_qty is None:
         raise HTTPException(

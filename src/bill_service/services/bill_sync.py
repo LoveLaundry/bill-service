@@ -59,13 +59,18 @@ def _snapshot_received(gp_items: list[dict]) -> dict:
         spec_item = {
             "item_name": name,
             "category": it.get("category"),
-            "received_qty": int(it.get("received_qty", 0) or 0),
+            "received_qty": float(it.get("received_qty", 0) or 0),
+            "piece_count": int(it.get("piece_count", 0) or 0),
+            "unit": it.get("unit"),
         }
         cur = out.get(name)
         if cur is None:
             out[name] = spec_item
         else:
             cur["received_qty"] += spec_item["received_qty"]
+            cur["piece_count"] += spec_item["piece_count"]
+            if cur["unit"] is None:
+                cur["unit"] = spec_item["unit"]
             if cur["category"] is None and spec_item["category"]:
                 cur["category"] = spec_item["category"]
     return out
@@ -193,7 +198,7 @@ async def sync_bills_to_gate_pass(
         for old in old_items:
             name = old.get("item_name", "")
             spec = old.get("specification")
-            old_qty = int(old.get("quantity", 0) or 0)
+            old_qty = float(old.get("quantity", 0) or 0)
             rec = received.get(name)
             new_qty = min(old_qty, rec["received_qty"]) if rec is not None else 0
             if new_qty != old_qty:
@@ -206,6 +211,8 @@ async def sync_bills_to_gate_pass(
                 "unit_price": old.get("unit_price", 0) or 0,
                 "quantity": new_qty,
                 "line_total": round((old.get("unit_price", 0) or 0) * new_qty, 2),
+                "piece_count": min(int(old.get("piece_count", 0) or 0), rec.get("piece_count", 0) if rec else 0),
+                "unit": old.get("unit") or (rec.get("unit") if rec else None),
             })
 
         # Items now received on the corrected gate pass but never billed on

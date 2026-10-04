@@ -831,7 +831,7 @@ async def update_gate_pass(
                 )
 
         previous_items = {
-            f"{i.get('item_name', '')}||{i.get('specification') or ''}": int(
+            f"{i.get('item_name', '')}||{i.get('specification') or ''}": float(
                 i.get("received_qty", 0) or 0
             )
             for i in decrypted.get("items", [])
@@ -848,6 +848,10 @@ async def update_gate_pass(
                         "client_qty": item["client_qty"],
                         "received_qty": item["received_qty"],
                         "difference": item["received_qty"] - item["client_qty"],
+                        "unit": item.get("unit") or (
+                            "kg" if "curtain" in item["item_name"].casefold() else "pcs"
+                        ),
+                        "piece_count": item.get("piece_count", 0),
                         "mismatch_reason": item.get("mismatch_reason"),
                         "mismatch_notes": item.get("mismatch_notes"),
                         "rewashed": bool(item.get("rewashed", False)),

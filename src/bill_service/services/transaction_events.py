@@ -103,8 +103,8 @@ async def record_event(
 def build_item_delta(
     item_name: str,
     specification: Optional[str],
-    qty_before: int,
-    qty_after: int,
+    qty_before: float,
+    qty_after: float,
 ) -> dict:
     """Build a single item-delta record for a journal entry."""
     return {

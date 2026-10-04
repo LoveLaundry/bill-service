@@ -57,6 +57,10 @@ def _serialize(doc: dict) -> dict:
     return decrypted
 
 
+def _item_unit(item_name: str, unit: Optional[str] = None) -> str:
+    return unit or ("kg" if "curtain" in item_name.casefold() else "pcs")
+
+
 def _serialize_payment(doc: dict) -> dict:
     try:
         decrypted = decrypt_dict(doc, PAYMENT_SENSITIVE_FIELDS)
@@ -204,7 +208,7 @@ async def _assert_items_within_billable_ceiling(
     all_del_ids = [d["_id"] for d in universe] + [
         ObjectId(d_id) for d_id in (bill_doc.get("delivery_ids") or []) if ObjectId.is_valid(str(d_id))
     ]
-    already_billed: Dict[str, int] = {}
+    already_billed: Dict[str, float] = {}
     or_clauses = []
     if all_del_ids:
         or_clauses.append({"delivery_ids": {"$in": all_del_ids}})
@@ -458,6 +462,7 @@ async def create_bill(
             gp_del_ids.append(str(del_doc["_id"]))
 
         already_billed_map = {}
+        already_billed_pieces = {}
         billed_filter: dict = {
             "payment_status": {"$ne": "CANCELLED"},
             "$or": [{"gate_pass_id": payload.gate_pass_id}],
@@ -472,8 +477,31 @@ async def create_bill(
                 already_billed_map[name] = (
                     already_billed_map.get(name, 0) + item["quantity"]
                 )
+                already_billed_pieces[name] = (
+                    already_billed_pieces.get(name, 0) + int(item.get("piece_count", 0) or 0)
+                )
 
         gp_map = be.compute_billable_received_by_name(gp_dec.get("items", []), already_billed_map)
+        received_by_name = {}
+        pieces_by_name = {}
+        unit_by_name = {}
+        for gp_item in gp_dec.get("items", []):
+            if gp_item.get("rewashed"):
+                continue
+            name = gp_item.get("item_name", "")
+            received_by_name[name] = received_by_name.get(name, 0) + float(gp_item.get("received_qty", 0) or 0)
+            pieces_by_name[name] = pieces_by_name.get(name, 0) + int(gp_item.get("piece_count", 0) or 0)
+            unit_by_name[name] = _item_unit(name, gp_item.get("unit"))
+
+        def unbilled_pieces(name: str, unbilled_qty: float) -> int:
+            total_pieces = pieces_by_name.get(name, 0)
+            received_qty = received_by_name.get(name, 0)
+            billed_pieces = already_billed_pieces.get(name, 0)
+            if billed_pieces > 0:
+                return max(0, total_pieces - billed_pieces)
+            if total_pieces <= 0 or received_qty <= 0:
+                return 0
+            return min(total_pieces, round(total_pieces * unbilled_qty / received_qty))
 
         rewashed_names = {
             it.get("item_name")
@@ -515,6 +543,8 @@ async def create_bill(
                         "unit_price": unit_price,
                         "quantity": qty,
                         "line_total": line_total,
+                        "piece_count": input_item.piece_count or unbilled_pieces(name, qty),
+                        "unit": _item_unit(name, input_item.unit or unit_by_name.get(name)),
                     }
                 )
         else:
@@ -539,6 +569,8 @@ async def create_bill(
                         "unit_price": unit_price,
                         "quantity": qty,
                         "line_total": line_total,
+                        "piece_count": unbilled_pieces(name, qty),
+                        "unit": unit_by_name.get(name, _item_unit(name)),
                     }
                 )
 
@@ -563,6 +595,8 @@ async def create_bill(
                     "unit_price": unit_price,
                     "quantity": input_item.quantity,
                     "line_total": line_total,
+                    "piece_count": input_item.piece_count,
+                    "unit": _item_unit(name, input_item.unit),
                 }
             )
 
@@ -850,7 +884,7 @@ async def get_unbilled_gatepasses(
             received_by_name: dict = {}
             for gp_item in gp.get("items", []):
                 if gp_item.get("rewashed"):
-                    received = int(gp_item.get("received_qty", 0) or 0)
+                    received = float(gp_item.get("received_qty", 0) or 0)
                     rewashed_items.append({
                         "item_name": gp_item.get("item_name", ""),
                         "specification": gp_item.get("specification") or "",
@@ -859,7 +893,7 @@ async def get_unbilled_gatepasses(
                     total_rewashed_qty += received
                     continue  # free re-washes are never billed
                 name = gp_item.get("item_name", "")
-                received_by_name[name] = received_by_name.get(name, 0) + int(
+                received_by_name[name] = received_by_name.get(name, 0) + float(
                     gp_item.get("received_qty", 0) or 0
                 )
 
@@ -1236,4 +1270,3 @@ async def list_payments_for_bill(
         except HTTPException:
             pass
     return results
-

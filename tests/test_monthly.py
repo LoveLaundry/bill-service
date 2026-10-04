@@ -152,6 +152,53 @@ async def test_receiving_confirm_creates_draft_gate_pass(mocked_db):
     assert len(gp["items"]) == 2
 
 
+async def test_curtain_receiving_preserves_decimal_kg_and_piece_count(mocked_db):
+    key = "Curtain (1 Kg)||"
+    await m.update_day_quantities(
+        "receiving",
+        CLIENT,
+        Y,
+        MO,
+        1,
+        MonthlyQuantitiesUpdate(
+            quantities={key: 1.25},
+            piece_quantities={key: 4},
+        ),
+        current_user=user(),
+    )
+
+    result = await confirm("receiving")
+    gate_pass = (await gp_docs(mocked_db))[0]
+    item = gate_pass["items"][0]
+
+    assert result["days"]["1"]["total_qty"] == 1.25
+    assert item["received_qty"] == 1.25
+    assert item["unit"] == "kg"
+    assert item["piece_count"] == 4
+    assert be.compute_billable_received_by_name([item], {})[key.split("||")[0]] == 1.25
+
+
+async def test_monthly_rejects_fractional_piece_item_and_non_curtain_piece_count():
+    with pytest.raises(HTTPException) as fractional:
+        await put("receiving", {"Towel||": 1.5})
+    assert fractional.value.status_code == 400
+
+    with pytest.raises(HTTPException) as pieces:
+        await m.update_day_quantities(
+            "receiving",
+            CLIENT,
+            Y,
+            MO,
+            1,
+            MonthlyQuantitiesUpdate(
+                quantities={"Towel||": 1},
+                piece_quantities={"Towel||": 2},
+            ),
+            current_user=user(),
+        )
+    assert pieces.value.status_code == 400
+
+
 async def test_receiving_confirm_idempotent_with_key(mocked_db):
     await put("receiving", {"Towel||": 12})
     key = "mm-key-1"

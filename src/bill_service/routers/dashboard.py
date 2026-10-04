@@ -70,7 +70,7 @@ def _key(name: str, spec: str = ""):
     return f"{name}||{spec}" if spec else name
 
 
-def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, int]]:
+def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, float]]:
     """``{gate_pass_id: {item_name: qty}}`` from the canonical engine.
 
     The legacy report groupings below are keyed by bare item name (no
@@ -80,7 +80,7 @@ def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, int]]:
     lines to the primary pass. They now all funnel through the engine and differ
     only in how they flatten the key.
     """
-    out: Dict[str, Dict[str, int]] = {}
+    out: Dict[str, Dict[str, float]] = {}
     for gp_id, keyed in be.compute_delivered_by_gate_pass(delivery_docs).items():
         bucket = out.setdefault(gp_id, {})
         for key, qty in keyed.items():
@@ -89,7 +89,7 @@ def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, int]]:
     return out
 
 
-async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
+async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, float]]:
     """Fetch all returns and build gate_pass_id → {item_key → returned_qty}.
 
     Only includes items with action RECEIVE_BACK/RE_WASH that haven't been
@@ -98,7 +98,7 @@ async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
     gate_pass_id, so they are attributed to the exact gate pass they were
     raised on — never to another pass of the same client.
     """
-    returned: Dict[str, Dict[str, int]] = {}
+    returned: Dict[str, Dict[str, float]] = {}
     ret_cursor = returns_collection.find()
     async for ret_doc in ret_cursor:
         try:
@@ -121,7 +121,7 @@ async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
                 name = item.get("item_name", "")
                 spec = item.get("specification") or ""
                 key = _key(name, spec)
-                qty = int(item.get("returned_qty", 0) or 0)
+                qty = float(item.get("returned_qty", 0) or 0)
                 if qty > 0:
                     returned[gp_id][key] = returned[gp_id].get(key, 0) + qty
         except Exception:
@@ -129,8 +129,8 @@ async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
     return returned
 
 
-def _flatten_returned_by_name(returned_by_gp: Dict[str, Dict[str, int]]) -> Dict[str, int]:
-    out: Dict[str, int] = {}
+def _flatten_returned_by_name(returned_by_gp: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
     for _, items in returned_by_gp.items():
         for key, qty in items.items():
             name = key.split("||", 1)[0]
@@ -342,7 +342,7 @@ async def get_linen_flow(
             {
                 "delivery_id": decced["id"],
                 "delivery_date": decced.get("delivery_date"),
-                "pieces": sum(int(i.get("quantity", 0) or 0) for i in decced.get("items", [])),
+                "pieces": sum(float(i.get("quantity", 0) or 0) for i in decced.get("items", [])),
             }
         )
 
@@ -463,7 +463,7 @@ async def get_client_summary(client_name: str = Query(...)):
         recorded = recorded_by_gp.get(gp["id"], {})
         for item in gp.get("items", []):
             name = item["item_name"]
-            qty = int(item.get("received_qty", 0) or 0)
+            qty = float(item.get("received_qty", 0) or 0)
             extra = max(0, qty - recorded.get(name, 0))
             if extra <= 0:
                 continue
@@ -673,7 +673,7 @@ async def get_client_wise_report():
 
     # Aggregate returned items per client (spec-aware) via each return's own
     # gate pass, so a return never leaks onto another pass of the same client.
-    client_returned: Dict[str, Dict[str, int]] = {}
+    client_returned: Dict[str, Dict[str, float]] = {}
     for gp_id, gp_items_returned in returned_by_gp.items():
         client_label = gp_client_map.get(gp_id)
         if not client_label:
@@ -1001,7 +1001,7 @@ async def _fetch_gate_passes(start: datetime, end: datetime):
                     {
                         "item_name": it.get("item_name"),
                         "specification": it.get("specification") or "",
-                        "received_qty": int(it.get("received_qty") or 0),
+                        "received_qty": float(it.get("received_qty") or 0),
                     }
                     for it in items
                 ],
@@ -1051,7 +1051,7 @@ async def _fetch_deliveries(gate_pass_ids: List[str]):
                         "item_name": it.get("item_name"),
                         "specification": it.get("specification") or "",
                         "gate_pass_id": it.get("gate_pass_id") or d.get("gate_pass_id"),
-                        "quantity": int(it.get("quantity") or 0),
+                        "quantity": float(it.get("quantity") or 0),
                     }
                     for it in items
                 ],
@@ -1104,7 +1104,7 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
 
     # Per-pass attribution from the engine, not a flat sum keyed on the
     # delivery's document-level gate_pass_id.
-    delivered_by_gp: Dict[str, Dict[str, int]] = be.compute_delivered_by_gate_pass(deliveries)
+    delivered_by_gp: Dict[str, Dict[str, float]] = be.compute_delivered_by_gate_pass(deliveries)
 
     balances = []
     items_received = 0
@@ -1451,7 +1451,7 @@ async def today_deliveries(
         for item in gp.get("items", []):
             item_name = item.get("item_name", "")
             spec = item.get("specification") or ""
-            qty = int(item.get("received_qty", 0) or 0)
+            qty = float(item.get("received_qty", 0) or 0)
             detail_key = f"{item_name}||{spec}" if spec else item_name
             if detail_key not in client_map[client]["items"]:
                 client_map[client]["items"][detail_key] = {
@@ -1485,7 +1485,7 @@ async def today_deliveries(
                 continue
 
         # Get ALL delivered qty for this client across ALL gate passes
-        delivered_map: Dict[str, int] = {}
+        delivered_map: Dict[str, float] = {}
         del_cursor2 = deliveries_collection.find({
             "client_name_search": get_search_token(client),
             "status": {"$ne": "CANCELLED"},
@@ -1500,7 +1500,7 @@ async def today_deliveries(
 
         # The client's total delivered quantity, independent of which pass each
         # line came from.
-        delivered_map: Dict[str, int] = {}
+        delivered_map: Dict[str, float] = {}
         for dl in client_deliveries:
             if dl.get("status") == "CANCELLED":
                 continue
@@ -1528,7 +1528,7 @@ async def today_deliveries(
                 for item in gp.get("items", []):
                     item_name = item.get("item_name", "")
                     spec = item.get("specification") or ""
-                    qty = int(item.get("received_qty", 0) or 0)
+                    qty = float(item.get("received_qty", 0) or 0)
                     detail_key = f"{item_name}||{spec}" if spec else item_name
                     extra = max(0, qty - recorded.get(detail_key, 0))
                     if extra > 0:
@@ -1538,7 +1538,7 @@ async def today_deliveries(
 
         # Calculate pending = total received (all open GPs) - total delivered (all time)
         # Returned items with action RECEIVE_BACK/RE_WASH need to be re-sent, so they count as pending
-        returned_map: Dict[str, int] = {}
+        returned_map: Dict[str, float] = {}
         ret_cursor = returns_collection.find({
             "client_name_search": get_search_token(client),
         })

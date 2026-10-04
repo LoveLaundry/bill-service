@@ -137,12 +137,12 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str, deta
     await audit_collection.insert_one(doc)
 
 
-def _recompute_discrepancy(item: dict) -> int:
+def _recompute_discrepancy(item: dict) -> float:
     """Server-owned reconciliation between recorded and client-counted qty."""
     counted = item.get("client_counted_qty")
     if counted is None:
         return 0
-    return int(item.get("quantity", 0) or 0) - int(counted or 0)
+    return float(item.get("quantity", 0) or 0) - float(counted or 0)
 
 
 def _source_filter(gate_pass_id: Optional[str]) -> dict:
@@ -410,7 +410,7 @@ async def activate_delivery(
         )
     gp_decrypted = decrypt_dict(gp_doc, GATE_PASS_SENSITIVE_FIELDS)
 
-    received_map: Dict[str, int] = {}
+    received_map: Dict[str, float] = {}
     for gp_item in gp_decrypted.get("items", []):
         key = be.item_key(gp_item["item_name"], gp_item.get("specification"))
         received_map[key] = received_map.get(key, 0) + gp_item["received_qty"]
@@ -655,9 +655,9 @@ async def correct_delivery_items(
                 "gate_pass_id": gp_id,
                 "item_name": original.get("item_name"),
                 "specification": original.get("specification") or "",
-                "original_quantity": int(original.get("quantity", 0) or 0),
-                "corrected_quantity": int(fix.quantity),
-                "delta": int(fix.quantity) - int(original.get("quantity", 0) or 0),
+                "original_quantity": float(original.get("quantity", 0) or 0),
+                "corrected_quantity": float(fix.quantity),
+                "delta": float(fix.quantity) - float(original.get("quantity", 0) or 0),
             }
         )
 
@@ -913,7 +913,7 @@ async def cancel_delivery(
             reason=payload.reason,
             item_deltas=[
                 build_item_delta(
-                    it.get("item_name", ""), it.get("specification"), int(it.get("quantity", 0) or 0), 0
+                    it.get("item_name", ""), it.get("specification"), float(it.get("quantity", 0) or 0), 0
                 )
                 for it in current.get("items", [])
                 if str(it.get("gate_pass_id") or current.get("gate_pass_id")) == str(gp_id)
@@ -921,7 +921,7 @@ async def cancel_delivery(
             meta={
                 "cancelled_by": current_user.get("user_name", ""),
                 "released_quantity": sum(
-                    int(it.get("quantity", 0) or 0)
+                    float(it.get("quantity", 0) or 0)
                     for it in current.get("items", [])
                     if str(it.get("gate_pass_id") or current.get("gate_pass_id")) == str(gp_id)
                 ),

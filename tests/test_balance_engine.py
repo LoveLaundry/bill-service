@@ -279,6 +279,35 @@ def test_billable_received_by_name():
     assert billable["Towel"] == 12  # 10 + 5 across specs, minus 3 already billed
 
 
+def test_fractional_curtain_kg_survives_balance_and_billing():
+    gate_pass = [{
+        "item_name": "Curtain (1 Kg)",
+        "specification": None,
+        "client_qty": 1.25,
+        "received_qty": 1.25,
+        "unit": "kg",
+        "piece_count": 4,
+    }]
+    delivered = be.compute_delivered_by_item([
+        {
+            "status": "DELIVERED",
+            "items": [{
+                "item_name": "Curtain (1 Kg)",
+                "specification": None,
+                "quantity": 0.5,
+            }],
+        }
+    ])
+
+    balance = be.compute_gate_pass_balance(gate_pass, delivered)
+    item = balance["items"][be.item_key("Curtain (1 Kg)")]
+    assert item["received_qty"] == 1.25
+    assert item["outstanding_delivery_qty"] == 0.75
+    assert be.compute_billable_received_by_name(gate_pass, {"Curtain (1 Kg)": 0.5})[
+        "Curtain (1 Kg)"
+    ] == 0.75
+
+
 # --- Rewashed items are never billable ---
 def test_rewashed_items_never_billable_by_name():
     # Mixed pass: normal + rewashed rows of the same item name.

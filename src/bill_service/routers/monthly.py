@@ -17,6 +17,7 @@ Invariants enforced here:
   * prices always resolve from the quotation (never hardcoded)
 """
 import calendar
+import math
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -127,6 +128,10 @@ def _split_key(key: str):
     return name, spec or None
 
 
+def _item_unit(item_name: str) -> str:
+    return "kg" if "curtain" in item_name.casefold() else "pcs"
+
+
 def _next_month_doc(client_name: str, kind: str, year: int, month: int) -> dict:
     now = datetime.now(timezone.utc)
     return {
@@ -163,9 +168,9 @@ async def _require_month_doc(client_name: str, kind: str, year: int, month: int,
 # --------------------------------------------------------------------------
 # Item rows: quotation prices + per-client historical usage ordering
 # --------------------------------------------------------------------------
-async def _historical_usage(client_name: str) -> Dict[str, int]:
+async def _historical_usage(client_name: str) -> Dict[str, float]:
     """Sum of received_qty per item_key across the client's gate passes."""
-    usage: Dict[str, int] = {}
+    usage: Dict[str, float] = {}
     cursor = gatepasses_collection.find(
         {
             "client_name_search": get_search_token(client_name),
@@ -179,7 +184,7 @@ async def _historical_usage(client_name: str) -> Dict[str, int]:
             continue
         for it in decrypted.get("items", []):
             key = _item_key(it.get("item_name", ""), it.get("specification"))
-            usage[key] = usage.get(key, 0) + int(it.get("received_qty", 0) or 0)
+            usage[key] = usage.get(key, 0) + float(it.get("received_qty", 0) or 0)
     return usage
 
 
@@ -216,8 +221,8 @@ async def _build_rows(client_name: str, quotation_id: Optional[str]) -> List[dic
                 }
 
     usage = await _historical_usage(client_name)
-    for key, qty in usage.items():
-        if qty <= 0 or key in row_map:
+    for key in usage:
+        if key in row_map:
             continue
         name, spec = _split_key(key)
         row_map[key] = {
@@ -235,6 +240,7 @@ async def _build_rows(client_name: str, quotation_id: Optional[str]) -> List[dic
             "category": r["category"],
             "unit_price": r["unit_price"],
             "has_price": r["has_price"],
+            "unit": _item_unit(r["item_name"]),
             "usage_qty": usage.get(_item_key(r["item_name"], r["specification"] or None), 0),
         }
         for r in row_map.values()
@@ -272,6 +278,7 @@ def _day_states(doc: Optional[dict], month_length: int) -> List[dict]:
                     "status": "EMPTY",
                     "total_qty": 0,
                     "quantities": {},
+                    "piece_quantities": {},
                     "gate_pass_ids": [],
                     "delivery_ids": [],
                     "rewash_ids": [],
@@ -286,9 +293,12 @@ def _day_states(doc: Optional[dict], month_length: int) -> List[dict]:
                 "day": day,
                 "date": st.get("date", ""),
                 "status": st.get("status", "DRAFT"),
-                "total_qty": int(st.get("total_qty", 0) or 0),
+                "total_qty": float(st.get("total_qty", 0) or 0),
                 "quantities": {
-                    str(k): int(v) for k, v in (st.get("quantities") or {}).items()
+                    str(k): float(v) for k, v in (st.get("quantities") or {}).items()
+                },
+                "piece_quantities": {
+                    str(k): int(v) for k, v in (st.get("piece_quantities") or {}).items()
                 },
                 "gate_pass_ids": list(st.get("gate_pass_ids") or []),
                 "delivery_ids": list(st.get("delivery_ids") or []),
@@ -301,15 +311,15 @@ def _day_states(doc: Optional[dict], month_length: int) -> List[dict]:
     return out
 
 
-def _cells_from_days(doc: Optional[dict]) -> Dict[str, Dict[str, int]]:
-    cells: Dict[str, Dict[str, int]] = {}
+def _cells_from_days(doc: Optional[dict]) -> Dict[str, Dict[str, float]]:
+    cells: Dict[str, Dict[str, float]] = {}
     days_map = (doc or {}).get("days") or {}
     for st in days_map.values():
         q = st.get("quantities") or {}
         for key, qty in q.items():
             if qty <= 0:
                 continue
-            cells.setdefault(str(key), {})[str(st["day"])] = int(qty)
+            cells.setdefault(str(key), {})[str(st["day"])] = float(qty)
     return cells
 
 
@@ -373,20 +383,54 @@ async def update_day_quantities(
             detail=f"Day {day} is outside month {year}-{month} (1..{month_length}).",
         )
 
-    sanitized: Dict[str, int] = {}
+    sanitized: Dict[str, float] = {}
     for key, qty in payload.quantities.items():
-        value = int(qty or 0)
+        value = float(qty or 0)
+        if not math.isfinite(value):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Quantity for '{key}' must be a finite number.",
+            )
         if value < 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Negative quantity for '{key}' is not allowed.",
             )
+        name, _ = _split_key(str(key))
+        if _item_unit(name) == "pcs" and not value.is_integer():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Quantity for '{name}' must be a whole number.",
+            )
         if value > 0:
             sanitized[str(key)] = value
 
+    sanitized_pieces: Dict[str, int] = {}
+    for key, count in payload.piece_quantities.items():
+        value = int(count or 0)
+        if value < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Negative piece count for '{key}' is not allowed.",
+            )
+        name, _ = _split_key(str(key))
+        if _item_unit(name) != "kg":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Piece counts are only supported for curtain items ('{name}').",
+            )
+        if value > 0:
+            sanitized_pieces[str(key)] = value
+
+    if sanitized_pieces and kind != "receiving":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Separate piece counts are only supported on receiving days.",
+        )
+
     doc = await _find_month_doc(client_name, kind, year, month)
     if doc is None:
-        if not sanitized:
+        if not sanitized and not sanitized_pieces:
             return {
                 "id": None,
                 "client_name": client_name,
@@ -413,13 +457,14 @@ async def update_day_quantities(
 
     now = datetime.now(timezone.utc)
     date_str = f"{year:04d}-{month:02d}-{day:02d}"
-    if sanitized:
+    if sanitized or sanitized_pieces:
         day_state = {
             "day": day,
             "date": date_str,
             "status": "DRAFT",
             "quantities": sanitized,
             "total_qty": sum(sanitized.values()),
+            "piece_quantities": sanitized_pieces,
             "gate_pass_ids": (existing or {}).get("gate_pass_ids", []),
             "delivery_ids": (existing or {}).get("delivery_ids", []),
             "rewash_ids": (existing or {}).get("rewash_ids", []),
@@ -451,7 +496,7 @@ async def update_day_quantities(
 # --------------------------------------------------------------------------
 # Day confirmation — creates real records (starting in DRAFT)
 # --------------------------------------------------------------------------
-async def _available_per_item(gp_decrypted: dict) -> Dict[str, int]:
+async def _available_per_item(gp_decrypted: dict) -> Dict[str, float]:
     """Live deliverable quantity per item on one gate pass.
 
     Uses the canonical balance engine: requested quantity may not exceed
@@ -536,9 +581,18 @@ async def confirm_monthly_day(
             detail=f"Day {day} is CANCELLED and cannot be confirmed.",
         )
 
-    quantities = {str(k): int(v) for k, v in (day_state.get("quantities") or {}).items() if v > 0}
+    quantities = {
+        str(k): float(v)
+        for k, v in (day_state.get("quantities") or {}).items()
+        if v > 0
+    }
+    piece_quantities = {
+        str(k): int(v)
+        for k, v in (day_state.get("piece_quantities") or {}).items()
+        if v > 0
+    }
     total_qty = sum(quantities.values())
-    if total_qty <= 0:
+    if total_qty <= 0 and not piece_quantities:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot confirm an empty day (zero total quantity).",
@@ -557,7 +611,8 @@ async def confirm_monthly_day(
 
     if kind == "receiving":
         items = []
-        for key, qty in quantities.items():
+        for key in quantities.keys() | piece_quantities.keys():
+            qty = quantities.get(key, 0)
             name, spec = _split_key(key)
             row = row_lookup.get(key)
             items.append(
@@ -567,6 +622,8 @@ async def confirm_monthly_day(
                     specification=spec,
                     client_qty=qty,
                     received_qty=qty,
+                    unit=_item_unit(name),
+                    piece_count=piece_quantities.get(key, 0),
                     difference=0,
                 )
             )
@@ -636,7 +693,7 @@ async def confirm_monthly_day(
                     candidates.append(decrypt_dict(gp, GATEPASS_SENSITIVE_FIELDS))
                 except Exception:
                     continue
-            allocated: Dict[str, int] = {}
+            allocated: Dict[str, float] = {}
             for gp in candidates:
                 available = await _available_per_item(gp)
                 lines = []

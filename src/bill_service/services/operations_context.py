@@ -131,14 +131,14 @@ async def load_movements(
     return deliveries, returns
 
 
-def delivered_by_gate_pass(deliveries: Iterable[dict]) -> Dict[str, Dict[str, int]]:
+def delivered_by_gate_pass(deliveries: Iterable[dict]) -> Dict[str, Dict[str, float]]:
     """Group delivered quantities by the gate pass each line came from."""
     return be.compute_delivered_by_gate_pass(deliveries)
 
 
 async def movement_maps(
     gate_pass_ids: Optional[Iterable[str]] = None,
-) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, int]]]:
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     """``(delivered_by_gp, returned_by_gp)`` for the given passes.
 
     The single replacement for the load-and-group loop that was copy-pasted
@@ -153,13 +153,13 @@ async def movement_maps(
     )
 
 
-def returned_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, int]]:
+def returned_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, float]]:
     """Group pending return quantities by gate pass."""
     return _returns_by_gate_pass(returns)
 
 
-def _returns_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, int]]:
-    out: Dict[str, Dict[str, int]] = {}
+def _returns_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
     for ret in returns or []:
         gp_id = str(ret.get("gate_pass_id") or "")
         if not gp_id:
@@ -172,12 +172,12 @@ def _returns_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, int]]:
 
 def availability_maps(
     gate_passes: List[dict],
-    delivered: Dict[str, Dict[str, int]],
-    returned: Optional[Dict[str, Dict[str, int]]] = None,
-) -> Dict[str, Dict[str, int]]:
+    delivered: Dict[str, Dict[str, float]],
+    returned: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, Dict[str, float]]:
     """{gate_pass_id: {item_key: still-deliverable quantity}}."""
     returned = returned or {}
-    out: Dict[str, Dict[str, int]] = {}
+    out: Dict[str, Dict[str, float]] = {}
     for gp in gate_passes or []:
         gp_id = str(gp.get("gate_pass_id") or gp.get("id") or "")
         if not gp_id:
@@ -192,8 +192,8 @@ def availability_maps(
 
 def balances_for(
     gate_passes: List[dict],
-    delivered: Dict[str, Dict[str, int]],
-    returned: Optional[Dict[str, Dict[str, int]]] = None,
+    delivered: Dict[str, Dict[str, float]],
+    returned: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, dict]:
     """{gate_pass_id: canonical balance document}."""
     returned = returned or {}
