@@ -22,6 +22,7 @@ from ..services.transaction_events import (
     record_event,
     EVENT_GATE_PASS_CREATED,
 )
+from ..services.manual_references import reserve_generated_reference
 from ..services.verification_service import attach_verification_to
 from ..models import GatePassCreate
 
@@ -59,7 +60,7 @@ async def next_receiving_number(receiving_date: datetime) -> str:
     while True:
         candidate = f"{prefix}{start:04d}"
         existing = await gatepasses_collection.find_one({"gate_pass_number": candidate})
-        if not existing:
+        if not existing and await reserve_generated_reference(candidate, "gate pass number"):
             return candidate
         start += 1
 
@@ -101,6 +102,9 @@ async def create_gate_pass_record(
     now = datetime.now(timezone.utc)
     doc = {
         "gate_pass_number": payload.gate_pass_number,
+        "manual_gate_pass_number": payload.manual_gate_pass_number,
+        "manual_bill_number": payload.manual_bill_number,
+        "alrs_number": payload.alrs_number,
         "client_name": payload.client_name,
         # Same wall-clock handling as the normal receiving path, so a
         # monthly-generated pass sorts by the same day boundary.

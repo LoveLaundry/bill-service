@@ -28,6 +28,7 @@ bill_templates_collection: AsyncIOMotorCollection = _db.get_collection("bill_tem
 legacy_invoices_collection: AsyncIOMotorCollection = _db.get_collection("legacy_invoices")
 rewashes_collection: AsyncIOMotorCollection = _db.get_collection("rewashes")
 monthly_entries_collection: AsyncIOMotorCollection = _db.get_collection("monthly_entries")
+manual_references_collection: AsyncIOMotorCollection = _db.get_collection("manual_references")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")
@@ -47,6 +48,7 @@ async def ensure_indexes():
     await gatepasses_collection.create_index("client_name_search")
     await gatepasses_collection.create_index("status")
     await gatepasses_collection.create_index("created_at")
+    await manual_references_collection.create_index("normalized", unique=True)
 
     # Deliveries indexes
     await deliveries_collection.create_index("gate_pass_id")

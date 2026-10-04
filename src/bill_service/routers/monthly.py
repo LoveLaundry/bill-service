@@ -37,6 +37,7 @@ from ..database.main_db import (
 )
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
+from ..services import manual_references
 from ..services import balance_engine as be
 from ..services.gate_pass_records import create_gate_pass_record, next_receiving_number
 from ..services.transaction_events import (
@@ -279,6 +280,9 @@ def _day_states(doc: Optional[dict], month_length: int) -> List[dict]:
                     "total_qty": 0,
                     "quantities": {},
                     "piece_quantities": {},
+                    "bill_number": None,
+                    "gate_pass_number": None,
+                    "alrs_number": None,
                     "gate_pass_ids": [],
                     "delivery_ids": [],
                     "rewash_ids": [],
@@ -300,6 +304,9 @@ def _day_states(doc: Optional[dict], month_length: int) -> List[dict]:
                 "piece_quantities": {
                     str(k): int(v) for k, v in (st.get("piece_quantities") or {}).items()
                 },
+                "bill_number": st.get("bill_number"),
+                "gate_pass_number": st.get("gate_pass_number"),
+                "alrs_number": st.get("alrs_number"),
                 "gate_pass_ids": list(st.get("gate_pass_ids") or []),
                 "delivery_ids": list(st.get("delivery_ids") or []),
                 "rewash_ids": list(st.get("rewash_ids") or []),
@@ -428,9 +435,24 @@ async def update_day_quantities(
             detail="Separate piece counts are only supported on receiving days.",
         )
 
+    submitted_refs = {}
+    for field in manual_references.REFERENCE_FIELDS:
+        value = getattr(payload, field)
+        if value is not None and len(value) > 120:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{field.replace('_', ' ').title()} must be 120 characters or fewer.",
+            )
+        submitted_refs[field] = value.strip() if value and value.strip() else None
+    if kind != "receiving" and any(submitted_refs.values()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Manual bill, gate-pass and ALRS references can only be entered on receiving days.",
+        )
+
     doc = await _find_month_doc(client_name, kind, year, month)
     if doc is None:
-        if not sanitized and not sanitized_pieces:
+        if not sanitized and not sanitized_pieces and not any(submitted_refs.values()):
             return {
                 "id": None,
                 "client_name": client_name,
@@ -455,9 +477,30 @@ async def update_day_quantities(
             detail=f"Day {day} is {existing.get('status')} and its quantities are locked.",
         )
 
+    reference_owner = f"monthly:{get_search_token(client_name)}:{kind}:{year}:{month}:{day}"
+    references = {
+        field: (
+            submitted_refs[field]
+            if field in payload.model_fields_set
+            else (existing or {}).get(field)
+        )
+        for field in manual_references.REFERENCE_FIELDS
+    }
+    previous_references = {
+        field: (existing or {}).get(field)
+        for field in manual_references.REFERENCE_FIELDS
+    }
+    try:
+        await manual_references.reserve_references(reference_owner, references)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
     now = datetime.now(timezone.utc)
     date_str = f"{year:04d}-{month:02d}-{day:02d}"
-    if sanitized or sanitized_pieces:
+    if sanitized or sanitized_pieces or any(references.values()):
         day_state = {
             "day": day,
             "date": date_str,
@@ -465,6 +508,7 @@ async def update_day_quantities(
             "quantities": sanitized,
             "total_qty": sum(sanitized.values()),
             "piece_quantities": sanitized_pieces,
+            **references,
             "gate_pass_ids": (existing or {}).get("gate_pass_ids", []),
             "delivery_ids": (existing or {}).get("delivery_ids", []),
             "rewash_ids": (existing or {}).get("rewash_ids", []),
@@ -482,12 +526,24 @@ async def update_day_quantities(
                 }
             },
         )
+        new_normalized = {
+            manual_references.normalize_reference(value)
+            for value in references.values()
+            if value
+        }
+        removed = {
+            field: value
+            for field, value in previous_references.items()
+            if value and manual_references.normalize_reference(value) not in new_normalized
+        }
+        await manual_references.release_references(reference_owner, removed)
     else:
         # All zero -> the DRAFT day is removed (no empty day records).
         await monthly_entries_collection.update_one(
             {"_id": doc["_id"]},
             {"$unset": {f"days.{day}": ""}, "$set": {"updated_at": now}},
         )
+        await manual_references.release_references(reference_owner, previous_references)
 
     updated = await monthly_entries_collection.find_one({"_id": doc["_id"]})
     return _serialize_month(updated)
@@ -627,7 +683,8 @@ async def confirm_monthly_day(
                     difference=0,
                 )
             )
-        gp_number = await next_receiving_number(day_date)
+        manual_gp_number = day_state.get("gate_pass_number")
+        gp_number = manual_gp_number or await next_receiving_number(day_date)
         origin = {
             "kind": "monthly",
             "year": year,
@@ -638,6 +695,9 @@ async def confirm_monthly_day(
         created = await create_gate_pass_record(
             GatePassCreate(
                 gate_pass_number=gp_number,
+                manual_gate_pass_number=manual_gp_number,
+                manual_bill_number=day_state.get("bill_number"),
+                alrs_number=day_state.get("alrs_number"),
                 client_name=client_name,
                 receiving_date=day_date,
                 received_by=payload.received_by or user_name,
@@ -957,9 +1017,17 @@ async def cancel_monthly_day(
             detail="Confirmed days cannot be cancelled here; use the records' own flows.",
         )
     now = datetime.now(timezone.utc)
+    reference_owner = f"monthly:{get_search_token(client_name)}:{kind}:{year}:{month}:{day}"
     await monthly_entries_collection.update_one(
         {"_id": month_doc["_id"]},
         {"$unset": {f"days.{day}": ""}, "$set": {"updated_at": now}},
+    )
+    await manual_references.release_references(
+        reference_owner,
+        {
+            field: day_state.get(field)
+            for field in manual_references.REFERENCE_FIELDS
+        },
     )
     updated = await monthly_entries_collection.find_one({"_id": month_doc["_id"]})
     return _serialize_month(updated)

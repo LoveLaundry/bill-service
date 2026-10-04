@@ -38,6 +38,9 @@ class GatePassItem(BaseModel):
 
 class GatePassCreate(BaseModel):
     gate_pass_number: str
+    manual_gate_pass_number: Optional[str] = None
+    manual_bill_number: Optional[str] = None
+    alrs_number: Optional[str] = None
     client_name: str
     receiving_date: datetime
     received_by: str
@@ -132,6 +135,9 @@ class GatePassModel(BaseModel):
 
     verification: Optional[Verification] = None
     gate_pass_number: str
+    manual_gate_pass_number: Optional[str] = None
+    manual_bill_number: Optional[str] = None
+    alrs_number: Optional[str] = None
     client_name: str
     receiving_date: datetime
     received_by: str
@@ -363,6 +369,9 @@ class BillModel(BaseModel):
     verification: Optional[Verification] = None
     quotation_id: str
     client_name: str
+    manual_bill_number: Optional[str] = None
+    manual_gate_pass_number: Optional[str] = None
+    alrs_number: Optional[str] = None
     quotation_title: Optional[str] = None
     items: List[BillItemOut]
     total_quantity: float
@@ -860,6 +869,9 @@ class MonthlyQuantitiesUpdate(BaseModel):
 
     quantities: Dict[str, float]
     piece_quantities: Dict[str, int] = {}
+    bill_number: Optional[str] = None
+    gate_pass_number: Optional[str] = None
+    alrs_number: Optional[str] = None
 
 
 class MonthlyDeliverySource(BaseModel):
@@ -896,6 +908,9 @@ class MonthlyDayState(BaseModel):
     total_qty: float
     quantities: Dict[str, float] = {}
     piece_quantities: Dict[str, int] = {}
+    bill_number: Optional[str] = None
+    gate_pass_number: Optional[str] = None
+    alrs_number: Optional[str] = None
     gate_pass_ids: List[str] = []
     delivery_ids: List[str] = []
     rewash_ids: List[str] = []

@@ -15,17 +15,23 @@ hand-written, so this is the guard against the two repos drifting apart.
 from datetime import datetime, timezone
 
 import pytest
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from bill_service.crypto_helper import decrypt_dict
 from bill_service.models import (
+    BillCreate,
+    BillItemIn,
     MonthlyDayConfirm,
     MonthlyMatrixResponse,
     MonthlyQuantitiesUpdate,
 )
+from bill_service.routers import bills as bills_router
 from bill_service.routers import monthly as m
+from bill_service.routers import shop_bills as shop_bills_router
 from bill_service.routers.deliveries import activate_delivery, pending_gatepasses
 from bill_service.routers.gatepasses import update_gate_pass_status
+from bill_service.services import manual_references
 from bill_service.services import operations_context as ctx
 
 GP_SENSITIVE = ["client_name", "items", "notes"]
@@ -104,6 +110,88 @@ async def balance_for(gp_id):
 # ---------------------------------------------------------------------------
 # DRAFT invisibility / activation, seen from the other screens
 # ---------------------------------------------------------------------------
+async def test_monthly_manual_references_round_trip_to_gate_pass(mocked_db):
+    payload = MonthlyQuantitiesUpdate(
+        quantities={"Towel||": 4},
+        bill_number="DAY-BILL-17",
+        gate_pass_number="HOTEL-GP-17",
+        alrs_number="ALRS-17",
+    )
+    await m.update_day_quantities(
+        "receiving", CLIENT, Y, MO, 1, payload, current_user=user()
+    )
+    day = next(item for item in (await matrix("receiving"))["days"] if item["day"] == 1)
+    assert day["bill_number"] == "DAY-BILL-17"
+    assert day["gate_pass_number"] == "HOTEL-GP-17"
+    assert day["alrs_number"] == "ALRS-17"
+
+    await confirm("receiving")
+    gate_pass = (await gate_passes(mocked_db))[0]
+    assert gate_pass["gate_pass_number"] == "HOTEL-GP-17"
+    assert gate_pass["manual_gate_pass_number"] == "HOTEL-GP-17"
+    assert gate_pass["manual_bill_number"] == "DAY-BILL-17"
+    assert gate_pass["alrs_number"] == "ALRS-17"
+    bill = await bills_router.create_bill(
+        BillCreate(
+            client_name=CLIENT,
+            gate_pass_id=gate_pass["id"],
+            items=[BillItemIn(item_name="Towel", unit_price=5, quantity=4)],
+        ),
+        user(),
+        request=_req(),
+    )
+    assert bill["manual_bill_number"] == "DAY-BILL-17"
+    assert bill["manual_gate_pass_number"] == "HOTEL-GP-17"
+    assert bill["alrs_number"] == "ALRS-17"
+
+
+async def test_manual_references_conflict_case_and_whitespace_insensitively():
+    first = MonthlyQuantitiesUpdate(
+        quantities={"Towel||": 1}, bill_number="Hotel   Bill 42"
+    )
+    await m.update_day_quantities(
+        "receiving", CLIENT, Y, MO, 1, first, current_user=user()
+    )
+
+    duplicate = MonthlyQuantitiesUpdate(
+        quantities={}, gate_pass_number=" hotel bill 42 "
+    )
+    with pytest.raises(HTTPException) as exc:
+        await m.update_day_quantities(
+            "receiving", CLIENT, Y, MO, 2, duplicate, current_user=user()
+        )
+    assert exc.value.status_code == 409
+
+
+async def test_generated_bill_reference_skips_manually_reserved_number(mocked_db):
+    await mocked_db["manual_references_collection"].create_index(
+        "normalized", unique=True
+    )
+    await manual_references.reserve_references(
+        "monthly:manual-number-test",
+        {"alrs_number": "SB-ABCDEFGH"},
+    )
+    assert not await manual_references.reserve_generated_bill_number("sb-abcdefgh")
+
+
+async def test_shop_bill_generator_avoids_reserved_monthly_references(
+    mocked_db, monkeypatch
+):
+    await mocked_db["manual_references_collection"].create_index(
+        "normalized", unique=True
+    )
+    await manual_references.reserve_references(
+        "monthly:manual-number-test",
+        {"bill_number": "SB-22222222"},
+    )
+    candidates = iter([list("2" * 8), list("3" * 8)])
+    monkeypatch.setattr(
+        shop_bills_router.random, "choices", lambda _chars, k: next(candidates)
+    )
+
+    assert await shop_bills_router._generate_bill_number() == "SB-33333333"
+
+
 async def test_receiving_draft_hidden_until_activated(mocked_db):
     """An unactivated monthly gate pass is not stock anyone may deliver."""
     await put("receiving", {"Duvet Cover||": 50})

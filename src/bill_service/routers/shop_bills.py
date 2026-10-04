@@ -2,6 +2,7 @@ import csv
 import io
 import random
 import re
+from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
@@ -32,6 +33,11 @@ from ..models import (
 )
 from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..router_utils import log_audit, parse_object_id
+from ..services.manual_references import (
+    reserve_generated_bill_number,
+    reserve_generated_reference,
+    reserve_references,
+)
 
 router = APIRouter(prefix="/shop-bills", tags=["shop-bills"])
 
@@ -91,9 +97,12 @@ async def _find_bill(bill_id: str) -> dict:
     return doc
 
 
-def _generate_bill_number() -> str:
+async def _generate_bill_number() -> str:
     """Generate a unique confusable-safe bill number like SB-XXXXXXXX."""
-    return BILL_NUMBER_PREFIX + "".join(random.choices(BILL_NUMBER_CHARS, k=8))
+    while True:
+        candidate = BILL_NUMBER_PREFIX + "".join(random.choices(BILL_NUMBER_CHARS, k=8))
+        if await reserve_generated_bill_number(candidate):
+            return candidate
 
 
 def _get_search_token(name: str) -> str:
@@ -275,13 +284,18 @@ async def _find_legacy_invoice(invoice_id: str) -> dict:
     return doc
 
 
-def _generate_legacy_invoice_number(now: datetime) -> str:
+async def _generate_legacy_invoice_number(now: datetime) -> str:
     """INV-YYYYMMDD-XXXXXX with a confutable-safe suffix.
 
     Numbered by the Sri Lankan calendar date, so an invoice raised at 02:00 LKT
     still belongs to the previous working day.
     """
-    return f"INV-{lkt(now).strftime('%Y%m%d')}-" + "".join(random.choices(BILL_NUMBER_CHARS, k=6))
+    while True:
+        candidate = f"INV-{lkt(now).strftime('%Y%m%d')}-" + "".join(
+            random.choices(BILL_NUMBER_CHARS, k=6)
+        )
+        if await reserve_generated_reference(candidate, "legacy invoice number"):
+            return candidate
 
 
 def _calc_legacy_grand_total(entries: list) -> float:
@@ -308,7 +322,7 @@ async def create_legacy_invoice(
     if grand_total <= 0:
         raise HTTPException(status_code=400, detail="Invoice total must be greater than zero")
 
-    invoice_number = _generate_legacy_invoice_number(now)
+    invoice_number = await _generate_legacy_invoice_number(now)
     doc = {
         "invoice_number": invoice_number,
         "shop_name": shop_name,
@@ -400,7 +414,16 @@ async def create_bill(
     current_user: dict = Depends(require_capability("bill:write")),
 ):
     now = datetime.now(timezone.utc)
-    bill_number = payload.bill_number or _generate_bill_number()
+    if payload.bill_number:
+        bill_number = payload.bill_number.strip()
+        try:
+            await reserve_references(
+                f"shop-bill:{uuid4().hex}", {"bill_number": bill_number}
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    else:
+        bill_number = await _generate_bill_number()
 
     items = [i.model_dump() for i in payload.items]
     _prepare_items(items)
@@ -755,7 +778,7 @@ async def split_bill(
 
     moved_totals_data = _calc_totals(moved_items)
     moved_grand = moved_totals_data["grand_total"]
-    new_bn = _generate_bill_number()
+    new_bn = await _generate_bill_number()
 
     new_doc = {
         "bill_number": new_bn,
@@ -868,7 +891,7 @@ async def duplicate_bill(
     items = [i.copy() for i in src_doc.get("items", [])]
     _prepare_items(items)
     totals = _calc_totals(items)
-    new_bn = _generate_bill_number()
+    new_bn = await _generate_bill_number()
 
     doc = {
         "bill_number": new_bn,
@@ -1029,7 +1052,7 @@ async def quick_bill(
     current_user: dict = Depends(require_capability("bill:write")),
 ):
     now = datetime.now(timezone.utc)
-    bn = _generate_bill_number()
+    bn = await _generate_bill_number()
 
     items = [dict(i) for i in (body.get("items", []) or [])]
     if not items and body.get("template_id"):
@@ -1092,7 +1115,7 @@ async def manual_bill(
     current_user: dict = Depends(require_capability("bill:write")),
 ):
     now = datetime.now(timezone.utc)
-    bn = _generate_bill_number()
+    bn = await _generate_bill_number()
 
     doc = _build_bill_doc(body, bn, now)
     doc["status"] = body.get("status", "PENDING")
@@ -1875,7 +1898,7 @@ async def bulk_status_notes(body: dict = Body(...), current_user: dict = Depends
 async def dup_opts(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
     raw = await _find_bill(bill_id); src = _dec(raw); now = datetime.now(timezone.utc)
     items = [i.copy() for i in src.get("items", [])] if body.get("keep_items", True) else []
-    bn = _generate_bill_number(); gt = sum(i.get("line_total", 0) for i in items)
+    bn = await _generate_bill_number(); gt = sum(i.get("line_total", 0) for i in items)
     doc = {"bill_number": bn, "client_name": body.get("client_name", src.get("client_name")), "quotation_id": src.get("quotation_id"), "items": items, "total_quantity": sum(i.get("quantity", 0) for i in items), "total_amount": gt, "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": gt, "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": gt, "notes": None, "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": src["id"], "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
@@ -1926,7 +1949,7 @@ async def from_quotation(quotation_id: str, current_user: dict = Depends(require
     except Exception: q_doc = q_raw
     now = datetime.now(timezone.utc)
     items_data = [{"item_name": qi.get("item_name", ""), "specification": qi.get("specification"), "category": qi.get("category"), "unit_price": qi.get("unit_price", 0), "quantity": qi.get("quantity", 1), "discount": 0, "discount_type": "FIXED"} for qi in q_doc.get("items", [])]
-    _prepare_items(items_data); totals = _calc_totals(items_data); bn = _generate_bill_number()
+    _prepare_items(items_data); totals = _calc_totals(items_data); bn = await _generate_bill_number()
     doc = {"bill_number": bn, "client_name": q_doc.get("client_name", ""), "quotation_id": quotation_id, "items": items_data, "total_quantity": totals["total_quantity"], "total_amount": totals["total_amount"], "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": totals["grand_total"], "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": totals["grand_total"], "notes": q_doc.get("notes"), "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": None, "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
@@ -2067,7 +2090,17 @@ async def calc_disc(body: dict = Body(...), current_user: dict = Depends(require
 async def batch(body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
     now = datetime.now(timezone.utc); created = []
     for bd in body.get("bills", [])[:20]:
-        bn = bd.get("bill_number") or _generate_bill_number(); doc = _build_bill_doc(bd, bn, now)
+        if bd.get("bill_number"):
+            bn = str(bd["bill_number"]).strip()
+            try:
+                await reserve_references(
+                    f"shop-bill:{uuid4().hex}", {"bill_number": bn}
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        else:
+            bn = await _generate_bill_number()
+        doc = _build_bill_doc(bd, bn, now)
         result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
         v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
         created.append({"bill_number": bn, "id": doc["id"]})
@@ -2177,7 +2210,7 @@ async def refund(bill_id: str, body: dict = Body(...), current_user: dict = Depe
 
 @router.post("/{bill_id}/credit-note")
 async def credit_note(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    src = _dec(await _find_bill(bill_id)); now = datetime.now(timezone.utc); amt = body.get("amount", 0); bn = _generate_bill_number()
+    src = _dec(await _find_bill(bill_id)); now = datetime.now(timezone.utc); amt = body.get("amount", 0); bn = await _generate_bill_number()
     doc = {"bill_number": bn, "client_name": src["client_name"], "quotation_id": None, "items": [], "total_quantity": 0, "total_amount": -amt, "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": -amt, "status": "COMPLETED", "payment_status": "PAID", "paid_amount": -amt, "outstanding_amount": 0, "notes": f"Credit note for {src.get('bill_number')}: {body.get(chr(114)+chr(101)+chr(97)+chr(115)+chr(111)+chr(110), '')}", "notes_history": [], "delivery_date": None, "tags": ["credit-note"], "locked": True, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": src["id"], "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)

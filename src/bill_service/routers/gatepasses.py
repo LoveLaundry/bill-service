@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from uuid import uuid4
 from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from bson import ObjectId
@@ -15,6 +16,7 @@ from ..database.main_db import (
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..services.gate_pass_records import create_gate_pass_record
+from ..services.manual_references import reserve_references
 from ..error_responses import NotFoundError, ValidationError, ConflictError, ForbiddenError
 from ..services.bill_sync import sync_bills_to_gate_pass
 from ..services.transaction_events import (
@@ -106,6 +108,13 @@ async def create_gate_pass(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Gate Pass number already exists",
         )
+    try:
+        await reserve_references(
+            f"gatepass:{uuid4().hex}",
+            {"gate_pass_number": payload.gate_pass_number},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # Shared builder keeps the full journal/sync/verify chain identical for the
     # normal (RECEIVED) and monthly DRAFT paths.
