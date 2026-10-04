@@ -144,35 +144,6 @@ async def list_returns(
     return {"items": items, "total": total}
 
 
-@router.get("/returns/{return_id}")
-async def get_return(
-    return_id: str,
-    current_user: dict = Depends(require_capability("gatepass:read")),
-):
-    """Get a single return by return_id."""
-    raw_doc = await returns_collection.find_one({"return_id": return_id})
-    if not raw_doc:
-        raise HTTPException(status_code=404, detail="Return not found")
-    return _dec(raw_doc)
-
-
-@router.get("/returns/stats/summary")
-async def returns_summary(
-    current_user: dict = Depends(require_capability("dashboard:read")),
-):
-    """Return stats summary for dashboard."""
-    total = await returns_collection.count_documents({})
-    pending = await returns_collection.count_documents({"status": "PENDING"})
-    received = await returns_collection.count_documents({"status": "RECEIVED"})
-    processed = await returns_collection.count_documents({"status": "PROCESSED"})
-    return {
-        "total": total,
-        "pending": pending,
-        "received": received,
-        "processed": processed,
-    }
-
-
 @router.get("/returns/pending-resent")
 async def pending_resent_items(
     client_name: Optional[str] = Query(None),
@@ -204,6 +175,35 @@ async def pending_resent_items(
             })
 
     return results
+
+
+@router.get("/returns/stats/summary")
+async def returns_summary(
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
+    """Return stats summary for dashboard."""
+    total = await returns_collection.count_documents({})
+    pending = await returns_collection.count_documents({"status": "PENDING"})
+    received = await returns_collection.count_documents({"status": "RECEIVED"})
+    processed = await returns_collection.count_documents({"status": "PROCESSED"})
+    return {
+        "total": total,
+        "pending": pending,
+        "received": received,
+        "processed": processed,
+    }
+
+
+@router.get("/returns/{return_id}")
+async def get_return(
+    return_id: str,
+    current_user: dict = Depends(require_capability("gatepass:read")),
+):
+    """Get a single return by return_id."""
+    raw_doc = await returns_collection.find_one({"return_id": return_id})
+    if not raw_doc:
+        raise HTTPException(status_code=404, detail="Return not found")
+    return _dec(raw_doc)
 
 
 @router.patch("/returns/{return_id}")

@@ -20,7 +20,7 @@ from ..database.main_db import gatepasses_collection
 from ..services import balance_engine as be
 from ..services import operations_context as ctx
 
-router = APIRouter(tags=["notifications"])
+router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 SENSITIVE_FIELDS_GP = ["client_name", "items", "notes"]
 
