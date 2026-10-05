@@ -26,6 +26,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from ..app_time import month_bounds
 from ..auth_helper import get_current_user, require_capability
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
@@ -334,7 +335,7 @@ def _cells_from_days(doc: Optional[dict]) -> Dict[str, Dict[str, float]]:
 async def _live_operations_summary(
     client_name: str, year: int, month: int
 ) -> dict:
-    """Return live receiving, delivery and balance totals for this month."""
+    """Return month activity plus the client's current live gate-pass balance."""
     receiving_month = await _find_month_doc(client_name, "receiving", year, month)
     receiving_days = (receiving_month or {}).get("days") or {}
     gate_pass_ids = list(
@@ -344,8 +345,18 @@ async def _live_operations_summary(
             for gate_pass_id in (day_state.get("gate_pass_ids") or [])
         )
     )
-    gate_passes = await ops_ctx.load_gate_passes(gate_pass_ids)
-    draft_count = sum(1 for gp in gate_passes if gp.get("status") == "DRAFT")
+    month_gate_pass_ids = set(gate_pass_ids)
+    all_gate_pass_ids = set(gate_pass_ids)
+    async for gate_pass_doc in gatepasses_collection.find(
+        {"client_name_search": get_search_token(client_name)}
+    ):
+        all_gate_pass_ids.add(str(gate_pass_doc["_id"]))
+    gate_passes = await ops_ctx.load_gate_passes(list(all_gate_pass_ids))
+    month_gate_passes = [
+        gp for gp in gate_passes
+        if str(gp.get("id")) in month_gate_pass_ids
+    ]
+    draft_count = sum(1 for gp in month_gate_passes if gp.get("status") == "DRAFT")
     active_gate_passes = [
         gp for gp in gate_passes if gp.get("status") not in ("DRAFT", "CANCELLED")
     ]
@@ -365,6 +376,19 @@ async def _live_operations_summary(
             "outstanding_delivery_qty",
         )
     }
+    month_start, month_end = month_bounds(year, month)
+    async for delivery_doc in deliveries_collection.find(
+        {"delivery_date": {"$gte": month_start, "$lt": month_end}}
+    ):
+        delivery = decrypt_dict(delivery_doc, DELIVERY_SENSITIVE_FIELDS)
+        if (delivery.get("client_name") or "").strip().casefold() != client_name.strip().casefold():
+            continue
+        if delivery.get("status") in ("DRAFT", "CANCELLED"):
+            continue
+        for item in delivery.get("items") or []:
+            unit = _item_unit(item.get("item_name", ""))
+            totals["delivered_qty"][unit] += float(item.get("quantity", 0) or 0)
+
     for gp in active_gate_passes:
         gp_id = str(gp["id"])
         balance = balances[gp_id]
@@ -376,10 +400,17 @@ async def _live_operations_summary(
         }
         for item_key, item_balance in balance["items"].items():
             unit = "kg" if units.get(item_key) == "kg" else "pcs"
-            for metric in totals:
+            if gp_id in month_gate_pass_ids:
+                totals["received_qty"][unit] += float(
+                    item_balance.get("received_qty", 0) or 0
+                )
+            for metric in ("returned_back_qty", "outstanding_delivery_qty"):
                 totals[metric][unit] += float(item_balance.get(metric, 0) or 0)
     return {
-        "gate_pass_count": len(active_gate_passes),
+        "gate_pass_count": sum(
+            1 for gp in month_gate_passes
+            if gp.get("status") not in ("DRAFT", "CANCELLED")
+        ),
         "draft_gate_pass_count": draft_count,
         "totals": {
             metric: {unit: round(value, 2) for unit, value in values.items()}

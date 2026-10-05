@@ -241,6 +241,30 @@ async def test_delivery_draft_moves_no_stock_until_activated(mocked_db):
     assert live_summary["totals"]["outstanding_delivery_qty"]["pcs"] == 40
 
 
+async def test_monthly_delivered_total_includes_current_month_deliveries_from_older_gate_passes(
+    mocked_db,
+):
+    """Monthly delivered totals follow delivery dates, not receiving-pass month."""
+    await put("receiving", {"Duvet Cover||": 50}, month=MO - 1)
+    await confirm("receiving", month=MO - 1)
+    gp = (await gate_passes(mocked_db))[0]
+    await update_gate_pass_status(gp["id"], "RECEIVED", current_user=user())
+
+    await put("delivery", {"Duvet Cover||": 15}, month=MO)
+    await confirm(
+        "delivery",
+        month=MO,
+        body=MonthlyDayConfirm(source_mode="auto"),
+    )
+    dlv = next(d for d in await deliveries(mocked_db) if d["status"] == "DRAFT")
+    await activate_delivery(dlv["id"], current_user=user())
+
+    live_summary = (await matrix("delivery", month=MO))["operations_summary"]
+    assert live_summary["totals"]["received_qty"]["pcs"] == 0
+    assert live_summary["totals"]["delivered_qty"]["pcs"] == 15
+    assert live_summary["totals"]["outstanding_delivery_qty"]["pcs"] == 35
+
+
 async def test_rewash_recorded_and_counted_without_activation(mocked_db):
     """Rewash is a receiving-side record: confirmed means it already counts."""
     await put("rewash", {"Duvet Cover||": 4})
