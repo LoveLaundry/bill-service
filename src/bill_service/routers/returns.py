@@ -17,6 +17,8 @@ from ..services.transaction_events import (
     EVENT_RETURN_UPDATED,
 )
 from ..crypto_helper import get_search_token, encrypt_dict, decrypt_dict
+from ..services import balance_engine as be
+from ..services import operations_context as ops
 
 router = APIRouter(tags=["Returns"])
 
@@ -47,29 +49,144 @@ def _generate_return_id() -> str:
     return f"RT-{code}"
 
 
+def _decrypted(doc: dict) -> dict:
+    try:
+        return decrypt_dict(doc, SENSITIVE_FIELDS)
+    except (ValueError, KeyError):
+        return {
+            k: v for k, v in doc.items()
+            if k != "encryption_metadata" and not k.endswith("_search")
+        }
+
+
+async def _validate_return_relationships_and_quantity(
+    *,
+    gate_pass_id: str,
+    client_name: str,
+    items: list[dict],
+    delivery_id: Optional[str] = None,
+    exclude_return_id: Optional[str] = None,
+) -> None:
+    """Check return links and quantities against active canonical movements."""
+    gp_oid = parse_object_id(gate_pass_id, "Gate Pass ID")
+    gp_raw = await gatepasses_collection.find_one({"_id": gp_oid})
+    if not gp_raw:
+        raise HTTPException(status_code=404, detail="Gate pass not found")
+    gp = _decrypted(gp_raw)
+    if not be.same_client(client_name, gp.get("client_name")):
+        raise HTTPException(status_code=400, detail="Return client does not match gate pass")
+    if gp.get("status") in (be.DRAFT_STATUS, be.CANCELLED_STATUS):
+        raise HTTPException(
+            status_code=400,
+            detail="Returns cannot be recorded against a draft or cancelled gate pass",
+        )
+
+    selected_delivery = None
+    if delivery_id:
+        dl_oid = parse_object_id(delivery_id, "Delivery ID")
+        dl_raw = await deliveries_collection.find_one({"_id": dl_oid})
+        if not dl_raw:
+            raise HTTPException(status_code=404, detail="Delivery not found")
+        selected_delivery = _decrypted(dl_raw)
+        source_ids = be.source_gate_pass_ids(selected_delivery)
+        if gate_pass_id not in source_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Delivery does not belong to the specified gate pass",
+            )
+        if not be.same_client(client_name, selected_delivery.get("client_name")):
+            raise HTTPException(status_code=400, detail="Return client does not match delivery")
+        if selected_delivery.get("status") in (be.DRAFT_STATUS, be.CANCELLED_STATUS):
+            raise HTTPException(
+                status_code=400,
+                detail="Returns can only be recorded against an active delivery",
+            )
+
+    deliveries, existing_returns = await ops.load_movements([gate_pass_id])
+    active_deliveries = [
+        doc for doc in deliveries
+        if doc.get("status") not in (be.DRAFT_STATUS, be.CANCELLED_STATUS)
+    ]
+    delivered_by_gp = be.compute_delivered_by_gate_pass(active_deliveries).get(
+        gate_pass_id, {}
+    )
+    delivered_from_selected = (
+        be.compute_delivered_by_gate_pass([selected_delivery]).get(gate_pass_id, {})
+        if selected_delivery else {}
+    )
+
+    previous_by_item: dict[str, float] = {}
+    previous_selected_by_item: dict[str, float] = {}
+    for ret in existing_returns:
+        if exclude_return_id and str(ret.get("return_id")) == exclude_return_id:
+            continue
+        for item in ret.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            key = be.item_key(item.get("item_name", ""), item.get("specification"))
+            qty = float(item.get("returned_qty", 0) or 0)
+            previous_by_item[key] = previous_by_item.get(key, 0) + qty
+            if selected_delivery and ret.get("delivery_id") in (None, delivery_id):
+                previous_selected_by_item[key] = (
+                    previous_selected_by_item.get(key, 0) + qty
+                )
+
+    requested_by_item: dict[str, float] = {}
+    for item in items:
+        key = be.item_key(item.get("item_name", ""), item.get("specification"))
+        requested_by_item[key] = requested_by_item.get(key, 0) + float(
+            item.get("returned_qty", 0) or 0
+        )
+
+    for key, requested in requested_by_item.items():
+        delivered = float(delivered_by_gp.get(key, 0) or 0)
+        previously_returned = previous_by_item.get(key, 0)
+        available = max(0, delivered - previously_returned)
+        if requested > available + 1e-9:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Return quantity for '{be.flatten_name(key)}' exceeds the "
+                    f"delivered quantity available to return (requested {requested:g}, "
+                    f"available {available:g})"
+                ),
+            )
+
+        if selected_delivery:
+            from_delivery = float(delivered_from_selected.get(key, 0) or 0)
+            previously_returned_from_delivery = previous_selected_by_item.get(key, 0)
+            delivery_available = max(0, from_delivery - previously_returned_from_delivery)
+            if requested > delivery_available + 1e-9:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Return quantity for '{be.flatten_name(key)}' exceeds the "
+                        f"quantity delivered in this delivery (available "
+                        f"{delivery_available:g})"
+                    ),
+                )
+
+
+async def _refresh_return_gate_pass_status(gate_pass_id: str) -> None:
+    await ops.refresh_gate_pass_statuses([gate_pass_id])
+
+
 @router.post("/returns")
 async def create_return(
     payload: ReturnCreate,
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     """Record a garment return from a client."""
-    # Validate gate pass exists
-    gp_oid = parse_object_id(payload.gate_pass_id)
-    gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
-    if not gp_doc:
-        raise HTTPException(status_code=404, detail="Gate pass not found")
-
-    # Validate delivery if provided
-    if payload.delivery_id:
-        dl_oid = parse_object_id(payload.delivery_id)
-        dl_doc = await deliveries_collection.find_one({"_id": dl_oid})
-        if not dl_doc:
-            raise HTTPException(status_code=404, detail="Delivery not found")
-
     now = datetime.now(timezone.utc)
     return_id = _generate_return_id()
 
     items_data = [item.model_dump() for item in payload.items]
+    await _validate_return_relationships_and_quantity(
+        gate_pass_id=payload.gate_pass_id,
+        client_name=payload.client_name,
+        items=items_data,
+        delivery_id=payload.delivery_id,
+    )
 
     doc = {
         "return_id": return_id,
@@ -109,11 +226,12 @@ async def create_return(
         reason=payload.notes,
         item_deltas=[
             build_item_delta(item.get("item_name"), item.get("specification"), 0, item.get("returned_qty", 0))
-            for item in payload.items
+            for item in items_data
         ],
         meta={"return_id": return_id, "delivery_id": payload.delivery_id, "status": "PENDING"},
     )
 
+    await _refresh_return_gate_pass_status(payload.gate_pass_id)
     return _dec(doc)
 
 
@@ -241,6 +359,13 @@ async def update_return(
     # Merge with existing decrypted doc, then re-encrypt entire document
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     merged.update(update_fields)
+    await _validate_return_relationships_and_quantity(
+        gate_pass_id=merged.get("gate_pass_id", ""),
+        client_name=merged.get("client_name", ""),
+        items=merged.get("items", []),
+        delivery_id=merged.get("delivery_id"),
+        exclude_return_id=return_id,
+    )
     encrypted = encrypt_dict(merged, SENSITIVE_FIELDS)
     await returns_collection.update_one({"return_id": return_id}, {"$set": encrypted})
 
@@ -264,6 +389,7 @@ async def update_return(
     )
 
     updated = await returns_collection.find_one({"return_id": return_id})
+    await _refresh_return_gate_pass_status(doc.get("gate_pass_id", ""))
     return _dec(updated)
 
 
@@ -280,6 +406,13 @@ async def mark_item_resent(
         raise HTTPException(status_code=404, detail="Return not found")
 
     doc = _dec(raw_doc)
+    await _validate_return_relationships_and_quantity(
+        gate_pass_id=doc.get("gate_pass_id", ""),
+        client_name=doc.get("client_name", ""),
+        items=doc.get("items", []),
+        delivery_id=doc.get("delivery_id"),
+        exclude_return_id=return_id,
+    )
 
     now = datetime.now(timezone.utc)
     updated_items = []
@@ -330,4 +463,5 @@ async def mark_item_resent(
     )
 
     updated = await returns_collection.find_one({"return_id": return_id})
+    await _refresh_return_gate_pass_status(doc.get("gate_pass_id", ""))
     return _dec(updated)

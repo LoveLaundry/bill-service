@@ -13,6 +13,7 @@ Everything here is a thin, read-only adapter over
 module owns the I/O.
 """
 from datetime import datetime, timezone
+import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from bson import ObjectId
@@ -22,6 +23,18 @@ from ..database.main_db import deliveries_collection, gatepasses_collection, ret
 from . import balance_engine as be
 
 SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+logger = logging.getLogger(__name__)
+
+
+def _decode_record(kind: str, doc: dict, sensitive_fields: Optional[List[str]] = None) -> dict:
+    record_id = str(doc.get("_id", "unknown"))
+    try:
+        return serialize(doc, sensitive_fields)
+    except Exception as exc:
+        logger.exception("Could not decode %s record %s; refusing incomplete balance data", kind, record_id)
+        raise RuntimeError(
+            f"Could not load complete operational data ({kind} record {record_id}); balance calculation aborted."
+        ) from exc
 
 
 def to_object_id(value: str) -> Optional[ObjectId]:
@@ -53,10 +66,7 @@ async def load_gate_passes(gate_pass_ids: Optional[Iterable[str]] = None) -> Lis
     cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
     out: List[dict] = []
     async for doc in cursor:
-        try:
-            gp = serialize(doc)
-        except Exception:
-            continue
+        gp = _decode_record("gate pass", doc)
         gp["gate_pass_id"] = gp["id"]
         out.append(gp)
     return out
@@ -70,10 +80,7 @@ async def load_gate_pass(gate_pass_id: str) -> Optional[dict]:
     doc = await gatepasses_collection.find_one({"_id": oid})
     if not doc:
         return None
-    try:
-        gp = serialize(doc)
-    except Exception:
-        return None
+    gp = _decode_record("gate pass", doc)
     gp["gate_pass_id"] = gp["id"]
     return gp
 
@@ -116,17 +123,11 @@ async def load_movements(
 
     deliveries: List[dict] = []
     async for doc in deliveries_collection.find(gp_filter):
-        try:
-            deliveries.append(serialize(doc))
-        except Exception:
-            continue
+        deliveries.append(_decode_record("delivery", doc))
 
     returns: List[dict] = []
     async for doc in returns_collection.find({"gate_pass_id": {"$in": [g for g in (gate_pass_ids or []) if g]}} if gate_pass_ids is not None else {}):
-        try:
-            returns.append(serialize(doc))
-        except Exception:
-            continue
+        returns.append(_decode_record("return", doc))
 
     return deliveries, returns
 

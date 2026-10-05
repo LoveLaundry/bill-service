@@ -155,5 +155,6 @@ async def ensure_indexes():
     # Sync infrastructure indexes
     await sync_status_collection.create_index([("entity", 1), ("record_id", 1)], unique=True)
     await sync_queue_collection.create_index([("status", 1), ("next_attempt_at", 1)])
+    await sync_queue_collection.create_index([("status", 1), ("lease_until", 1)])
     await sync_queue_collection.create_index([("entity", 1), ("record_id", 1)], unique=True)
     await sync_logs_collection.create_index([("operation", 1), ("started_at", -1)])

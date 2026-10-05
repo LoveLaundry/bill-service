@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from pymongo.errors import DuplicateKeyError
+
 from ..database.main_db import sync_queue_collection, sync_status_collection
 from .entity_registry import get_main_collection
 
@@ -42,25 +44,41 @@ async def bump_version(entity: str, record_id: Any, reason: str = "update") -> i
     return int(result.get("sync_version") or 1)
 
 
+async def _enqueue_operation(
+    entity: str, record_id: Any, version: int, operation: str
+) -> None:
+    now = _now()
+    identity = {"entity": entity, "record_id": str(record_id)}
+    update = {
+        "$set": {
+            **identity,
+            "version": version,
+            "operation": operation,
+            "attempts": 0,
+            "next_attempt_at": now,
+            "updated_at": now,
+        },
+        "$setOnInsert": {"created_at": now, "status": "PENDING"},
+    }
+
+    try:
+        await sync_queue_collection.update_one(identity, update, upsert=True)
+    except DuplicateKeyError:
+        # A concurrent first enqueue may have inserted the unique entity/id
+        # row after this upsert checked for it.
+        await sync_queue_collection.update_one(identity, update)
+
+    # Keep an in-flight claim exclusive while replacing its queued version.
+    # The claimant will notice the version/operation change and release it.
+    await sync_queue_collection.update_one(
+        {**identity, "status": {"$ne": "SYNCING"}},
+        {"$set": {"status": "PENDING"}},
+    )
+
+
 async def enqueue_sync(entity: str, record_id: Any, version: int) -> None:
     """Persist a sync job in the durable MAIN sync_queue (retry-safe)."""
-    await sync_queue_collection.update_one(
-        {"entity": entity, "record_id": str(record_id), "status": {"$in": ["PENDING", "FAILED"]}},
-        {
-            "$set": {
-                "entity": entity,
-                "record_id": str(record_id),
-                "version": version,
-                "operation": OPERATION_UPSERT,
-                "status": "PENDING",
-                "attempts": 0,
-                "next_attempt_at": _now(),
-                "updated_at": _now(),
-            },
-            "$setOnInsert": {"created_at": _now()},
-        },
-        upsert=True,
-    )
+    await _enqueue_operation(entity, record_id, version, OPERATION_UPSERT)
 
 
 async def enqueue_delete(entity: str, record_id: Any, version: int) -> None:
@@ -70,23 +88,7 @@ async def enqueue_delete(entity: str, record_id: Any, version: int) -> None:
     Call this AFTER the document has been removed from MAIN, passing the
     version captured by `bump_version` immediately before the delete.
     """
-    await sync_queue_collection.update_one(
-        {"entity": entity, "record_id": str(record_id), "status": {"$in": ["PENDING", "FAILED"]}},
-        {
-            "$set": {
-                "entity": entity,
-                "record_id": str(record_id),
-                "version": version,
-                "operation": OPERATION_DELETE,
-                "status": "PENDING",
-                "attempts": 0,
-                "next_attempt_at": _now(),
-                "updated_at": _now(),
-            },
-            "$setOnInsert": {"created_at": _now()},
-        },
-        upsert=True,
-    )
+    await _enqueue_operation(entity, record_id, version, OPERATION_DELETE)
 
 
 async def record_sync_status(

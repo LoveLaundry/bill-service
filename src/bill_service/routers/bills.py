@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 from bson import ObjectId
@@ -42,6 +43,7 @@ PAYMENT_SENSITIVE_FIELDS = ["client_name", "notes"]
 DELIVERY_SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 GATEPASS_SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 QUOTATION_SENSITIVE_FIELDS = ["client_name", "quotation_title", "line_items"]
+logger = logging.getLogger(__name__)
 
 
 def _serialize(doc: dict) -> dict:
@@ -1212,6 +1214,122 @@ async def delete_bill(
 
 
 # --- Payment APIs ---
+def _payment_bill_cas_filter(doc: dict, oid: ObjectId) -> dict:
+    """Match the money state read by a payment before changing its aggregates."""
+    query = {"_id": oid}
+    for field in ("paid_amount", "grand_total", "outstanding_amount", "payment_status"):
+        if field in doc:
+            query[field] = doc[field]
+        else:
+            query[field] = {"$exists": False}
+    return query
+
+
+async def _reserve_bill_payment(oid: ObjectId, amount: float, now: datetime) -> tuple[dict, dict]:
+    """Atomically reserve amount against the current bill balance using CAS.
+
+    MongoDB updates a single document atomically across processes. Comparing
+    every accounting field read prevents one request from overwriting another
+    request's newer aggregate values.
+    """
+    for _ in range(20):
+        doc = await bills_collection.find_one({"_id": oid})
+        if not doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
+            )
+
+        dec_bill = _serialize(doc)
+        if dec_bill["payment_status"] == "CANCELLED":
+            raise HTTPException(
+                status_code=400, detail="Cannot record payments on a cancelled bill."
+            )
+
+        paid_amount = round(float(dec_bill.get("paid_amount") or 0), 2)
+        grand_total = round(float(dec_bill["grand_total"]), 2)
+        outstanding = round(grand_total - paid_amount, 2)
+        if outstanding < 0:
+            outstanding = 0.0
+        if amount > outstanding + 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Payment amount of {amount} exceeds outstanding block of {outstanding}.",
+            )
+
+        new_paid = round(paid_amount + amount, 2)
+        new_outstanding = round(grand_total - new_paid, 2)
+        if new_outstanding < 0.01:
+            new_outstanding = 0.0
+            new_status = "PAID"
+        else:
+            new_status = "PARTIALLY_PAID"
+
+        result = await bills_collection.update_one(
+            _payment_bill_cas_filter(doc, oid),
+            {
+                "$set": {
+                    "paid_amount": new_paid,
+                    "outstanding_amount": new_outstanding,
+                    "payment_status": new_status,
+                    "updated_at": now,
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return dec_bill, {
+                "paid_amount": new_paid,
+                "outstanding_amount": new_outstanding,
+                "payment_status": new_status,
+            }
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Bill was updated concurrently. Please retry the payment.",
+    )
+
+
+async def _rollback_bill_payment(oid: ObjectId, amount: float, prior_status: str) -> None:
+    """Compensate a successful bill reservation if its payment row cannot save."""
+    for _ in range(20):
+        doc = await bills_collection.find_one({"_id": oid})
+        if not doc:
+            raise RuntimeError("Bill disappeared while restoring its payment balance")
+
+        dec_bill = _serialize(doc)
+        paid_amount = round(float(dec_bill.get("paid_amount") or 0), 2)
+        grand_total = round(float(dec_bill["grand_total"]), 2)
+        restored_paid = max(0.0, round(paid_amount - amount, 2))
+        restored_outstanding = round(grand_total - restored_paid, 2)
+        if restored_outstanding < 0.01:
+            restored_outstanding = 0.0
+            restored_status = "PAID"
+        elif restored_paid > 0:
+            restored_status = "PARTIALLY_PAID"
+        else:
+            restored_status = prior_status
+
+        # A cancellation that happened while the write was in flight remains
+        # authoritative; compensation only restores its monetary aggregates.
+        if dec_bill["payment_status"] == "CANCELLED":
+            restored_status = "CANCELLED"
+
+        result = await bills_collection.update_one(
+            _payment_bill_cas_filter(doc, oid),
+            {
+                "$set": {
+                    "paid_amount": restored_paid,
+                    "outstanding_amount": restored_outstanding,
+                    "payment_status": restored_status,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return
+
+    raise RuntimeError("Bill changed repeatedly while restoring its payment balance")
+
+
 @router.post(
     "/{bill_id}/payments",
     response_model=PaymentModel,
@@ -1231,27 +1349,8 @@ async def create_payment(
         return _serialize_payment(existing_created)
 
     oid = _parse_object_id(bill_id)
-    doc = await bills_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
-        )
-
-    dec_bill = _serialize(doc)
-    if dec_bill["payment_status"] == "CANCELLED":
-        raise HTTPException(
-            status_code=400, detail="Cannot record payments on a cancelled bill."
-        )
-
-    outstanding = dec_bill["outstanding_amount"]
-    if payload.amount > outstanding + 0.01:  # Allow minor tolerance for rounding
-        raise HTTPException(
-            status_code=400,
-            detail=f"Payment amount of {payload.amount} exceeds outstanding block of {outstanding}.",
-        )
-
-    # 1. Create Payment record
     now = datetime.now(timezone.utc)
+    dec_bill, _ = await _reserve_bill_payment(oid, payload.amount, now)
     payment_doc = {
         "bill_id": bill_id,
         "client_name": dec_bill["client_name"],
@@ -1264,41 +1363,59 @@ async def create_payment(
         "created_at": now,
     }
 
-    encrypted_pay = encrypt_dict(payment_doc, PAYMENT_SENSITIVE_FIELDS)
-    pay_result = await payments_collection.insert_one(encrypted_pay)
+    # Without replica-set transactions the two collections cannot commit
+    # together. Reserve the balance first, then compensate the bill if the
+    # payment insert fails. Confirm the pre-generated id after an insert error
+    # because a lost acknowledgement may still mean MongoDB committed it.
+    payment_id = ObjectId()
+    try:
+        encrypted_pay = encrypt_dict(payment_doc, PAYMENT_SENSITIVE_FIELDS)
+        encrypted_pay["_id"] = payment_id
+        await payments_collection.insert_one(encrypted_pay)
+    except Exception as insert_error:
+        try:
+            created_pay = await payments_collection.find_one({"_id": payment_id})
+        except Exception:
+            logger.exception(
+                "Could not determine whether payment %s was persisted",
+                payment_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Payment persistence could not be confirmed; manual reconciliation is required.",
+            ) from insert_error
 
-    payment_version = await bump_version("payment", pay_result.inserted_id)
-    await enqueue_sync("payment", pay_result.inserted_id, payment_version)
+        if created_pay is None:
+            try:
+                await _rollback_bill_payment(
+                    oid, payload.amount, dec_bill.get("payment_status", "PENDING")
+                )
+            except Exception as rollback_error:
+                logger.exception(
+                    "Payment insert failed and bill %s compensation failed",
+                    bill_id,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Payment could not be saved and the bill balance could not be restored; manual reconciliation is required.",
+                ) from rollback_error
 
-    # 2. Update Bill totals
-    new_paid = round(dec_bill["paid_amount"] + payload.amount, 2)
-    new_outstanding = round(dec_bill["grand_total"] - new_paid, 2)
-    if new_outstanding < 0.01:
-        new_outstanding = 0.0
-        new_status = "PAID"
-    else:
-        new_status = "PARTIALLY_PAID"
+            raise HTTPException(
+                status_code=500,
+                detail="Payment could not be saved; the bill balance was restored.",
+            ) from insert_error
 
-    await bills_collection.update_one(
-        {"_id": oid},
-        {
-            "$set": {
-                "paid_amount": new_paid,
-                "outstanding_amount": new_outstanding,
-                "payment_status": new_status,
-                "updated_at": now,
-            }
-        },
-    )
+    payment_version = await bump_version("payment", payment_id)
+    await enqueue_sync("payment", payment_id, payment_version)
 
-    created_pay = await payments_collection.find_one({"_id": pay_result.inserted_id})
+    created_pay = await payments_collection.find_one({"_id": payment_id})
     serialized_pay = _serialize_payment(created_pay)
 
     # The bill changed too -> enqueue its replication as well
     bill_new_version = await bump_version("bill", oid)
     await enqueue_sync("bill", oid, bill_new_version)
 
-    serialized_pay = await attach_verification_to("payment", pay_result.inserted_id, serialized_pay)
+    serialized_pay = await attach_verification_to("payment", payment_id, serialized_pay)
 
     await log_audit(
         current_user.get("auth_id", "system"),
