@@ -224,6 +224,10 @@ async def test_delivery_draft_moves_no_stock_until_activated(mocked_db):
 
     # Still 50 available: the DRAFT delivery is recorded, not applied.
     assert (await pending_rows())[0]["total_pending"] == 50
+    live_summary = (await matrix("receiving"))["operations_summary"]
+    assert live_summary["totals"]["received_qty"]["pcs"] == 50
+    assert live_summary["totals"]["delivered_qty"]["pcs"] == 0
+    assert live_summary["totals"]["outstanding_delivery_qty"]["pcs"] == 50
     before = await balance_for(gp["id"])
 
     await activate_delivery(dlv["id"], current_user=user())
@@ -232,6 +236,9 @@ async def test_delivery_draft_moves_no_stock_until_activated(mocked_db):
     assert after["totals"]["outstanding_delivery_qty"] == before["totals"]["outstanding_delivery_qty"] - 10
     assert (await pending_rows())[0]["total_pending"] == 40
     assert (await gate_passes(mocked_db))[0]["status"] == "PARTIALLY_DELIVERED"
+    live_summary = (await matrix("receiving"))["operations_summary"]
+    assert live_summary["totals"]["delivered_qty"]["pcs"] == 10
+    assert live_summary["totals"]["outstanding_delivery_qty"]["pcs"] == 40
 
 
 async def test_rewash_recorded_and_counted_without_activation(mocked_db):

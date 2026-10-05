@@ -932,6 +932,24 @@ class MonthlyItemRow(BaseModel):
     usage_qty: float = 0
 
 
+class MonthlyUnitQuantities(BaseModel):
+    pcs: float = 0
+    kg: float = 0
+
+
+class MonthlyOperationsTotals(BaseModel):
+    received_qty: MonthlyUnitQuantities = Field(default_factory=MonthlyUnitQuantities)
+    delivered_qty: MonthlyUnitQuantities = Field(default_factory=MonthlyUnitQuantities)
+    returned_back_qty: MonthlyUnitQuantities = Field(default_factory=MonthlyUnitQuantities)
+    outstanding_delivery_qty: MonthlyUnitQuantities = Field(default_factory=MonthlyUnitQuantities)
+
+
+class MonthlyOperationsSummary(BaseModel):
+    gate_pass_count: int = 0
+    draft_gate_pass_count: int = 0
+    totals: MonthlyOperationsTotals = Field(default_factory=MonthlyOperationsTotals)
+
+
 class MonthlyMatrixResponse(BaseModel):
     """Full monthly grid payload."""
 
@@ -944,3 +962,4 @@ class MonthlyMatrixResponse(BaseModel):
     rows: List[MonthlyItemRow]
     days: List[MonthlyDayState]
     cells: Dict[str, Dict[str, float]] = {}  # item_key -> { day: quantity }
+    operations_summary: MonthlyOperationsSummary = Field(default_factory=MonthlyOperationsSummary)

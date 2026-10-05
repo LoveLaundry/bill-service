@@ -39,6 +39,7 @@ from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..services import manual_references
 from ..services import balance_engine as be
+from ..services import operations_context as ops_ctx
 from ..services.gate_pass_records import create_gate_pass_record, next_receiving_number
 from ..services.transaction_events import (
     build_item_delta,
@@ -330,6 +331,63 @@ def _cells_from_days(doc: Optional[dict]) -> Dict[str, Dict[str, float]]:
     return cells
 
 
+async def _live_operations_summary(
+    client_name: str, year: int, month: int
+) -> dict:
+    """Return live receiving, delivery and balance totals for this month."""
+    receiving_month = await _find_month_doc(client_name, "receiving", year, month)
+    receiving_days = (receiving_month or {}).get("days") or {}
+    gate_pass_ids = list(
+        dict.fromkeys(
+            gate_pass_id
+            for day_state in receiving_days.values()
+            for gate_pass_id in (day_state.get("gate_pass_ids") or [])
+        )
+    )
+    gate_passes = await ops_ctx.load_gate_passes(gate_pass_ids)
+    draft_count = sum(1 for gp in gate_passes if gp.get("status") == "DRAFT")
+    active_gate_passes = [
+        gp for gp in gate_passes if gp.get("status") not in ("DRAFT", "CANCELLED")
+    ]
+    active_ids = [str(gp["id"]) for gp in active_gate_passes]
+    deliveries, returns = await ops_ctx.load_movements(active_ids)
+    delivered_by_gp = be.compute_delivered_by_gate_pass(deliveries)
+    returned_by_gp = ops_ctx.returned_by_gate_pass(returns)
+    balances = ops_ctx.balances_for(
+        active_gate_passes, delivered_by_gp, returned_by_gp
+    )
+    totals = {
+        metric: {"pcs": 0.0, "kg": 0.0}
+        for metric in (
+            "received_qty",
+            "delivered_qty",
+            "returned_back_qty",
+            "outstanding_delivery_qty",
+        )
+    }
+    for gp in active_gate_passes:
+        gp_id = str(gp["id"])
+        balance = balances[gp_id]
+        units = {
+            be.item_key(item.get("item_name", ""), item.get("specification")):
+                item.get("unit")
+                or ("kg" if "curtain" in item.get("item_name", "").casefold() else "pcs")
+            for item in gp.get("items", [])
+        }
+        for item_key, item_balance in balance["items"].items():
+            unit = "kg" if units.get(item_key) == "kg" else "pcs"
+            for metric in totals:
+                totals[metric][unit] += float(item_balance.get(metric, 0) or 0)
+    return {
+        "gate_pass_count": len(active_gate_passes),
+        "draft_gate_pass_count": draft_count,
+        "totals": {
+            metric: {unit: round(value, 2) for unit, value in values.items()}
+            for metric, values in totals.items()
+        },
+    }
+
+
 @router.get("/{kind}/{client_name}/{year}/{month}", response_model=MonthlyMatrixResponse)
 async def get_monthly_matrix(
     kind: str,
@@ -359,6 +417,9 @@ async def get_monthly_matrix(
         "rows": rows,
         "days": _day_states(doc, month_length),
         "cells": _cells_from_days(doc),
+        "operations_summary": await _live_operations_summary(
+            client_name, year, month
+        ),
     }
 
 
