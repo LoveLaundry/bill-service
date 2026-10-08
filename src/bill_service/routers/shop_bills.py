@@ -303,6 +303,32 @@ def _calc_legacy_grand_total(entries: list) -> float:
     return round(sum(float(e.get("amount", 0) or 0) for e in entries), 2)
 
 
+def _legacy_entry_stats(entries: list) -> dict:
+    """Validate entries and return the derived totals for a legacy invoice."""
+    for entry in entries:
+        if (entry.get("amount", 0) or 0) < 0:
+            raise HTTPException(status_code=400, detail="Amount cannot be negative")
+    grand_total = _calc_legacy_grand_total(entries)
+    if grand_total <= 0:
+        raise HTTPException(status_code=400, detail="Invoice total must be greater than zero")
+    return {
+        "grand_total": grand_total,
+        "total_entries": len([
+            e for e in entries
+            if e.get("bill_number") or (e.get("amount", 0) or 0) > 0
+        ]),
+    }
+
+
+def _require_editable_legacy(raw: dict) -> None:
+    """Paid legacy invoices are final records and can no longer be changed."""
+    if (raw.get("payment_status") or "PENDING") == "PAID":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Legacy invoice is marked as PAID and can no longer be modified",
+        )
+
+
 @router.post("/legacy", status_code=status.HTTP_201_CREATED)
 async def create_legacy_invoice(
     payload: LegacyInvoiceCreate,
@@ -314,13 +340,7 @@ async def create_legacy_invoice(
         raise HTTPException(status_code=400, detail="Shop / Hotel name is required")
 
     entries = [e.model_dump() for e in payload.entries]
-    for entry in entries:
-        if (entry.get("amount", 0) or 0) < 0:
-            raise HTTPException(status_code=400, detail="Amount cannot be negative")
-
-    grand_total = _calc_legacy_grand_total(entries)
-    if grand_total <= 0:
-        raise HTTPException(status_code=400, detail="Invoice total must be greater than zero")
+    stats = _legacy_entry_stats(entries)
 
     invoice_number = await _generate_legacy_invoice_number(now)
     doc = {
@@ -329,11 +349,9 @@ async def create_legacy_invoice(
         "shop_name_search": get_search_token(shop_name),
         "description": payload.description or "",
         "entries": entries,
-        "total_entries": len([
-            e for e in entries
-            if e.get("bill_number") or (e.get("amount", 0) or 0) > 0
-        ]),
-        "grand_total": grand_total,
+        "total_entries": stats["total_entries"],
+        "grand_total": stats["grand_total"],
+        "payment_status": "PENDING",
         "created_by": current_user.get("auth_id", "system"),
         "created_at": now,
         "updated_at": now,
@@ -350,7 +368,7 @@ async def create_legacy_invoice(
         "LEGACY_INVOICE_CREATE",
         "legacy_invoice",
         doc["id"],
-        details={"invoice_number": invoice_number, "grand_total": grand_total},
+        details={"invoice_number": invoice_number, "grand_total": stats["grand_total"]},
     )
     return doc
 
@@ -384,12 +402,100 @@ async def get_legacy_invoice(
     return _dec_legacy(doc)
 
 
+@router.put("/legacy/{invoice_id}")
+async def update_legacy_invoice(
+    invoice_id: str,
+    payload: LegacyInvoiceCreate,
+    current_user: dict = Depends(require_capability("bill:write")),
+):
+    """Edit an existing legacy invoice while it is still unpaid.
+
+    The invoice number and creation audit fields are preserved; only the
+    shop, description and bill entries are rewritten. A PAID invoice is a
+    final record and is rejected here.
+    """
+    raw = await _find_legacy_invoice(invoice_id)
+    _require_editable_legacy(raw)
+
+    shop_name = (payload.shop_name or "").strip()
+    if not shop_name:
+        raise HTTPException(status_code=400, detail="Shop / Hotel name is required")
+
+    entries = [e.model_dump() for e in payload.entries]
+    stats = _legacy_entry_stats(entries)
+
+    now = datetime.now(timezone.utc)
+    current = decrypt_dict(raw, LEGACY_SENSITIVE_FIELDS)
+    current.pop("_id", None)
+    current.pop("id", None)
+    merged = {
+        **current,
+        "shop_name": shop_name,
+        "shop_name_search": get_search_token(shop_name),
+        "description": payload.description or "",
+        "entries": entries,
+        "total_entries": stats["total_entries"],
+        "grand_total": stats["grand_total"],
+        "updated_by": current_user.get("auth_id", "system"),
+        "updated_at": now,
+    }
+    merged.pop("encryption_metadata", None)
+
+    new_version = await bump_version("legacy_invoice", raw["_id"])
+    await legacy_invoices_collection.replace_one({"_id": raw["_id"]}, _enc_legacy(merged))
+    await enqueue_sync("legacy_invoice", raw["_id"], new_version)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "LEGACY_INVOICE_UPDATE",
+        "legacy_invoice",
+        str(raw["_id"]),
+        details={"invoice_number": merged.get("invoice_number"), "grand_total": stats["grand_total"]},
+    )
+
+    merged["id"] = str(raw["_id"])
+    return merged
+
+
+@router.post("/legacy/{invoice_id}/mark-paid")
+async def mark_legacy_invoice_paid(
+    invoice_id: str,
+    current_user: dict = Depends(require_capability("bill:write")),
+):
+    """Mark a legacy invoice as PAID, freezing it against further edits."""
+    raw = await _find_legacy_invoice(invoice_id)
+    if (raw.get("payment_status") or "PENDING") == "PAID":
+        return _dec_legacy(raw)
+
+    now = datetime.now(timezone.utc)
+    new_version = await bump_version("legacy_invoice", raw["_id"])
+    await legacy_invoices_collection.update_one(
+        {"_id": raw["_id"]},
+        {"$set": {"payment_status": "PAID", "paid_at": now, "updated_at": now}},
+    )
+    await enqueue_sync("legacy_invoice", raw["_id"], new_version)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "LEGACY_INVOICE_MARK_PAID",
+        "legacy_invoice",
+        str(raw["_id"]),
+        details={"invoice_number": raw.get("invoice_number")},
+    )
+
+    merged = dict(raw)
+    merged["payment_status"] = "PAID"
+    merged["paid_at"] = now
+    return _dec_legacy(merged)
+
+
 @router.delete("/legacy/{invoice_id}")
 async def delete_legacy_invoice(
     invoice_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
     raw = await _find_legacy_invoice(invoice_id)
+    _require_editable_legacy(raw)
     # Bump before deleting: bump_version needs the document to still exist.
     new_version = await bump_version("legacy_invoice", raw["_id"])
     await legacy_invoices_collection.delete_one({"_id": raw["_id"]})
