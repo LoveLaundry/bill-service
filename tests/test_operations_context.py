@@ -14,7 +14,9 @@ from bill_service.services import operations_context as ctx
 async def test_unreadable_operational_record_aborts_balance_load(
     mocked_db, monkeypatch, collection_name, loader
 ):
-    await mocked_db[collection_name].insert_one({"client_name": "encrypted"})
+    await mocked_db[collection_name].insert_one(
+        {"status": "RECEIVED", "client_name": "encrypted"}
+    )
 
     def unreadable(*_args, **_kwargs):
         raise ValueError("invalid encrypted record")

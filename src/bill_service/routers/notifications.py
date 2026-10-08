@@ -42,7 +42,10 @@ async def gatepass_pending(
     ``received`` / ``delivered`` / ``pending`` are server-computed, so the badge
     count, the notification dialog and the delivery form can never drift apart.
     """
-    query: dict = {"status": {"$ne": "CANCELLED"}}
+    # Drafts are excluded too: an unconfirmed monthly entry has nothing pending
+    # to deliver and must not appear in the bell feed. (CANCELLED has always
+    # been excluded.)
+    query: dict = {"status": {"$nin": [be.DRAFT_STATUS, be.CANCELLED_STATUS]}}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 

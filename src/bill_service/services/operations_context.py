@@ -55,8 +55,16 @@ def serialize(doc: dict, sensitive_fields: Optional[List[str]] = None) -> dict:
 
 
 async def load_gate_passes(gate_pass_ids: Optional[Iterable[str]] = None) -> List[dict]:
-    """Load + decrypt gate passes, optionally restricted to specific ids."""
+    """Load + decrypt gate passes, optionally restricted to specific ids.
+
+    With no ids (the "everything active" feeds such as pending-gatepasses and
+    availability) DRAFT and CANCELLED passes are excluded at the query level so
+    unconfirmed monthly entries never surface and never block the feed. When ids
+    are given (a specific pass being inspected) drafts remain loadable.
+    """
     query: dict = {}
+    if gate_pass_ids is None:
+        query["status"] = {"$nin": [be.DRAFT_STATUS, be.CANCELLED_STATUS]}
     ids = [to_object_id(g) for g in (gate_pass_ids or [])]
     ids = [g for g in ids if g is not None]
     if gate_pass_ids is not None:
