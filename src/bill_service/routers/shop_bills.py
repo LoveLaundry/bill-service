@@ -378,8 +378,21 @@ async def list_legacy_invoices(
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=200),
     search: Optional[str] = Query(None),
+    sort_by: Optional[str] = Query("created_at"),
+    sort_dir: str = Query("desc"),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
+    if sort_by not in ("created_at", "invoice_number"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Sort only by created_at or invoice_number.",
+        )
+    if sort_dir not in ("asc", "desc"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Sort direction must be asc or desc.",
+        )
+
     query: dict = {}
     if search:
         query["shop_name_search"] = {"$regex": get_search_token(search), "$options": "i"}
@@ -387,7 +400,10 @@ async def list_legacy_invoices(
     total = await legacy_invoices_collection.count_documents(query)
     items = []
     async for doc in (
-        legacy_invoices_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
+        legacy_invoices_collection.find(query)
+        .sort(sort_by, 1 if sort_dir == "asc" else -1)
+        .skip(skip)
+        .limit(limit)
     ):
         items.append(_dec_legacy(doc))
     return {"items": items, "total": total}

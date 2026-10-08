@@ -13,6 +13,7 @@ from bill_service.routers.shop_bills import (
     create_legacy_invoice,
     delete_legacy_invoice,
     get_legacy_invoice,
+    list_legacy_invoices,
     mark_legacy_invoice_paid,
     update_legacy_invoice,
 )
@@ -111,3 +112,25 @@ async def test_update_keeps_audit_fields(mocked_db):
     persisted = await get_legacy_invoice(inv["id"], current_user=user())
     assert persisted["created_at"] == updated["created_at"]
     assert persisted["grand_total"] == updated["grand_total"]
+
+
+async def test_list_sorts_by_invoice_number_and_date(mocked_db):
+    first = await make_invoice(mocked_db)
+    second = await make_invoice(mocked_db)
+
+    result = await list_legacy_invoices(skip=0, limit=20, search=None, sort_by="invoice_number", sort_dir="asc", current_user=user())
+    numbers = [item["invoice_number"] for item in result["items"]]
+    assert numbers == sorted(numbers)
+    assert {first["invoice_number"], second["invoice_number"]}.issubset(numbers)
+
+    result_desc = await list_legacy_invoices(skip=0, limit=20, search=None, sort_by="created_at", sort_dir="desc", current_user=user())
+    dates = [item["created_at"] for item in result_desc["items"]]
+    assert dates == sorted(dates, reverse=True)
+
+    with pytest.raises(HTTPException) as exc:
+        await list_legacy_invoices(skip=0, limit=20, search=None, sort_by="shop_name", current_user=user())
+    assert exc.value.status_code == 422
+
+    with pytest.raises(HTTPException) as exc:
+        await list_legacy_invoices(skip=0, limit=20, search=None, sort_by="created_at", sort_dir="sideways", current_user=user())
+    assert exc.value.status_code == 422
