@@ -138,3 +138,73 @@ async def test_report_endpoint_uses_monthly_quotation_unless_explicitly_cleared(
     assert defaulted["hotel_summary"][0]["suggested_quotation_id"] == "quote-1"
     assert explicitly_unpriced["total_income"] == 0.0
     assert explicitly_unpriced["unpriced_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_report_defaults_to_latest_hotel_quotation(mocked_db, monkeypatch):
+    for month, quote_id, quantity in ((9, "old-quote", 1), (10, "new-quote", 2)):
+        await mocked_db["monthly_entries_collection"].insert_one({
+            "client_name": "Sunrise Hotel",
+            "kind": "receiving",
+            "year": 2026,
+            "month": month,
+            "quotation_id": quote_id,
+            "days": {
+                "1": {
+                    "date": f"2026-{month:02d}-01",
+                    "status": "CONFIRMED",
+                    "quantities": {"Shirt": quantity},
+                },
+            },
+        })
+    quote_prices = AsyncMock(return_value={("shirt", ""): 30.0})
+    monkeypatch.setattr(operational_reports, "_quotation_prices", quote_prices)
+
+    report = await operational_reports.monthly_operations_report(
+        MonthlyOperationsReportRequest(
+            start_date=date(2026, 9, 1),
+            end_date=date(2026, 10, 31),
+        ),
+        {"role": "MANAGER"},
+    )
+
+    assert quote_prices.await_args_list[0].args == ("new-quote",)
+    assert report["selected_quotations"]["Sunrise Hotel"] == "new-quote"
+    assert report["total_income"] == 90.0
+
+
+@pytest.mark.asyncio
+async def test_postgresql_style_quote_id_uses_selected_quotation_snapshot(mocked_db, monkeypatch):
+    await mocked_db["monthly_entries_collection"].insert_one({
+        "client_name": "Sunrise Hotel",
+        "kind": "receiving",
+        "year": 2026,
+        "month": 10,
+        "days": {
+            "1": {
+                "date": "2026-10-01",
+                "status": "CONFIRMED",
+                "quantities": {"Shirt": 4},
+            },
+        },
+    })
+    monkeypatch.setattr(operational_reports, "_quotation_prices", AsyncMock(return_value={}))
+
+    report = await operational_reports.monthly_operations_report(
+        MonthlyOperationsReportRequest(
+            start_date=date(2026, 10, 1),
+            end_date=date(2026, 10, 31),
+            selected_quotations={"Sunrise Hotel": "481"},
+            quotation_snapshots={
+                "481": {
+                    "id": 481,
+                    "client_name": "Sunrise Hotel",
+                    "line_items": [{"item_name": "Shirt", "unit_price": 25.0}],
+                },
+            },
+        ),
+        {"role": "MANAGER"},
+    )
+
+    assert report["total_income"] == 100.0
+    assert report["quotation_price_sources"]["481"] == "quotation_api_snapshot"

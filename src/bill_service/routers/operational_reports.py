@@ -22,6 +22,7 @@ class MonthlyOperationsReportRequest(BaseModel):
     start_date: date
     end_date: date
     selected_quotations: Dict[str, Optional[str]] = Field(default_factory=dict)
+    quotation_snapshots: Dict[str, dict] = Field(default_factory=dict)
 
 
 def _number(value) -> float:
@@ -35,31 +36,9 @@ def _normalized(value: str) -> str:
     return " ".join((value or "").casefold().split())
 
 
-async def _quotation_prices(quotation_id: Optional[str]) -> dict:
-    if not quotation_id:
-        return {}
-    if not ObjectId.is_valid(quotation_id):
-        raise HTTPException(status_code=400, detail=f"Invalid quotation id: {quotation_id}")
-
-    client = get_client("MAIN")
-    quotation = None
-    for db_name in ("quotations_db", "quotations", "laundry_db"):
-        try:
-            quotation = await client[db_name]["quotations"].find_one({"_id": ObjectId(quotation_id)})
-        except Exception:
-            continue
-        if quotation:
-            break
-    if not quotation:
-        return {}
-
-    try:
-        decoded = decrypt_dict(quotation, QUOTATION_SENSITIVE_FIELDS)
-    except Exception:
-        decoded = quotation
-
+def _quotation_price_map(line_items: list) -> dict:
     prices = {}
-    for line in decoded.get("line_items", []) or []:
+    for line in line_items or []:
         if not isinstance(line, dict):
             continue
         item_name = _normalized(line.get("item_name", ""))
@@ -78,6 +57,32 @@ async def _quotation_prices(quotation_id: Optional[str]) -> dict:
         else:
             prices[(item_name, "")] = base_price
     return prices
+
+
+async def _quotation_prices(quotation_id: Optional[str]) -> dict:
+    if not quotation_id:
+        return {}
+    if not ObjectId.is_valid(quotation_id):
+        return {}
+
+    client = get_client("MAIN")
+    quotation = None
+    for db_name in ("quotations_db", "quotations", "laundry_db"):
+        try:
+            quotation = await client[db_name]["quotations"].find_one({"_id": ObjectId(quotation_id)})
+        except Exception:
+            continue
+        if quotation:
+            break
+    if not quotation:
+        return {}
+
+    try:
+        decoded = decrypt_dict(quotation, QUOTATION_SENSITIVE_FIELDS)
+    except Exception:
+        decoded = quotation
+
+    return _quotation_price_map(decoded.get("line_items", []))
 
 
 def _monthly_day_rows(documents: list, start_date: date, end_date: date, price_map: dict) -> dict:
@@ -223,6 +228,7 @@ async def monthly_operations_report(
         _normalized(name): quotation_id
         for name, quotation_id in payload.selected_quotations.items()
     }
+    explicitly_selected_hotels = set(selected_ids)
     documents = []
     cursor = monthly_entries_collection.find({
         "kind": "receiving",
@@ -250,17 +256,36 @@ async def monthly_operations_report(
         except Exception:
             decoded = raw_doc
         hotel_key = _normalized(decoded.get("client_name", ""))
-        if hotel_key and hotel_key not in selected_ids:
+        if hotel_key and hotel_key not in explicitly_selected_hotels:
             selected_ids[hotel_key] = raw_doc["quotation_id"]
 
     prices = {}
+    snapshot_quote_ids = set()
     for quotation_id in set(selected_ids.values()):
         if quotation_id:
             prices[quotation_id] = await _quotation_prices(quotation_id)
+            snapshot = payload.quotation_snapshots.get(str(quotation_id))
+            selected_hotel_names = {
+                hotel_name
+                for hotel_name, selected_id in selected_ids.items()
+                if str(selected_id) == str(quotation_id)
+            }
+            snapshot_matches_hotel = (
+                snapshot
+                and _normalized(snapshot.get("client_name", "")) in selected_hotel_names
+            )
+            if not prices[quotation_id] and snapshot_matches_hotel and str(snapshot.get("id")) == str(quotation_id):
+                prices[quotation_id] = _quotation_price_map(snapshot.get("line_items", []))
+                if prices[quotation_id]:
+                    snapshot_quote_ids.add(quotation_id)
     prices["selected_ids"] = selected_ids
 
     report = _monthly_day_rows(documents, payload.start_date, payload.end_date, prices)
     for hotel in report["hotel_summary"]:
         hotel["suggested_quotation_id"] = report["suggested_quotations"].get(_normalized(hotel["client_name"]))
     report["hotels"] = report["hotel_summary"]
+    report["quotation_price_sources"] = {
+        str(quotation_id): "quotation_api_snapshot" if quotation_id in snapshot_quote_ids else "main_database"
+        for quotation_id in set(selected_ids.values()) if quotation_id
+    }
     return report
