@@ -1,123 +1,37 @@
 from datetime import date
 from unittest.mock import AsyncMock
+from datetime import datetime, timezone
 
 import pytest
 
 from bill_service.routers import operational_reports
 from bill_service.routers.operational_reports import (
     MonthlyOperationsReportRequest,
-    _monthly_day_rows,
+    LinenCategoryMappingPayload,
+    _build_gatepass_report,
+    _load_category_lookup,
 )
-
-
-def test_monthly_income_uses_only_confirmed_receiving_lines_and_selected_quote():
-    documents = [
-        {
-            "kind": "receiving",
-            "client_name": "Sunrise Hotel",
-            "year": 2026,
-            "month": 10,
-            "days": {
-                "10": {
-                    "date": "2026-10-10",
-                    "status": "CONFIRMED",
-                    "quantities": {"Shirt||White": 2, "Towel": 3},
-                    "piece_quantities": {"Shirt||White": 2, "Curtain": 1},
-                },
-                "11": {
-                    "date": "2026-10-11",
-                    "status": "DRAFT",
-                    "quantities": {"Shirt||White": 100},
-                },
-            },
-        },
-        {
-            "kind": "delivery",
-            "client_name": "Sunrise Hotel",
-            "year": 2026,
-            "month": 10,
-            "days": {
-                "10": {
-                    "date": "2026-10-10",
-                    "status": "CONFIRMED",
-                    "quantities": {"Shirt||White": 900},
-                },
-            },
-        },
-    ]
-    price_map = {
-        "selected_ids": {"sunrise hotel": "quote-1"},
-        "quote-1": {
-            ("shirt", "white"): 25,
-            ("towel", ""): 40,
-            ("curtain", ""): 100,
-        },
-    }
-
-    report = _monthly_day_rows(documents, date(2026, 10, 1), date(2026, 10, 31), price_map)
-
-    assert report["source_of_truth"] == "monthly_operations_confirmed_receiving"
-    assert report["total_income"] == 170.0
-    assert report["total_quantity"] == 5.0
-    assert report["hotel_summary"] == [{
-        "client_name": "Sunrise Hotel",
-        "quotation_id": "quote-1",
-        "income": 170.0,
-        "quantity": 5.0,
-        "confirmed_days": 1,
-    }]
-    pieces_by_item = {item["item_name"]: item["piece_count"] for item in report["daily_details"][0]["items"]}
-    assert pieces_by_item["Shirt"] == 2
-    curtain = next(item for item in report["daily_details"][0]["items"] if item["item_name"] == "Curtain")
-    assert curtain["unit"] == "kg"
-    assert curtain["quantity"] == 0.0
-    assert curtain["piece_count"] == 1
-    assert report["unpriced_count"] == 0
-
-
-def test_unselected_quotation_marks_receiving_items_unpriced():
-    report = _monthly_day_rows(
-        [{
-            "kind": "receiving",
-            "client_name": "Sunrise Hotel",
-            "year": 2026,
-            "month": 10,
-            "days": {
-                "10": {
-                    "date": "2026-10-10",
-                    "status": "CONFIRMED",
-                    "quantities": {"Shirt": 4},
-                },
-            },
-        }],
-        date(2026, 10, 10),
-        date(2026, 10, 10),
-        {"selected_ids": {}},
-    )
-
-    assert report["total_income"] == 0.0
-    assert report["unpriced_count"] == 1
-    assert report["unpriced_items"][0]["item_name"] == "Shirt"
+from bill_service.services import gate_pass_records
+from bill_service.models import GatePassCreate, GatePassItem
 
 
 @pytest.mark.asyncio
-async def test_report_endpoint_uses_monthly_quotation_unless_explicitly_cleared(
-    mocked_db, monkeypatch
-):
-    await mocked_db["monthly_entries_collection"].insert_one({
-        "client_name": "Sunrise Hotel",
-        "kind": "receiving",
-        "year": 2026,
-        "month": 10,
-        "quotation_id": "quote-1",
-        "days": {
-            "10": {
-                "date": "2026-10-10",
-                "status": "CONFIRMED",
-                "quantities": {"Shirt": 4},
-            },
+async def test_report_uses_active_gate_passes_and_separates_draft_cancelled(mocked_db, monkeypatch):
+    received_at = datetime(2026, 10, 10, 8, tzinfo=timezone.utc)
+    await mocked_db["gatepasses_collection"].insert_many([
+        {
+            "client_name": "Sunrise Hotel", "status": "RECEIVED", "receiving_date": received_at,
+            "quotation_id": "quote-1", "items": [{"item_name": "Shirt", "received_qty": 4}],
         },
-    })
+        {
+            "client_name": "Sunrise Hotel", "status": "DRAFT", "receiving_date": received_at,
+            "quotation_id": "quote-1", "items": [{"item_name": "Shirt", "received_qty": 400}],
+        },
+        {
+            "client_name": "Sunrise Hotel", "status": "CANCELLED", "receiving_date": received_at,
+            "quotation_id": "quote-1", "items": [{"item_name": "Shirt", "received_qty": 900}],
+        },
+    ])
     monkeypatch.setattr(
         operational_reports,
         "_quotation_prices",
@@ -136,6 +50,9 @@ async def test_report_endpoint_uses_monthly_quotation_unless_explicitly_cleared(
 
     assert defaulted["total_income"] == 100.0
     assert defaulted["hotel_summary"][0]["suggested_quotation_id"] == "quote-1"
+    assert defaulted["source_of_truth"] == "active_gate_pass_received_items"
+    assert len(defaulted["draft_receiving"]) == 1
+    assert defaulted["cancelled_gate_pass_count"] == 1
     assert explicitly_unpriced["total_income"] == 0.0
     assert explicitly_unpriced["unpriced_count"] == 1
 
@@ -143,19 +60,12 @@ async def test_report_endpoint_uses_monthly_quotation_unless_explicitly_cleared(
 @pytest.mark.asyncio
 async def test_report_defaults_to_latest_hotel_quotation(mocked_db, monkeypatch):
     for month, quote_id, quantity in ((9, "old-quote", 1), (10, "new-quote", 2)):
-        await mocked_db["monthly_entries_collection"].insert_one({
+        await mocked_db["gatepasses_collection"].insert_one({
             "client_name": "Sunrise Hotel",
-            "kind": "receiving",
-            "year": 2026,
-            "month": month,
+            "status": "RECEIVED",
+            "receiving_date": datetime(2026, month, 1, 8, tzinfo=timezone.utc),
             "quotation_id": quote_id,
-            "days": {
-                "1": {
-                    "date": f"2026-{month:02d}-01",
-                    "status": "CONFIRMED",
-                    "quantities": {"Shirt": quantity},
-                },
-            },
+            "items": [{"item_name": "Shirt", "received_qty": quantity}],
         })
     quote_prices = AsyncMock(return_value={("shirt", ""): 30.0})
     monkeypatch.setattr(operational_reports, "_quotation_prices", quote_prices)
@@ -168,25 +78,19 @@ async def test_report_defaults_to_latest_hotel_quotation(mocked_db, monkeypatch)
         {"role": "MANAGER"},
     )
 
-    assert quote_prices.await_args_list[0].args == ("new-quote",)
+    assert ("new-quote",) in [call.args for call in quote_prices.await_args_list]
     assert report["selected_quotations"]["Sunrise Hotel"] == "new-quote"
     assert report["total_income"] == 90.0
 
 
 @pytest.mark.asyncio
 async def test_postgresql_style_quote_id_uses_selected_quotation_snapshot(mocked_db, monkeypatch):
-    await mocked_db["monthly_entries_collection"].insert_one({
+    await mocked_db["gatepasses_collection"].insert_one({
         "client_name": "Sunrise Hotel",
-        "kind": "receiving",
-        "year": 2026,
-        "month": 10,
-        "days": {
-            "1": {
-                "date": "2026-10-01",
-                "status": "CONFIRMED",
-                "quantities": {"Shirt": 4},
-            },
-        },
+        "status": "RECEIVED",
+        "receiving_date": datetime(2026, 10, 1, 8, tzinfo=timezone.utc),
+        "quotation_id": "481",
+        "items": [{"item_name": "Shirt", "received_qty": 4}],
     })
     monkeypatch.setattr(operational_reports, "_quotation_prices", AsyncMock(return_value={}))
 
@@ -207,4 +111,115 @@ async def test_postgresql_style_quote_id_uses_selected_quotation_snapshot(mocked
     )
 
     assert report["total_income"] == 100.0
-    assert report["quotation_price_sources"]["481"] == "quotation_api_snapshot"
+    assert report["daily_details"][0]["items"][0]["rate_source"] == "selected_current_quotation"
+
+
+def test_linen_variants_consolidate_without_losing_different_rates():
+    gate_passes = [{
+        "_id": "gp-1",
+        "client_name": "Sunrise Hotel",
+        "status": "RECEIVED",
+        "receiving_date": datetime(2026, 10, 1, 8, tzinfo=timezone.utc),
+        "quotation_id": "quote-1",
+        "quotation_price_snapshot": {"prices": {
+            "bedsheet - single||": 100,
+            "bedsheet - double||": 120,
+            "bedsheet - large||": 150,
+            "duvet cover - king||": 110,
+        }},
+        "items": [
+            {"item_name": "Bedsheet - Single", "received_qty": 20},
+            {"item_name": "Bedsheet - Double", "received_qty": 35},
+            {"item_name": "Bedsheet - Large", "received_qty": 15},
+            {"item_name": "Duvet Cover - King", "received_qty": 45},
+        ],
+    }]
+
+    report = _build_gatepass_report(
+        gate_passes, [], 0, date(2026, 10, 1), date(2026, 10, 2),
+        {}, {}, operational_reports.DEFAULT_CATEGORY_LOOKUP,
+    )
+
+    bedsheets = next(row for row in report["period_summary"] if row["category"] == "Bedsheets")
+    assert bedsheets["quantity"] == 70.0
+    assert bedsheets["value"] == 8450.0
+    assert bedsheets["rate_label"] == "Multiple Rates"
+    assert len(bedsheets["variants"]) == 3
+    assert report["daily_summary"][1]["value"] == 0.0
+    assert report["daily_summary"][0]["transaction_count"] == 1
+    assert report["total_income"] == 13400.0
+
+
+def test_unknown_items_remain_unclassified_and_rewash_is_excluded():
+    report = _build_gatepass_report(
+        [{
+            "_id": "gp-1",
+            "client_name": "Sunrise Hotel",
+            "status": "RECEIVED",
+            "receiving_date": datetime(2026, 10, 1, 8, tzinfo=timezone.utc),
+            "items": [
+                {"item_name": "Custom Laundry Bag", "received_qty": 3},
+                {"item_name": "Bedsheet - Single", "received_qty": 5, "rewashed": True},
+            ],
+        }],
+        [], 0, date(2026, 10, 1), date(2026, 10, 1), {}, {},
+        operational_reports.DEFAULT_CATEGORY_LOOKUP,
+    )
+
+    assert report["unmapped_items"][0]["item_name"] == "Custom Laundry Bag"
+    assert report["unmapped_items"][0]["category"] == "Other / Unclassified Items"
+    assert report["total_quantity"] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_admin_mapping_classifies_unknown_item_and_is_audited(mocked_db, monkeypatch):
+    monkeypatch.setattr(operational_reports, "audit_collection", mocked_db["audit_collection"])
+    await operational_reports.upsert_linen_category_mapping(
+        LinenCategoryMappingPayload(item_name="Custom Bath Set", category="Bath Towels"),
+        {"auth_id": "admin-1", "role": "ADMIN"},
+    )
+
+    lookup = await _load_category_lookup()
+    audit_rows = await mocked_db["audit_collection"].find({}).to_list(length=None)
+    report = _build_gatepass_report(
+        [{
+            "_id": "gp-custom",
+            "client_name": "Sunrise Hotel",
+            "status": "RECEIVED",
+            "receiving_date": datetime(2026, 10, 1, 8, tzinfo=timezone.utc),
+            "quotation_price_snapshot": {"prices": {"custom bath set||": 50}},
+            "items": [{"item_name": "Custom Bath Set", "received_qty": 2}],
+        }],
+        [], 0, date(2026, 10, 1), date(2026, 10, 1), {}, {}, lookup,
+    )
+
+    assert lookup["custom bath set"] == "Bath Towels"
+    assert report["unmapped_items"] == []
+    assert next(row for row in report["period_summary"] if row["category"] == "Bath Towels")["quantity"] == 2
+    assert audit_rows[0]["action"] == "LINEN_CATEGORY_MAPPING_UPSERT"
+
+
+@pytest.mark.asyncio
+async def test_gate_pass_creation_persists_quotation_price_snapshot(mocked_db, monkeypatch):
+    snapshot = {"bedsheet - single||": 100.0}
+    monkeypatch.setattr(gate_pass_records, "_quotation_price_snapshot", AsyncMock(return_value=snapshot))
+
+    await gate_pass_records.create_gate_pass_record(
+        GatePassCreate(
+            gate_pass_number="GP-20261001-9001",
+            client_name="Sunrise Hotel",
+            receiving_date=datetime(2026, 10, 1, 8, tzinfo=timezone.utc),
+            received_by="Tester",
+            quotation_id="65f0aa0000000000000000aa",
+            items=[GatePassItem(
+                item_name="Bedsheet - Single",
+                client_qty=2,
+                received_qty=2,
+            )],
+        ),
+        {"auth_id": "admin-1", "user_name": "Admin"},
+    )
+    stored = await mocked_db["gatepasses_collection"].find_one({"gate_pass_number": "GP-20261001-9001"})
+
+    assert stored["quotation_price_snapshot"]["prices"] == snapshot
+    assert stored["quotation_price_snapshot"]["quotation_id"] == "65f0aa0000000000000000aa"

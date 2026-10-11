@@ -46,6 +46,7 @@ COLLECTION_NAMES = [
     "linen_events_collection",
     "linens_collection",
     "loyalty_collection",
+    "linen_category_mappings_collection",
     "monthly_entries_collection",
     "payments_collection",
     "returns_collection",

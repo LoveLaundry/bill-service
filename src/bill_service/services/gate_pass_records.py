@@ -31,6 +31,53 @@ SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 ALLOWED_STATUSES = ("RECEIVED", "DRAFT")
 
 
+async def _quotation_price_snapshot(quotation_id: Optional[str]) -> dict:
+    if not quotation_id:
+        return {}
+    try:
+        quotation_oid = ObjectId(quotation_id)
+    except Exception:
+        return {}
+
+    from ..database.connection_manager import get_client
+
+    client = get_client("MAIN")
+    quotation = None
+    for database_name in ("quotations_db", "quotations", "laundry_db"):
+        try:
+            quotation = await client[database_name]["quotations"].find_one({"_id": quotation_oid})
+        except Exception:
+            continue
+        if quotation:
+            break
+    if not quotation:
+        return {}
+
+    try:
+        quotation = decrypt_dict(quotation, ["client_name", "quotation_title", "line_items"])
+    except Exception:
+        return {}
+
+    prices = {}
+    for line in quotation.get("line_items", []) or []:
+        if not isinstance(line, dict):
+            continue
+        item_name = " ".join((line.get("item_name") or "").casefold().split())
+        if not item_name:
+            continue
+        base_price = line.get("unit_price") or line.get("price") or 0
+        specifications = line.get("specifications") or []
+        if specifications:
+            for variant in specifications:
+                if not isinstance(variant, dict):
+                    continue
+                specification = " ".join((variant.get("specification") or "").casefold().split())
+                prices[f"{item_name}||{specification}"] = float(variant.get("unit_price") or base_price or 0)
+        else:
+            prices[f"{item_name}||"] = float(base_price or 0)
+    return prices
+
+
 def _serialize(doc: dict) -> dict:
     decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
     decrypted["id"] = str(decrypted["_id"])
@@ -100,6 +147,7 @@ async def create_gate_pass_record(
         )
 
     now = datetime.now(timezone.utc)
+    price_snapshot = await _quotation_price_snapshot(payload.quotation_id)
     doc = {
         "gate_pass_number": payload.gate_pass_number,
         "manual_gate_pass_number": payload.manual_gate_pass_number,
@@ -114,6 +162,11 @@ async def create_gate_pass_record(
         "status": status,
         "notes": payload.notes,
         "quotation_id": payload.quotation_id,
+        "quotation_price_snapshot": {
+            "quotation_id": payload.quotation_id,
+            "captured_at": now,
+            "prices": price_snapshot,
+        } if price_snapshot else None,
         "origin": origin,
         "created_at": now,
         "updated_at": now,
