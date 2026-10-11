@@ -13,6 +13,7 @@ from bill_service.routers.operational_reports import (
 )
 from bill_service.services import gate_pass_records
 from bill_service.models import GatePassCreate, GatePassItem
+from bill_service.crypto_helper import encrypt_dict
 
 
 @pytest.mark.asyncio
@@ -197,6 +198,36 @@ async def test_admin_mapping_classifies_unknown_item_and_is_audited(mocked_db, m
     assert report["unmapped_items"] == []
     assert next(row for row in report["period_summary"] if row["category"] == "Bath Towels")["quantity"] == 2
     assert audit_rows[0]["action"] == "LINEN_CATEGORY_MAPPING_UPSERT"
+
+
+@pytest.mark.asyncio
+async def test_report_decrypts_encrypted_gate_passes(mocked_db, monkeypatch):
+    gp = {
+        "client_name": "Avenra Garden Hotel",
+        "status": "RECEIVED",
+        "receiving_date": datetime(2026, 10, 3, 8, tzinfo=timezone.utc),
+        "quotation_id": "quote-1",
+        "items": [{"item_name": "Shirt", "received_qty": 4}],
+    }
+    await mocked_db["gatepasses_collection"].insert_one(
+        encrypt_dict(gp, ["client_name", "items", "notes"])
+    )
+    monkeypatch.setattr(
+        operational_reports,
+        "_quotation_prices",
+        AsyncMock(return_value={("shirt", ""): 25.0}),
+    )
+
+    report = await operational_reports.monthly_operations_report(
+        MonthlyOperationsReportRequest(
+            start_date=date(2026, 10, 1),
+            end_date=date(2026, 10, 31),
+        ),
+        {"role": "MANAGER"},
+    )
+
+    assert report["total_income"] == 100.0
+    assert report["hotel_summary"][0]["client_name"] == "Avenra Garden Hotel"
 
 
 @pytest.mark.asyncio

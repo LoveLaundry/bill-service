@@ -250,6 +250,11 @@ def _build_gatepass_report(
     selected_quotations = {}
 
     for gp in gate_passes:
+        if "encryption_metadata" in gp:
+            try:
+                gp = decrypt_dict(gp, ["client_name", "items", "notes"])
+            except Exception:
+                pass
         client_name = (gp.get("client_name") or "Unknown").strip() or "Unknown"
         hotel_key = _normalized(client_name)
         gp_id = str(gp.get("_id") or gp.get("id") or "")
