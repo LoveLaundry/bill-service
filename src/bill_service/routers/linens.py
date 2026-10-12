@@ -12,6 +12,7 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
+from ..crypto_helper import get_search_token
 from ..database.main_db import (
     linens_collection,
     linen_events_collection,

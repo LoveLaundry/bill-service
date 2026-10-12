@@ -2295,11 +2295,11 @@ async def bill_diff(body: dict = Body(...), current_user: dict = Depends(require
     return {"bill_1": d1.get("bill_number"), "bill_2": d2.get("bill_number"), "diff": diff}
 
 @router.get("/health")
-async def health_check():
+async def health_check(current_user: dict = Depends(require_capability("bill:read"))):
     return {"status": "ok", "bills_count": await shop_bills_collection.count_documents({}), "templates_count": await bill_templates_collection.count_documents({})}
 
 @router.get("/schema")
-async def schema_info():
+async def schema_info(current_user: dict = Depends(require_capability("bill:read"))):
     return {"bill_statuses": SHOP_BILL_STATUSES, "payment_statuses": SHOP_PAYMENT_STATUSES, "recurring_intervals": RECURRING_INTERVALS, "discount_types": ["FIXED", "PERCENT"]}
 
 @router.post("/export/csv-by-ids")
@@ -2363,7 +2363,7 @@ async def export_summary(current_user: dict = Depends(require_capability("bill:r
     return {"total_bills": r["total_bills"], "total_revenue": round(r["total_revenue"], 2), "total_paid": round(r["total_paid"], 2), "total_outstanding": round(r["total_outstanding"], 2), "exported_at": datetime.now(timezone.utc).isoformat()}
 
 @router.get("/info")
-async def api_info():
+async def api_info(current_user: dict = Depends(require_capability("bill:read"))):
     return {"module": "Shop Bills", "version": "2.0.0", "total_features": 100}
 
 @router.get("/recurring/due-v2")
