@@ -71,6 +71,7 @@ DEPENDENT_MODULES = [
     "bill_service.services.balance_engine",
     "bill_service.services.operations_context",
     "bill_service.services.gate_pass_records",
+    "bill_service.services.monthly_sync",
     "bill_service.services.local_sync_service",
     "bill_service.routers.bills",
     "bill_service.routers.gatepasses",

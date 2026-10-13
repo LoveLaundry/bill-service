@@ -74,6 +74,48 @@ async def _existing_document_reference(
     return False
 
 
+async def _find_conflicting_reservation(
+    normalized: str,
+    field: str,
+    scope: str,
+    owner: str,
+    *,
+    client_name: str | None,
+):
+    """Return an existing reservation that conflicts with a new claim.
+
+    A reservation sharing the same normalized value conflicts unless:
+
+    * it is owned by the same ``owner`` (an update of our own claim), or
+    * both the new claim and the reservation are hotel-scoped bill numbers
+      for *different* hotels (same value, different ``scope_key``).
+
+    Note that an *unscoped* bill-number reservation (no ``client_name``) is
+    global and therefore still collides with any hotel-scoped claim.
+    """
+    async for reservation in manual_references_collection.find(
+        {"normalized": normalized}
+    ):
+        if reservation.get("owner") == owner:
+            continue
+        if reservation.get("scope_key") == scope:
+            return reservation
+        existing_is_hotel_scoped = (
+            reservation.get("scope_key") != normalized
+            and bool(reservation.get("client_name_search"))
+        )
+        if (
+            field in HOTEL_SCOPED_FIELDS
+            and reservation.get("reference_type") in HOTEL_SCOPED_FIELDS
+            and client_name
+            and existing_is_hotel_scoped
+        ):
+            # Same value is allowed for a different hotel's bill number.
+            continue
+        return reservation
+    return None
+
+
 async def reserve_references(
     owner: str,
     references: dict[str, str | None],
@@ -115,13 +157,19 @@ async def reserve_references(
 
     for normalized, field in values.items():
         scope = _scope_key(normalized, field)
-        reservation = await manual_references_collection.find_one({"scope_key": scope})
-        if reservation and reservation.get("owner") != owner:
+        reservation = await _find_conflicting_reservation(
+            normalized,
+            field,
+            scope,
+            owner,
+            client_name=client_name,
+        )
+        if reservation:
             raise ValueError(
                 f"'{references[field]}' is already used as a "
                 f"{reservation.get('reference_type', 'document reference')}."
             )
-        if not reservation and await _existing_document_reference(
+        if await _existing_document_reference(
             references[field],
             client_name=client_name if field in HOTEL_SCOPED_FIELDS else None,
         ):
