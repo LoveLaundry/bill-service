@@ -729,6 +729,60 @@ async def create_bill(
     return serialized
 
 
+def _gatepass_lookup_stage() -> dict:
+    """Join bills to their gate pass for receiving-date filtering.
+
+    ``gate_pass_id`` is stored as a string while ``_id`` is an ObjectId, so
+    the join must convert. A plain ``$toObjectId`` throws on missing or
+    malformed ids — and manual bills carry ``gate_pass_id=None`` — which used
+    to collapse the whole listing into a 500 as soon as a gate-pass date
+    filter was sent. ``$convert`` maps those to null instead, which matches
+    no gate pass, so manual bills are simply excluded from date-filtered
+    results.
+    """
+    return {
+        "$lookup": {
+            "from": "gatepasses",
+            "let": {"gp_id_str": "$gate_pass_id"},
+            "pipeline": [
+                {
+                    "$match": {
+                        "$expr": {
+                            "$eq": [
+                                "$_id",
+                                {
+                                    "$convert": {
+                                        "input": "$$gp_id_str",
+                                        "to": "objectId",
+                                        "onError": None,
+                                        "onNull": None,
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                },
+            ],
+            "as": "gp",
+        }
+    }
+
+
+def _combine_name_filters(*tokens: Optional[str]) -> dict:
+    """Merge exact-match client-name search tokens without dropping any.
+
+    ``search`` and ``client_name`` both resolve to ``client_name_search``;
+    assigning the key twice used to let ``search`` silently override the
+    client scope. Multiple tokens become an ``$and`` intersection instead.
+    """
+    clauses = [{"client_name_search": token} for token in tokens if token]
+    if len(clauses) == 1:
+        return clauses[0]
+    if len(clauses) > 1:
+        return {"$and": clauses}
+    return {}
+
+
 @router.get("", response_model=BillListResponse)
 async def list_bills(
     search: Optional[str] = Query(None),
@@ -758,22 +812,17 @@ async def list_bills(
         if payment_status:
             base_match["payment_status"] = payment_status
         if search:
-            base_match["client_name_search"] = get_search_token(search)
+            base_match.update(
+                _combine_name_filters(
+                    base_match.pop("client_name_search", None),
+                    get_search_token(search),
+                )
+            )
         if base_match:
             pipeline.append({"$match": base_match})
 
         # Join with gatepasses to access receiving_date
-        # gate_pass_id is stored as a string, _id is ObjectId — must convert
-        pipeline.append({
-            "$lookup": {
-                "from": "gatepasses",
-                "let": {"gp_id_str": "$gate_pass_id"},
-                "pipeline": [
-                    {"$match": {"$expr": {"$eq": ["$_id", {"$toObjectId": "$$gp_id_str"}]}}},
-                ],
-                "as": "gp",
-            }
-        })
+        pipeline.append(_gatepass_lookup_stage())
 
         # Filter by gate pass receiving_date (handles null gate_pass_id too)
         gp_date_match: dict = {}
@@ -828,9 +877,6 @@ async def list_bills(
     # Original simple query (no gate pass date filter)
     query: dict = {}
 
-    if client_name:
-        query["client_name_search"] = get_search_token(client_name)
-
     if quotation_id:
         query["quotation_id"] = quotation_id
 
@@ -845,8 +891,15 @@ async def list_bills(
             date_filter["$lte"] = day_query_end(date_to)
         query["created_at"] = date_filter
 
-    if search:
-        query["client_name_search"] = get_search_token(search)
+    # `search` and `client_name` resolve to the same token field — intersect
+    # them instead of letting one silently overwrite the other.
+    if client_name or search:
+        query.update(
+            _combine_name_filters(
+                get_search_token(client_name) if client_name else None,
+                get_search_token(search) if search else None,
+            )
+        )
 
     total = await bills_collection.count_documents(query)
     cursor = (

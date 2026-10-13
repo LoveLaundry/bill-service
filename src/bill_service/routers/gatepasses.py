@@ -171,6 +171,8 @@ async def list_gate_passes(
     status_filter: Optional[str] = Query(None, alias="status"),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(5000, ge=1, le=5000),
     current_user: dict = Depends(require_capability("gatepass:read")),
 ):
     query = {}
@@ -190,7 +192,7 @@ async def list_gate_passes(
             date_query["$lte"] = day_query_end(date_to)
         query["receiving_date"] = date_query
 
-    cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
+    cursor = gatepasses_collection.find(query).sort("receiving_date", -1).skip(skip).limit(limit)
     results = []
     async for doc in cursor:
         try:
