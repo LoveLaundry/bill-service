@@ -17,6 +17,7 @@ from ..database.main_db import (
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..services import balance_engine as be
+from ..services.hotel_code import format_bill_number
 from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
 from pydantic import BaseModel
@@ -1441,3 +1442,39 @@ async def list_payments_for_bill(
         except HTTPException:
             pass
     return results
+
+
+@router.get("/{bill_id}/print-data")
+async def print_bill_data(
+    bill_id: str,
+    include_prefix: bool = Query(
+        False, description="Include hotel-code prefix in bill / gate-pass numbers"
+    ),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    """Return a print-ready projection of a hotel bill.
+
+    When ``include_prefix`` is False (default), the hotel-code prefix is
+    stripped from ``manual_bill_number``, ``manual_gate_pass_number`` and
+    ``alrs_number`` — matching the legacy numbering the hotels are used to
+    seeing on printed invoices.
+    """
+    oid = _parse_object_id(bill_id)
+    doc = await bills_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
+        )
+    serialized = _serialize(doc)
+    serialized = await _attach_receiving_date(doc, serialized)
+
+    serialized["manual_bill_number"] = format_bill_number(
+        serialized.get("manual_bill_number"), include_prefix
+    )
+    serialized["manual_gate_pass_number"] = format_bill_number(
+        serialized.get("manual_gate_pass_number"), include_prefix
+    )
+    serialized["alrs_number"] = format_bill_number(
+        serialized.get("alrs_number"), include_prefix
+    )
+    return serialized

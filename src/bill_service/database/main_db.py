@@ -30,6 +30,7 @@ rewashes_collection: AsyncIOMotorCollection = _db.get_collection("rewashes")
 monthly_entries_collection: AsyncIOMotorCollection = _db.get_collection("monthly_entries")
 linen_category_mappings_collection: AsyncIOMotorCollection = _db.get_collection("linen_category_mappings")
 manual_references_collection: AsyncIOMotorCollection = _db.get_collection("manual_references")
+hotel_codes_collection: AsyncIOMotorCollection = _db.get_collection("hotel_codes")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")
@@ -50,7 +51,13 @@ async def ensure_indexes():
     await gatepasses_collection.create_index("status")
     await gatepasses_collection.create_index("created_at")
     await gatepasses_collection.create_index([("receiving_date", 1), ("status", 1)])
-    await manual_references_collection.create_index("normalized", unique=True)
+    # scope_key is the uniqueness key for manual references.
+    # For hotel-scoped fields (bill_number) it is ``{normalized}|hotel:{token}``;
+    # for globally-unique fields it equals ``normalized``.
+    await manual_references_collection.create_index("scope_key", unique=True)
+    # Keep normalized as a non-unique secondary index for look-ups.
+    await manual_references_collection.create_index("normalized")
+    await manual_references_collection.create_index("client_name_search")
 
     # Deliveries indexes
     await deliveries_collection.create_index("gate_pass_id")
@@ -122,7 +129,14 @@ async def ensure_indexes():
     await idempotency_collection.create_index("created_at")
 
     # Shop Bills indexes
-    await shop_bills_collection.create_index("bill_number", unique=True)
+    # bill_number is unique per hotel: the stored value includes the hotel-code
+    # prefix (e.g. "RH-1001") so the same suffix can appear for multiple hotels.
+    # A compound index on (client_name_search, bill_number) enforces uniqueness
+    # within each hotel; the plain bill_number index is non-unique for lookups.
+    await shop_bills_collection.create_index(
+        [("client_name_search", 1), ("bill_number", 1)], unique=True
+    )
+    await shop_bills_collection.create_index("bill_number")
     await shop_bills_collection.create_index("client_name_search")
     await shop_bills_collection.create_index("status")
     await shop_bills_collection.create_index("payment_status")

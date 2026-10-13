@@ -33,6 +33,7 @@ from ..models import (
 )
 from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..router_utils import log_audit, parse_object_id
+from ..services.hotel_code import format_bill_number, prefix_bill_number
 from ..services.manual_references import (
     reserve_generated_bill_number,
     reserve_generated_reference,
@@ -418,6 +419,29 @@ async def get_legacy_invoice(
     return _dec_legacy(doc)
 
 
+@router.get("/legacy/{invoice_id}/print-data")
+async def print_legacy_invoice_data(
+    invoice_id: str,
+    include_prefix: bool = Query(
+        False, description="Include hotel-code prefix in bill numbers"
+    ),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    """Return a print-ready legacy invoice with optional prefix stripping.
+
+    The ``invoice_number`` is always returned as-is. Each entry's
+    ``bill_number`` is formatted according to ``include_prefix``.
+    """
+    doc = await _find_legacy_invoice(invoice_id)
+    result = _dec_legacy(doc)
+    for entry in result.get("entries", []):
+        if entry.get("bill_number"):
+            entry["bill_number"] = format_bill_number(
+                entry["bill_number"], include_prefix
+            )
+    return result
+
+
 @router.put("/legacy/{invoice_id}")
 async def update_legacy_invoice(
     invoice_id: str,
@@ -538,9 +562,13 @@ async def create_bill(
     now = datetime.now(timezone.utc)
     if payload.bill_number:
         bill_number = payload.bill_number.strip()
+        # Prefix with hotel code so same number can coexist across hotels.
+        bill_number = prefix_bill_number(payload.client_name, bill_number)
         try:
             await reserve_references(
-                f"shop-bill:{uuid4().hex}", {"bill_number": bill_number}
+                f"shop-bill:{uuid4().hex}",
+                {"bill_number": bill_number},
+                client_name=payload.client_name,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -2185,16 +2213,37 @@ async def versions(bill_id: str, current_user: dict = Depends(require_capability
     return {"versions": vs}
 
 @router.get("/{bill_id}/print-data")
-async def print_data(bill_id: str, current_user: dict = Depends(require_capability("bill:read"))):
+async def print_data(
+    bill_id: str,
+    include_prefix: bool = Query(False, description="Include hotel-code prefix in bill number"),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
     doc = _dec(await _find_bill(bill_id))
-    return {k: doc.get(k) for k in ("bill_number", "client_name", "delivery_date", "items", "total_amount", "discounts", "transport_fee", "taxes", "grand_total", "paid_amount", "outstanding_amount", "notes", "created_at")}
+    result = {k: doc.get(k) for k in (
+        "bill_number", "client_name", "delivery_date", "items",
+        "total_amount", "discounts", "transport_fee", "taxes",
+        "grand_total", "paid_amount", "outstanding_amount", "notes", "created_at"
+    )}
+    result["bill_number"] = format_bill_number(result.get("bill_number"), include_prefix)
+    return result
 
 @router.post("/bulk-print-data")
-async def bulk_print(body: dict = Body(...), current_user: dict = Depends(require_capability("bill:read"))):
+async def bulk_print(
+    body: dict = Body(...),
+    include_prefix: bool = Query(False, description="Include hotel-code prefix in bill number"),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
     bills = []
     for bid in body.get("bill_ids", [])[:10]:
         raw = await shop_bills_collection.find_one({"_id": parse_object_id(bid, "Bill ID")})
-        if raw: d = _dec(raw); bills.append({"bill_number": d.get("bill_number"), "client_name": d.get("client_name"), "items": d.get("items", []), "grand_total": d.get("grand_total", 0)})
+        if raw:
+            d = _dec(raw)
+            bills.append({
+                "bill_number": format_bill_number(d.get("bill_number"), include_prefix),
+                "client_name": d.get("client_name"),
+                "items": d.get("items", []),
+                "grand_total": d.get("grand_total", 0),
+            })
     return {"bills": bills}
 
 @router.post("/calculate-tax")
@@ -2212,11 +2261,14 @@ async def calc_disc(body: dict = Body(...), current_user: dict = Depends(require
 async def batch(body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
     now = datetime.now(timezone.utc); created = []
     for bd in body.get("bills", [])[:20]:
+        client_name = bd.get("client_name", "")
         if bd.get("bill_number"):
             bn = str(bd["bill_number"]).strip()
+            bn = prefix_bill_number(client_name, bn)
             try:
                 await reserve_references(
-                    f"shop-bill:{uuid4().hex}", {"bill_number": bn}
+                    f"shop-bill:{uuid4().hex}", {"bill_number": bn},
+                    client_name=client_name,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc

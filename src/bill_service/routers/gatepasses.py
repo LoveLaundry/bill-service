@@ -16,7 +16,9 @@ from ..database.main_db import (
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..services.gate_pass_records import create_gate_pass_record
+from ..services.hotel_code import format_bill_number, prefix_bill_number
 from ..services.manual_references import reserve_references
+from ..services.monthly_sync import sync_gate_pass_to_monthly, update_monthly_day_references
 from ..error_responses import NotFoundError, ValidationError, ConflictError, ForbiddenError
 from ..services.bill_sync import sync_bills_to_gate_pass
 from ..services.transaction_events import (
@@ -99,6 +101,17 @@ async def create_gate_pass(
     if existing_created:
         return _serialize(existing_created)
 
+    # ── Bill number: store with hotel-code prefix so the same number can
+    # coexist across different hotels (uniqueness is per-hotel).
+    if payload.manual_bill_number:
+        payload = payload.model_copy(
+            update={
+                "manual_bill_number": prefix_bill_number(
+                    payload.client_name, payload.manual_bill_number
+                )
+            }
+        )
+
     # Check if uniqueness constraint violates
     existing = await gatepasses_collection.find_one(
         {"gate_pass_number": payload.gate_pass_number}
@@ -112,6 +125,7 @@ async def create_gate_pass(
         await reserve_references(
             f"gatepass:{uuid4().hex}",
             {"gate_pass_number": payload.gate_pass_number},
+            client_name=payload.client_name,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -135,6 +149,19 @@ async def create_gate_pass(
         serialized["id"],
     )
     await idempotency.record_created(request, auth_id, "gatepass", serialized["id"])
+
+    # ── Back-sync to monthly operations (manual gate passes only).
+    # Monthly-generated passes already carry origin.kind=="monthly" and are
+    # skipped inside sync_gate_pass_to_monthly; this is a no-op for them.
+    try:
+        await sync_gate_pass_to_monthly(serialized, actor_id=auth_id)
+    except Exception:  # pragma: no cover
+        # Never block the gate pass creation because of a sync error.
+        import logging
+        logging.getLogger(__name__).exception(
+            "sync_gate_pass_to_monthly failed for gate pass %s", serialized.get("id")
+        )
+
     return serialized
 
 
@@ -951,6 +978,17 @@ async def update_gate_pass(
             "gatepass",
             serialized["id"],
         )
+
+        # Keep monthly operations in sync with reference changes.
+        try:
+            await update_monthly_day_references(serialized)
+        except Exception:  # pragma: no cover
+            import logging
+            logging.getLogger(__name__).exception(
+                "update_monthly_day_references failed for gate pass %s",
+                serialized.get("id"),
+            )
+
         return serialized
     except HTTPException:
         raise
@@ -997,3 +1035,38 @@ async def adjust_gate_pass(
     updated_doc = await gatepasses_collection.find_one({"_id": oid})
     serialized = _serialize(updated_doc)
     return await attach_verification_to("gatepass", oid, serialized)
+
+
+@router.get("/{gate_pass_id}/print-data")
+async def print_gate_pass_data(
+    gate_pass_id: str,
+    include_prefix: bool = Query(
+        False, description="Include hotel-code prefix in bill / gate-pass numbers"
+    ),
+    current_user: dict = Depends(require_capability("gatepass:read")),
+):
+    """Return a print-ready projection of a gate pass.
+
+    When ``include_prefix`` is False (default), the hotel-code prefix is
+    stripped from ``manual_bill_number``, ``manual_gate_pass_number`` and
+    ``alrs_number``.
+    """
+    oid = _parse_object_id(gate_pass_id)
+    doc = await gatepasses_collection.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
+        )
+    serialized = _serialize(doc)
+    serialized = await attach_verification_to("gatepass", oid, serialized)
+
+    serialized["manual_bill_number"] = format_bill_number(
+        serialized.get("manual_bill_number"), include_prefix
+    )
+    serialized["manual_gate_pass_number"] = format_bill_number(
+        serialized.get("manual_gate_pass_number"), include_prefix
+    )
+    serialized["alrs_number"] = format_bill_number(
+        serialized.get("alrs_number"), include_prefix
+    )
+    return serialized

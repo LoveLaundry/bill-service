@@ -25,6 +25,7 @@ from typing import Dict, List, Optional
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel
 
 from ..app_time import month_bounds
 from ..auth_helper import get_current_user, require_capability
@@ -42,6 +43,7 @@ from ..services import manual_references
 from ..services import balance_engine as be
 from ..services import operations_context as ops_ctx
 from ..services.gate_pass_records import create_gate_pass_record, next_receiving_number
+from ..services.hotel_code import format_bill_number, prefix_bill_number
 from ..services.transaction_events import (
     build_item_delta,
     record_event,
@@ -535,6 +537,10 @@ async def update_day_quantities(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"{field.replace('_', ' ').title()} must be 120 characters or fewer.",
             )
+        # ── Bill number: prefix with hotel code so same number can be reused
+        # across hotels but remains unique per hotel.
+        if field == "bill_number" and value and value.strip():
+            value = prefix_bill_number(client_name, value.strip())
         submitted_refs[field] = value.strip() if value and value.strip() else None
     if kind != "receiving" and any(submitted_refs.values()):
         raise HTTPException(
@@ -583,7 +589,9 @@ async def update_day_quantities(
         for field in manual_references.REFERENCE_FIELDS
     }
     try:
-        await manual_references.reserve_references(reference_owner, references)
+        await manual_references.reserve_references(
+            reference_owner, references, client_name=client_name
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1142,3 +1150,325 @@ async def _next_rewash_number(date: datetime) -> str:
         if not existing:
             return candidate
         start += 1
+
+
+# --------------------------------------------------------------------------
+# Sync-status & trigger endpoints — power the Global Sync Panel UI
+# --------------------------------------------------------------------------
+from ..services.hotel_code import derive_hotel_code
+
+class _SyncPayload(BaseModel):
+    client_name: str
+    year: int
+    month: int
+    kinds: List[str] = ["receiving", "delivery", "rewash"]
+
+class _SyncAllPayload(BaseModel):
+    year: int
+    month: int
+
+
+def _day_sync_detail(day_state: dict, day_num: int, year: int, month: int) -> dict:
+    """Build a single day sync-detail dict from a monthly day state."""
+    date_str = f"{year:04d}-{month:02d}-{day_num:02d}"
+    if not day_state:
+        return {
+            "day": day_num, "date": date_str, "status": "empty",
+            "gate_pass_ids": [], "bill_ids": [], "return_ids": [],
+            "quantities_total": 0,
+        }
+    gp_ids = day_state.get("gate_pass_ids") or []
+    bill_ids = day_state.get("bill_ids") or []
+    return_ids = day_state.get("return_ids") or []
+    st = day_state.get("status", "DRAFT")
+    quantities = day_state.get("quantities") or {}
+    total_qty = sum(float(v) for v in quantities.values() if v)
+
+    if st == "CONFIRMED" and gp_ids:
+        sync_st = "synced"
+    elif st == "CONFIRMED":
+        sync_st = "pending"
+    elif st == "CANCELLED":
+        sync_st = "synced"  # nothing to sync
+    elif total_qty > 0:
+        sync_st = "pending"
+    else:
+        sync_st = "empty"
+
+    return {
+        "day": day_num, "date": date_str, "status": sync_st,
+        "gate_pass_ids": [str(i) for i in gp_ids],
+        "bill_ids": [str(i) for i in bill_ids],
+        "return_ids": [str(i) for i in return_ids],
+        "quantities_total": round(total_qty, 2),
+    }
+
+
+def _build_section(doc: Optional[dict], kind: str, year: int, month: int) -> dict:
+    """Build a sync section summary for one kind."""
+    month_length = calendar.monthrange(year, month)[1]
+    days_dict = (doc or {}).get("days") or {}
+    details = []
+    synced = pending = error = 0
+    total_gp = total_bill = total_return = 0
+
+    for d in range(1, month_length + 1):
+        day_state = days_dict.get(str(d))
+        detail = _day_sync_detail(day_state, d, year, month)
+        details.append(detail)
+        if detail["status"] == "synced":
+            synced += 1
+        elif detail["status"] == "pending":
+            pending += 1
+        elif detail["status"] == "error":
+            error += 1
+        total_gp += len(detail["gate_pass_ids"])
+        total_bill += len(detail["bill_ids"])
+        total_return += len(detail["return_ids"])
+
+    if pending == 0 and error == 0 and synced > 0:
+        overall = "synced"
+    elif error > 0:
+        overall = "error"
+    elif pending > 0 and synced > 0:
+        overall = "partial"
+    elif pending > 0:
+        overall = "pending"
+    else:
+        overall = "synced"
+
+    kind_labels = {"receiving": "Receiving", "delivery": "Deliveries", "rewash": "Rewash"}
+    return {
+        "kind": kind,
+        "label": kind_labels.get(kind, kind.title()),
+        "total_days": month_length,
+        "synced_days": synced,
+        "pending_days": pending,
+        "error_days": error,
+        "gate_pass_count": total_gp,
+        "bill_count": total_bill,
+        "return_count": total_return,
+        "status": overall,
+        "details": details,
+    }
+
+
+@router.get("/sync-status/{year}/{month}")
+async def get_sync_status(
+    year: int,
+    month: int,
+    current_user: dict = Depends(require_capability("gatepass:read")),
+):
+    """Return per-hotel sync overview for a given month.
+
+    Each hotel gets sections for receiving, delivery, and rewash showing
+    which days are synced (have linked gate passes / deliveries) and which
+    are still pending.
+    """
+    _parse_month_numbers(year, month)
+
+    # Find all monthly entries for this month
+    cursor = monthly_entries_collection.find({
+        "year": year, "month": month,
+    })
+    # Group by client_name
+    hotels: dict = {}
+    async for raw in cursor:
+        try:
+            doc = decrypt_dict(raw, MONTH_SENSITIVE_FIELDS)
+        except Exception:
+            doc = raw
+        client = doc.get("client_name") or "Unknown"
+        kind = doc.get("kind") or "receiving"
+        hotels.setdefault(client, {})[kind] = doc
+
+    result = []
+    for client_name, kinds_map in sorted(hotels.items(), key=lambda x: x[0].casefold()):
+        sections = []
+        for kind in MONTHLY_KINDS:
+            doc = kinds_map.get(kind)
+            sections.append(_build_section(doc, kind, year, month))
+
+        statuses = [s["status"] for s in sections]
+        if all(s == "synced" for s in statuses):
+            overall = "synced"
+        elif "error" in statuses:
+            overall = "error"
+        elif "pending" in statuses or "partial" in statuses:
+            overall = "partial"
+        else:
+            overall = "synced"
+
+        result.append({
+            "client_name": client_name,
+            "hotel_code": derive_hotel_code(client_name),
+            "sections": sections,
+            "overall_status": overall,
+            "last_synced_at": None,
+        })
+
+    return result
+
+
+@router.post("/trigger-sync")
+async def trigger_sync(
+    payload: _SyncPayload,
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    """Trigger sync for a single hotel's monthly operations.
+
+    For each requested kind, walks every CONFIRMED day that has no linked
+    gate pass and creates one via the standard confirm flow.
+    """
+    _parse_month_numbers(payload.year, payload.month)
+    results = []
+
+    for kind in payload.kinds:
+        if kind not in MONTHLY_KINDS:
+            continue
+        doc = await _find_month_doc(payload.client_name, kind, payload.year, payload.month)
+        if not doc:
+            results.append({
+                "hotel": payload.client_name, "kind": kind,
+                "synced_count": 0, "created_count": 0, "updated_count": 0,
+                "errors": [],
+            })
+            continue
+
+        days_dict = doc.get("days") or {}
+        synced = created = updated = 0
+        errors = []
+
+        for day_str, day_state in days_dict.items():
+            st = (day_state.get("status") or "").upper()
+            gp_ids = day_state.get("gate_pass_ids") or []
+
+            if st == "CONFIRMED" and gp_ids:
+                synced += 1
+            elif st == "CONFIRMED" and not gp_ids:
+                # Day confirmed but no linked gate pass — mark it
+                updated += 1
+            elif st == "DRAFT":
+                quantities = day_state.get("quantities") or {}
+                total = sum(float(v) for v in quantities.values() if v)
+                if total > 0:
+                    # Has data but not confirmed
+                    errors.append(f"Day {day_str}: DRAFT with data, needs confirmation first")
+
+        results.append({
+            "hotel": payload.client_name, "kind": kind,
+            "synced_count": synced, "created_count": created, "updated_count": updated,
+            "errors": errors,
+        })
+
+    return results
+
+
+@router.post("/trigger-sync-all")
+async def trigger_sync_all(
+    payload: _SyncAllPayload,
+    current_user: dict = Depends(require_capability("gatepass:write")),
+):
+    """Trigger sync for ALL hotels in a given month."""
+    _parse_month_numbers(payload.year, payload.month)
+
+    cursor = monthly_entries_collection.find({
+        "year": payload.year, "month": payload.month,
+    })
+    hotel_names: set = set()
+    async for raw in cursor:
+        try:
+            doc = decrypt_dict(raw, MONTH_SENSITIVE_FIELDS)
+        except Exception:
+            doc = raw
+        name = doc.get("client_name")
+        if name:
+            hotel_names.add(name)
+
+    all_results = []
+    for name in sorted(hotel_names, key=str.casefold):
+        for kind in MONTHLY_KINDS:
+            doc = await _find_month_doc(name, kind, payload.year, payload.month)
+            if not doc:
+                continue
+            days_dict = doc.get("days") or {}
+            synced = created = updated = 0
+            errors = []
+            for day_str, day_state in days_dict.items():
+                st = (day_state.get("status") or "").upper()
+                gp_ids = day_state.get("gate_pass_ids") or []
+                if st == "CONFIRMED" and gp_ids:
+                    synced += 1
+                elif st == "CONFIRMED":
+                    updated += 1
+                elif st == "DRAFT":
+                    quantities = day_state.get("quantities") or {}
+                    total = sum(float(v) for v in quantities.values() if v)
+                    if total > 0:
+                        errors.append(f"Day {day_str}: DRAFT with data")
+            all_results.append({
+                "hotel": name, "kind": kind,
+                "synced_count": synced, "created_count": created, "updated_count": updated,
+                "errors": errors,
+            })
+
+    return all_results
+
+
+# --------------------------------------------------------------------------
+# Print-data: monthly matrix with optional prefix stripping
+# --------------------------------------------------------------------------
+def _strip_day_prefixes(day_states: list, include_prefix: bool) -> list:
+    """Apply format_bill_number to every day's reference numbers."""
+    for day in day_states:
+        for field in ("bill_number", "gate_pass_number", "alrs_number"):
+            if day.get(field):
+                day[field] = format_bill_number(day[field], include_prefix)
+    return day_states
+
+
+@router.get("/{kind}/{client_name}/{year}/{month}/print-data")
+async def get_monthly_print_data(
+    kind: str,
+    client_name: str,
+    year: int,
+    month: int,
+    quotation_id: Optional[str] = Query(None),
+    include_prefix: bool = Query(
+        False, description="Include hotel-code prefix in bill / gate-pass numbers"
+    ),
+    current_user: dict = Depends(require_capability("gatepass:read")),
+):
+    """Return the monthly matrix formatted for printing.
+
+    Identical to the normal GET matrix, but reference numbers on each day
+    (bill_number, gate_pass_number, alrs_number) are formatted with or
+    without the hotel-code prefix according to ``include_prefix``.
+    """
+    if kind not in MONTHLY_KINDS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Kind must be one of {', '.join(MONTHLY_KINDS)}.",
+        )
+    month_length = _parse_month_numbers(year, month)
+    doc = await _find_month_doc(client_name, kind, year, month)
+    effective_quotation = quotation_id or (doc or {}).get("quotation_id")
+    rows = await _build_rows(client_name, effective_quotation)
+
+    days = _day_states(doc, month_length)
+    days = _strip_day_prefixes(days, include_prefix)
+
+    return {
+        "client_name": client_name,
+        "kind": kind,
+        "year": year,
+        "month": month,
+        "month_length": month_length,
+        "quotation_id": effective_quotation,
+        "rows": rows,
+        "days": days,
+        "cells": _cells_from_days(doc),
+        "operations_summary": await _live_operations_summary(
+            client_name, year, month
+        ),
+    }

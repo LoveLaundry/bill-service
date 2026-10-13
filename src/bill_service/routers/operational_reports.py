@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..auth_helper import require_capability, require_role
@@ -18,6 +18,7 @@ from ..database.main_db import (
     gatepasses_collection,
     linen_category_mappings_collection,
 )
+from ..services.hotel_code import format_bill_number
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
 
@@ -689,6 +690,9 @@ async def delete_linen_category_mapping(
 @router.post("/monthly-operations")
 async def monthly_operations_report(
     payload: MonthlyOperationsReportRequest,
+    include_prefix: bool = Query(
+        False, description="Include hotel-code prefix in bill / gate-pass numbers"
+    ),
     current_user: dict = Depends(require_capability("report:read")),
 ):
     if payload.end_date < payload.start_date:
@@ -771,4 +775,12 @@ async def monthly_operations_report(
         for hotel in report["hotel_summary"]
     ]
     report["hotels"] = report["hotel_summary"]
+
+    # Apply prefix formatting to daily details for printing
+    for detail in report.get("daily_details", []):
+        if detail.get("gate_pass_number"):
+            detail["gate_pass_number"] = format_bill_number(
+                detail["gate_pass_number"], include_prefix
+            )
+
     return report
