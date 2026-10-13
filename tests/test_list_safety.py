@@ -1,14 +1,6 @@
-"""Regression tests for list-endpoint safety fixed alongside the Income/Ledger tabs.
-
-Covers:
- * ``GET /gatepasses`` ``skip``/``limit`` pagination (the Income/Ledger tabs
-   page through the full receiving history);
- * the ``$convert`` guard in the bills gate-pass-date ``$lookup`` stage, which
-   replaced a ``$toObjectId`` that collapsed the whole listing into a 500 as
-   soon as a manual bill (``gate_pass_id=None``) met a gate-pass date filter;
- * ``search`` + ``client_name`` on ``GET /bills`` intersecting instead of
-   ``search`` silently overriding the client scope (both resolve to the same
-   ``client_name_search`` token field).
+"""List-endpoint safety: gatepass skip/limit pagination, null-safe $convert in
+the bills gate-pass-date lookup (bare $toObjectId 500s on manual bills), and
+search + client_name intersecting instead of search overriding client scope.
 """
 from datetime import datetime, timezone
 

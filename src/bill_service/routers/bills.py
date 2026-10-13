@@ -732,13 +732,9 @@ async def create_bill(
 def _gatepass_lookup_stage() -> dict:
     """Join bills to their gate pass for receiving-date filtering.
 
-    ``gate_pass_id`` is stored as a string while ``_id`` is an ObjectId, so
-    the join must convert. A plain ``$toObjectId`` throws on missing or
-    malformed ids — and manual bills carry ``gate_pass_id=None`` — which used
-    to collapse the whole listing into a 500 as soon as a gate-pass date
-    filter was sent. ``$convert`` maps those to null instead, which matches
-    no gate pass, so manual bills are simply excluded from date-filtered
-    results.
+    ``gate_pass_id`` is a string, ``_id`` an ObjectId. ``$convert`` maps
+    missing/malformed ids (manual bills carry ``gate_pass_id=None``) to null
+    instead of throwing like ``$toObjectId`` did.
     """
     return {
         "$lookup": {
@@ -769,12 +765,8 @@ def _gatepass_lookup_stage() -> dict:
 
 
 def _combine_name_filters(*tokens: Optional[str]) -> dict:
-    """Merge exact-match client-name search tokens without dropping any.
-
-    ``search`` and ``client_name`` both resolve to ``client_name_search``;
-    assigning the key twice used to let ``search`` silently override the
-    client scope. Multiple tokens become an ``$and`` intersection instead.
-    """
+    """Merge client-name search tokens: multiple become an ``$and`` instead of
+    one silently overwriting the other (both resolve to one field)."""
     clauses = [{"client_name_search": token} for token in tokens if token]
     if len(clauses) == 1:
         return clauses[0]
@@ -800,10 +792,8 @@ async def list_bills(
     use_pipeline = gate_pass_date_from or gate_pass_date_to
 
     if use_pipeline:
-        # Build aggregation pipeline — filter by gate pass receiving_date
         pipeline: list = []
 
-        # Start with basic bill-level filters (non-date)
         base_match: dict = {}
         if client_name:
             base_match["client_name_search"] = get_search_token(client_name)
@@ -824,7 +814,7 @@ async def list_bills(
         # Join with gatepasses to access receiving_date
         pipeline.append(_gatepass_lookup_stage())
 
-        # Filter by gate pass receiving_date (handles null gate_pass_id too)
+        # Filter by gate pass receiving_date
         gp_date_match: dict = {}
         if gate_pass_date_from:
             gp_date_match["$gte"] = day_query(gate_pass_date_from)
@@ -852,7 +842,6 @@ async def list_bills(
         # Drop the gate-pass join field after exposing the date.
         pipeline.append({"$project": {"gp": 0}})
 
-        # Count total before sort/skip/limit
         count_pipeline = pipeline + [{"$count": "total"}]
         count_result = await bills_collection.aggregate(count_pipeline).to_list(1)
         total = count_result[0]["total"] if count_result else 0
@@ -874,7 +863,6 @@ async def list_bills(
 
         return {"items": docs, "total": total}
 
-    # Original simple query (no gate pass date filter)
     query: dict = {}
 
     if quotation_id:
@@ -891,8 +879,6 @@ async def list_bills(
             date_filter["$lte"] = day_query_end(date_to)
         query["created_at"] = date_filter
 
-    # `search` and `client_name` resolve to the same token field — intersect
-    # them instead of letting one silently overwrite the other.
     if client_name or search:
         query.update(
             _combine_name_filters(
