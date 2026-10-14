@@ -6,6 +6,7 @@ from bson import ObjectId
 from bson.errors import InvalidId
 
 from ..auth_helper import get_current_user, require_capability
+from ..tenancy import assert_same_laundry, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -64,6 +65,19 @@ def _serialize(doc: dict) -> dict:
     return decrypted
 
 
+async def _owned_gate_pass(gate_pass_id: str, current_user: dict):
+    """Fetch a gate pass iff it belongs to the caller's laundry.
+
+    Returns (laundry_id, oid, raw_doc). Unknown ids and other laundries'
+    passes both surface as 404 so identifiers cannot be probed.
+    """
+    laundry_id = resolve_laundry_id(current_user)
+    oid = _parse_object_id(gate_pass_id)
+    doc = await gatepasses_collection.find_one({"_id": oid})
+    assert_same_laundry(doc, laundry_id, "Gate Pass")
+    return laundry_id, oid, doc
+
+
 def _parse_object_id(gate_pass_id: str) -> ObjectId:
     try:
         return ObjectId(gate_pass_id)
@@ -94,6 +108,7 @@ async def create_gate_pass(
     request: Request = None,
 ):
     auth_id = current_user.get("auth_id", "system")
+    laundry_id = resolve_laundry_id(current_user)
 
     # Idempotent create: a retry with the same X-Idempotency-Key returns the
     # previously created gate pass instead of duplicating it.
@@ -126,6 +141,7 @@ async def create_gate_pass(
             f"gatepass:{uuid4().hex}",
             {"gate_pass_number": payload.gate_pass_number},
             client_name=payload.client_name,
+            laundry_id=laundry_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -138,6 +154,7 @@ async def create_gate_pass(
             current_user,
             status=payload.status,
             origin=payload.origin,
+            laundry_id=laundry_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
@@ -192,7 +209,7 @@ async def list_gate_passes(
             date_query["$lte"] = day_query_end(date_to)
         query["receiving_date"] = date_query
 
-    cursor = gatepasses_collection.find(query).sort("receiving_date", -1).skip(skip).limit(limit)
+    cursor = gatepasses_collection.find(scoped_query(query, resolve_laundry_id(current_user))).sort("receiving_date", -1).skip(skip).limit(limit)
     results = []
     async for doc in cursor:
         try:
@@ -208,12 +225,7 @@ async def get_gate_pass(
     gate_pass_id: str,
     current_user: dict = Depends(require_capability("gatepass:read")),
 ):
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
     serialized = _serialize(doc)
     return await attach_verification_to("gatepass", oid, serialized)
 
@@ -234,12 +246,7 @@ async def get_gate_pass_balance(
     from ..services import balance_engine as be
     from ..services import operations_context as ctx
 
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
     decrypted = ctx.serialize(doc)
 
     deliveries, returns = await ctx.load_movements([gate_pass_id])
@@ -287,12 +294,7 @@ async def list_gate_pass_deliveries(
     from .deliveries import _serialize as _serialize_delivery
     from .deliveries import _source_filter
 
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
     decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
 
     results = []
@@ -352,12 +354,7 @@ async def update_gate_pass_status(
         "READY_FOR_DELIVERY": ["PROCESSING", "CANCELLED"],
     }
 
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
 
     previous_status = doc.get("status")
     if previous_status not in allowed_transitions:
@@ -389,7 +386,7 @@ async def update_gate_pass_status(
 
     # Update status field
     await gatepasses_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {
             "$set": {
                 "status": status_update,
@@ -438,12 +435,7 @@ async def mark_gate_pass_delivered(
     Requires a mandatory note; stores the catch-up record on the gate pass so
     it is treated as fully delivered while keeping an audit trail.
     """
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
 
     current_status = doc.get("status")
     if current_status in ("DELIVERED", "CANCELLED"):
@@ -478,12 +470,7 @@ async def catch_up_delivery(
     from ..services import balance_engine as be
     from ..services import operations_context as ctx
 
-    oid = _parse_object_id(gate_pass_id)
-    gp_doc = await gatepasses_collection.find_one({"_id": oid})
-    if not gp_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, gp_doc = await _owned_gate_pass(gate_pass_id, current_user)
     decrypted = decrypt_dict(gp_doc, SENSITIVE_FIELDS)
     current_status = decrypted.get("status")
     if current_status in ("DELIVERED", "CANCELLED"):
@@ -527,6 +514,7 @@ async def catch_up_delivery(
     marker = f"Catch-up delivery: {payload.note}"
     existing_notes = decrypted.get("notes") or ""
     delivery_doc = {
+        "laundry_id": laundry_id,
         "gate_pass_id": gate_pass_id,
         "source_gate_pass_ids": [gate_pass_id],
         "client_name": decrypted.get("client_name"),
@@ -581,7 +569,7 @@ async def catch_up_delivery(
     updated_gp["notes"] = f"{existing_notes}\n{marker}".strip() if existing_notes else marker
     updated_gp["updated_at"] = now
     encrypted_gp = encrypt_dict(updated_gp, SENSITIVE_FIELDS)
-    await gatepasses_collection.replace_one({"_id": oid}, encrypted_gp)
+    await gatepasses_collection.replace_one(owned_filter(oid, laundry_id), encrypted_gp)
 
     # Bump + sync both entities.
     dl_id = str(dl_result.inserted_id)
@@ -618,7 +606,7 @@ async def catch_up_delivery(
     return await attach_verification_to("gatepass", oid, serialized)
 
 
-async def _reopen_legacy_doc(gp_doc: dict, current_user: dict) -> dict:
+async def _reopen_legacy_doc(gp_doc: dict, current_user: dict, laundry_id: str) -> dict:
     """Reopen one legacy note-closed pass.
 
     Never raises for a specific pass; returns a result dict for callers to
@@ -670,7 +658,15 @@ async def _reopen_legacy_doc(gp_doc: dict, current_user: dict) -> dict:
         updated_gp["notes"] = f"{existing_notes}\n{marker}".strip() if existing_notes else marker
         updated_gp["updated_at"] = now
         encrypted_gp = encrypt_dict(updated_gp, SENSITIVE_FIELDS)
-        await gatepasses_collection.replace_one({"_id": oid}, encrypted_gp)
+        replaced = await gatepasses_collection.replace_one(
+            owned_filter(oid, laundry_id), encrypted_gp
+        )
+        if replaced.matched_count == 0:
+            return {
+                "gate_pass_id": gp_id,
+                "reopened": False,
+                "reason": "Gate Pass not found",
+            }
 
         gp_version = await bump_version("gatepass", oid)
         await enqueue_sync("gatepass", oid, gp_version)
@@ -730,13 +726,8 @@ async def reopen_legacy_gate_pass(
     LEGACY_CLOSED_WITHOUT_DELIVERY) and the pass is moved back to RECEIVED so
     it re-enters the pending-to-deliver list. No quantities are fabricated.
     """
-    oid = _parse_object_id(gate_pass_id)
-    gp_doc = await gatepasses_collection.find_one({"_id": oid})
-    if not gp_doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
-    result = await _reopen_legacy_doc(gp_doc, current_user)
+    laundry_id, oid, gp_doc = await _owned_gate_pass(gate_pass_id, current_user)
+    result = await _reopen_legacy_doc(gp_doc, current_user, laundry_id)
     if not result["reopened"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=result["reason"]
@@ -754,13 +745,14 @@ async def reopen_all_legacy_gate_passes(
     Idempotent and safe — only passes with a ``marked_delivered`` closure and
     no recorded deliveries change; everything else is skipped and reported.
     """
+    laundry_id = resolve_laundry_id(current_user)
     reopened = []
     skipped = []
-    gp_cursor = gatepasses_collection.find({})
+    gp_cursor = gatepasses_collection.find(scoped_query({}, laundry_id))
     async for gp_doc in gp_cursor:
         if gp_doc.get("status") == "CANCELLED":
             continue
-        result = await _reopen_legacy_doc(gp_doc, current_user)
+        result = await _reopen_legacy_doc(gp_doc, current_user, laundry_id)
         if result["reopened"]:
             reopened.append(result)
         else:
@@ -774,15 +766,10 @@ async def update_gate_pass_date(
     payload: GatePassDateUpdate,
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
 
     await gatepasses_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {
             "$set": {
                 "receiving_date": payload.receiving_date,
@@ -825,12 +812,7 @@ async def update_gate_pass(
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     try:
-        oid = _parse_object_id(gate_pass_id)
-        doc = await gatepasses_collection.find_one({"_id": oid})
-        if not doc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-            )
+        laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
 
         if doc.get("status") in ("DELIVERED", "PARTIALLY_DELIVERED", "CANCELLED"):
             raise HTTPException(
@@ -907,7 +889,7 @@ async def update_gate_pass(
         decrypted["updated_at"] = datetime.now(timezone.utc)
 
         encrypted_new = encrypt_dict(decrypted, SENSITIVE_FIELDS)
-        await gatepasses_collection.replace_one({"_id": oid}, encrypted_new)
+        await gatepasses_collection.replace_one(owned_filter(oid, laundry_id), encrypted_new)
 
         updated_doc = await gatepasses_collection.find_one({"_id": oid})
         serialized = _serialize(updated_doc)
@@ -927,6 +909,7 @@ async def update_gate_pass(
                     user_id=current_user.get("auth_id", "system"),
                     user_name=current_user.get("user_name"),
                     reason=update_data.get("notes"),
+                    laundry_id=laundry_id,
                 )
             except Exception:
                 import logging
@@ -1018,12 +1001,7 @@ async def adjust_gate_pass(
     ``POST /adjustments``; the gate pass is returned UNCHANGED until another
     user approves the request (approved corrections re-sync linked bills).
     """
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
 
     request = GatePassAdjustmentRequest(
         gate_pass_id=gate_pass_id,
@@ -1053,12 +1031,7 @@ async def print_gate_pass_data(
     stripped from ``manual_bill_number``, ``manual_gate_pass_number`` and
     ``alrs_number``.
     """
-    oid = _parse_object_id(gate_pass_id)
-    doc = await gatepasses_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Gate Pass not found"
-        )
+    laundry_id, oid, doc = await _owned_gate_pass(gate_pass_id, current_user)
     serialized = _serialize(doc)
     serialized = await attach_verification_to("gatepass", oid, serialized)
 

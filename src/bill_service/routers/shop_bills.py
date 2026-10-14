@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from ..app_time import day_bounds, day_start, lkt, MONGO_TIME_ZONE, month_bounds, month_start, parse_day, this_month_number, this_year, today, week_start, year_bounds
 from ..auth_helper import require_capability
+from ..tenancy import resolve_laundry_id
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -560,6 +561,7 @@ async def create_bill(
     current_user: dict = Depends(require_capability("bill:write")),
 ):
     now = datetime.now(timezone.utc)
+    laundry_id = resolve_laundry_id(current_user)
     if payload.bill_number:
         bill_number = payload.bill_number.strip()
         # Prefix with hotel code so same number can coexist across hotels.
@@ -569,6 +571,7 @@ async def create_bill(
                 f"shop-bill:{uuid4().hex}",
                 {"bill_number": bill_number},
                 client_name=payload.client_name,
+                laundry_id=laundry_id,
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -584,6 +587,7 @@ async def create_bill(
     grand_total = totals["grand_total"]
 
     doc = {
+        "laundry_id": laundry_id,
         "bill_number": bill_number,
         "client_name": payload.client_name,
         "client_name_search": _get_search_token(payload.client_name),
@@ -2260,6 +2264,7 @@ async def calc_disc(body: dict = Body(...), current_user: dict = Depends(require
 @router.post("/batch-create", status_code=201)
 async def batch(body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
     now = datetime.now(timezone.utc); created = []
+    laundry_id = resolve_laundry_id(current_user)
     for bd in body.get("bills", [])[:20]:
         client_name = bd.get("client_name", "")
         if bd.get("bill_number"):
@@ -2269,12 +2274,14 @@ async def batch(body: dict = Body(...), current_user: dict = Depends(require_cap
                 await reserve_references(
                     f"shop-bill:{uuid4().hex}", {"bill_number": bn},
                     client_name=client_name,
+                    laundry_id=laundry_id,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         else:
             bn = await _generate_bill_number()
         doc = _build_bill_doc(bd, bn, now)
+        doc["laundry_id"] = laundry_id
         result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
         v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
         created.append({"bill_number": bn, "id": doc["id"]})

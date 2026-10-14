@@ -69,7 +69,9 @@ async def _store_delivery(mocked_db, gate_pass_id, items):
 
 
 def _auth_user(name="Alice"):
-    return {"auth_id": f"u-{name}", "user_name": name, "role": "ADMIN"}
+    from conftest import tenant_user
+
+    return tenant_user(f"u-{name}", "lovelaundry")
 
 
 def _fake_request():

@@ -20,6 +20,7 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth_helper import require_capability
+from ..tenancy import LOVE_LAUNDRY_ID, assert_same_laundry, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -57,6 +58,15 @@ SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 # Gate-pass documents are encrypted with the same three sensitive fields; the
 # alias keeps the intent explicit where a delivery reads its source pass.
 GATE_PASS_SENSITIVE_FIELDS = SENSITIVE_FIELDS
+
+
+async def _owned_delivery(delivery_id: str, current_user: dict, label: str = "Delivery record not found"):
+    """Fetch a delivery iff it belongs to the caller's laundry (404 otherwise)."""
+    laundry_id = resolve_laundry_id(current_user)
+    oid = _parse_object_id(delivery_id, label)
+    doc = await deliveries_collection.find_one({"_id": oid})
+    assert_same_laundry(doc, laundry_id, "Delivery record")
+    return laundry_id, oid, doc
 
 
 def _parse_object_id(id_str: str, label: str = "Invalid ID format") -> ObjectId:
@@ -213,6 +223,10 @@ async def create_delivery(
     if not be.same_client(payload.client_name, canonical_client):
         raise _client_mismatch_error(payload.client_name, canonical_client)
 
+    laundry_id = resolve_laundry_id(current_user)
+    for gp_id in gp_ids:
+        assert_same_laundry(gate_passes.get(gp_id), laundry_id, "Gate pass")
+
     # ── 3. Validate every line against the pass it came from ─────────────────
     deliveries, returns = await ctx.load_movements(gp_ids)
     available = ctx.availability_maps(
@@ -250,6 +264,7 @@ async def create_delivery(
     is_draft = payload.status == "DRAFT"
 
     delivery_doc = {
+        "laundry_id": laundry_id,
         "gate_pass_id": primary_gp_id,
         # Denormalised, non-sensitive index field (see _source_filter).
         "source_gate_pass_ids": source_ids,
@@ -387,12 +402,7 @@ async def activate_delivery(
     (received - already delivered by other active deliveries +/- returns),
     then re-derives the gate pass status from recorded quantities.
     """
-    oid = _parse_object_id(delivery_id)
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
     if decrypted.get("status") != "DRAFT":
         raise HTTPException(
@@ -403,6 +413,7 @@ async def activate_delivery(
     gp_id = decrypted.get("gate_pass_id")
     gp_oid = _parse_object_id(gp_id)
     gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
+    assert_same_laundry(gp_doc, laundry_id, "Gate Pass")
     if not gp_doc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -424,6 +435,8 @@ async def activate_delivery(
         {"gate_pass_id": gp_id, "status": {"$nin": ["CANCELLED", "DRAFT"]}}
     )
     async for prev_doc in prev_cursor:
+        if (prev_doc.get("laundry_id") or LOVE_LAUNDRY_ID) != laundry_id:
+            continue
         try:
             active_deliveries.append(decrypt_dict(prev_doc, SENSITIVE_FIELDS))
         except Exception:
@@ -456,7 +469,7 @@ async def activate_delivery(
     decrypted["status"] = "DELIVERED"
     decrypted["updated_at"] = now
     encrypted = encrypt_dict(decrypted, SENSITIVE_FIELDS)
-    await deliveries_collection.replace_one({"_id": oid}, encrypted)
+    await deliveries_collection.replace_one(owned_filter(oid, laundry_id), encrypted)
 
     new_version = await bump_version("delivery", oid)
     await enqueue_sync("delivery", oid, new_version)
@@ -470,6 +483,8 @@ async def activate_delivery(
     returns: List[dict] = []
     ret_cursor = returns_collection.find({"gate_pass_id": gp_id})
     async for ret_doc in ret_cursor:
+        if (ret_doc.get("laundry_id") or LOVE_LAUNDRY_ID) != laundry_id:
+            continue
         try:
             returns.append(decrypt_dict(ret_doc, ["client_name", "items", "notes"]))
         except Exception:
@@ -480,7 +495,7 @@ async def activate_delivery(
     )
     new_gp_status = be.derive_gate_pass_status(balance, gp_decrypted.get("status", ""))
     await gatepasses_collection.update_one(
-        {"_id": gp_oid},
+        owned_filter(gp_oid, laundry_id),
         {"$set": {"status": new_gp_status, "updated_at": now}},
     )
     gp_new_version = await bump_version("gatepass", gp_oid)
@@ -519,12 +534,7 @@ async def update_delivery_date(
     not a quantity change, so balances are never affected. A reason is kept for
     the audit trail and the change is journaled as DELIVERY_DATE_CHANGED.
     """
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
 
     previous_date = doc.get("delivery_date")
     new_date = payload.delivery_date
@@ -532,7 +542,7 @@ async def update_delivery_date(
         new_date = wall_clock(new_date)
 
     await deliveries_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {
             "$set": {
                 "delivery_date": new_date,
@@ -590,12 +600,7 @@ async def correct_delivery_items(
       * re-derives every affected gate pass's status, which is what turns
         "23 delivered" into "21 delivered, balance 2" everywhere at once.
     """
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     if doc.get("status") == be.CANCELLED_STATUS:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -688,6 +693,8 @@ async def correct_delivery_items(
         )
 
     gate_passes = {str(gp["gate_pass_id"]): gp for gp in await ctx.load_gate_passes(gp_ids)}
+    for gp in gate_passes.values():
+        assert_same_laundry(gp, laundry_id, "Gate pass")
     if not gate_passes:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Source gate pass no longer exists"
@@ -756,7 +763,7 @@ async def correct_delivery_items(
     # discards the first correction along with its audit record. Matching on
     # the timestamp we actually read turns that race into a visible 409.
     expected_updated_at = doc.get("updated_at")
-    write_filter: dict = {"_id": oid}
+    write_filter: dict = owned_filter(oid, laundry_id)
     if expected_updated_at is not None:
         write_filter["updated_at"] = expected_updated_at
     else:
@@ -794,7 +801,7 @@ async def correct_delivery_items(
     if violations:
         # `doc` is the untouched original straight from the database, so
         # writing it back restores the exact prior state — encryption included.
-        await deliveries_collection.replace_one({"_id": oid}, doc)
+        await deliveries_collection.replace_one(owned_filter(oid, laundry_id), doc)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -870,12 +877,7 @@ async def cancel_delivery(
     them. The document is kept (status CANCELLED) so the history survives, and
     a reason is mandatory so the void can be explained later.
     """
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     if doc.get("status") == be.CANCELLED_STATUS:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Delivery is already cancelled."
@@ -890,7 +892,7 @@ async def cancel_delivery(
 
     now = datetime.now(timezone.utc)
     await deliveries_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {"$set": {"status": "CANCELLED", "cancelled_at": now, "updated_at": now,
                   "cancelled_by": current_user.get("user_name", ""),
                   "cancelled_by_id": current_user.get("auth_id", ""),
@@ -953,6 +955,7 @@ async def available_quantities(
     """
     from ..crypto_helper import get_search_token
 
+    laundry_id = resolve_laundry_id(current_user)
     query: dict = {"status": {"$ne": be.CANCELLED_STATUS}}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
@@ -961,7 +964,8 @@ async def available_quantities(
     gate_passes = [
         gp
         for gp in gate_passes
-        if not client_name or be.same_client(gp.get("client_name"), client_name)
+        if (gp.get("laundry_id") or LOVE_LAUNDRY_ID) == laundry_id
+        and (not client_name or be.same_client(gp.get("client_name"), client_name))
     ]
     gp_ids = [str(gp["gate_pass_id"]) for gp in gate_passes]
     deliveries, returns = await ctx.load_movements(gp_ids)
@@ -990,6 +994,7 @@ async def pending_gatepasses(
     ``/deliveries/available`` so the number a user is allowed to type always
     matches the number they are shown.
     """
+    laundry_id = resolve_laundry_id(current_user)
     gate_passes = await ctx.load_gate_passes()
     # DRAFT passes are excluded: an unactivated monthly grid is not yet stock
     # anyone may deliver against. `build_availability` filters them again.
@@ -997,6 +1002,7 @@ async def pending_gatepasses(
         gp
         for gp in gate_passes
         if gp.get("status") not in (be.CANCELLED_STATUS, be.DRAFT_STATUS)
+        and (gp.get("laundry_id") or LOVE_LAUNDRY_ID) == laundry_id
         and (not client_name or be.same_client(gp.get("client_name"), client_name))
     ]
     gp_ids = [str(gp["gate_pass_id"]) for gp in gate_passes]
@@ -1049,12 +1055,7 @@ async def delivery_balance(
     what was its original recorded quantity, what was it corrected to, who
     corrected it and why, and what now remains on each source gate pass.
     """
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     current = _serialize(doc)
     gp_ids = [
         str(g)
@@ -1062,6 +1063,8 @@ async def delivery_balance(
         if g
     ]
     gate_passes = await ctx.load_gate_passes(gp_ids)
+    for gp in gate_passes:
+        assert_same_laundry(gp, laundry_id, "Gate pass")
     gp_map = {str(gp["gate_pass_id"]): gp for gp in gate_passes}
     deliveries, returns = await ctx.load_movements(gp_ids)
     balances = ctx.balances_for(
@@ -1125,7 +1128,9 @@ async def list_deliveries(
             date_query["$lte"] = day_query_end(date_to)
         query["delivery_date"] = date_query
 
-    cursor = deliveries_collection.find(query).sort("delivery_date", -1)
+    cursor = deliveries_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("delivery_date", -1)
     rows: List[dict] = []
     all_source_ids: List[str] = []
     for doc in await cursor.to_list(length=None):
@@ -1179,11 +1184,6 @@ async def get_delivery(
     delivery_id: str,
     current_user: dict = Depends(require_capability("delivery:read")),
 ):
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     serialized = _serialize(doc)
     return await attach_verification_to("delivery", oid, serialized)

@@ -249,6 +249,7 @@ async def test_gate_pass_creation_persists_quotation_price_snapshot(mocked_db, m
             )],
         ),
         {"auth_id": "admin-1", "user_name": "Admin"},
+        laundry_id="lovelaundry",
     )
     stored = await mocked_db["gatepasses_collection"].find_one({"gate_pass_number": "GP-20261001-9001"})
 

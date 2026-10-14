@@ -161,6 +161,7 @@ async def sync_bills_to_gate_pass(
     user_id: str = "system",
     user_name: Optional[str] = None,
     reason: Optional[str] = None,
+    laundry_id: Optional[str] = None,
 ) -> list[dict]:
     """Clamp every linked, editable bill to the corrected received quantities.
 
@@ -170,16 +171,19 @@ async def sync_bills_to_gate_pass(
     received = _snapshot_received(gp_items)
     outcomes = []
 
+    delivery_query: dict = {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
+    if laundry_id:
+        delivery_query["laundry_id"] = laundry_id
     delivery_ids = []
-    async for d in deliveries_collection.find(
-        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
-    ):
+    async for d in deliveries_collection.find(delivery_query):
         delivery_ids.append(str(d["_id"]))
 
     billed_filter: dict = {
         "payment_status": {"$ne": "CANCELLED"},
         "$or": [{"gate_pass_id": gate_pass_id}],
     }
+    if laundry_id:
+        billed_filter["laundry_id"] = laundry_id
     if delivery_ids:
         billed_filter["$or"].append({"delivery_ids": {"$in": delivery_ids}})
 

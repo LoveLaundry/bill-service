@@ -118,12 +118,16 @@ async def create_gate_pass_record(
     *,
     status: str = "RECEIVED",
     origin: Optional[dict] = None,
+    laundry_id: str,
 ) -> dict:
     """Create a gate pass document and run the full journal/sync/verify chain.
 
     ``payload.gate_pass_number`` must already be unique (caller should pass a
     server-generated number for DRAFT creation, or the client number for the
     normal flow where uniqueness is enforced upfront).
+
+    ``laundry_id`` is required and always stamped: no gate pass exists outside
+    exactly one laundry.
     """
     if status not in ALLOWED_STATUSES:
         raise ValueError(f"Unsupported gate pass status: {status}")
@@ -149,6 +153,7 @@ async def create_gate_pass_record(
     now = datetime.now(timezone.utc)
     price_snapshot = await _quotation_price_snapshot(payload.quotation_id)
     doc = {
+        "laundry_id": laundry_id,
         "gate_pass_number": payload.gate_pass_number,
         "manual_gate_pass_number": payload.manual_gate_pass_number,
         "manual_bill_number": payload.manual_bill_number,
