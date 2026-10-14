@@ -63,6 +63,42 @@ async def _store_bill(mocked_db, client: str, **extra) -> str:
     return str(res.inserted_id)
 
 
+async def _store_payment(mocked_db, bill_id: str, client: str, amount: float, payment_date) -> str:
+    doc = {
+        "bill_id": bill_id,
+        "client_name": client,
+        "client_name_search": get_search_token(client),
+        "amount": amount,
+        "payment_date": payment_date,
+        "payment_method": "CASH",
+        "reference": None,
+        "notes": "",
+        "created_at": _now(),
+        "updated_at": _now(),
+    }
+    encrypted = encrypt_dict(doc, bills.PAYMENT_SENSITIVE_FIELDS)
+    res = await mocked_db["payments_collection"].insert_one(encrypted)
+    return str(res.inserted_id)
+
+
+async def test_bulk_payments_filter_by_client_and_date(mocked_db):
+    await _store_payment(mocked_db, "bill-1", "Hilton Colombo", 100.0, datetime(2026, 1, 5, tzinfo=timezone.utc))
+    await _store_payment(mocked_db, "bill-2", "Hilton Colombo", 50.0, datetime(2026, 2, 5, tzinfo=timezone.utc))
+    await _store_payment(mocked_db, "bill-3", "Galle Face Hotel", 75.0, datetime(2026, 1, 5, tzinfo=timezone.utc))
+
+    scoped = await bills.list_all_payments("Hilton Colombo", None, None, 0, 500, _auth_user())
+    assert sorted(p["amount"] for p in scoped) == [50.0, 100.0]
+    assert {p["bill_id"] for p in scoped} == {"bill-1", "bill-2"}
+
+    ranged = await bills.list_all_payments(
+        None, datetime(2026, 1, 1), datetime(2026, 1, 31), 0, 500, _auth_user()
+    )
+    assert sorted(p["amount"] for p in ranged) == [75.0, 100.0]
+
+    paged = await bills.list_all_payments(None, None, None, 1, 1, _auth_user())
+    assert len(paged) == 1
+
+
 async def test_gatepass_list_paginates_with_skip_and_limit(mocked_db):
     await _store_gp(mocked_db, "GP-P1", "Hilton Colombo", "2026-01-01T00:00:00+00:00")
     await _store_gp(mocked_db, "GP-P2", "Hilton Colombo", "2026-01-02T00:00:00+00:00")

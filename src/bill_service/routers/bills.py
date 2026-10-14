@@ -1035,6 +1035,43 @@ async def get_unbilled_gatepasses(
     return unbilled_gatepasses
 
 
+@router.get("/payments", response_model=list)
+async def list_all_payments(
+    client_name: Optional[str] = Query(None),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=5000),
+    current_user: dict = Depends(require_capability("payment:read")),
+):
+    """All payment receipts in scope, newest first.
+
+    One request replaces N per-bill ``/{bill_id}/payments`` calls for
+    ledger-style screens. Defined before ``/{bill_id}`` so the static path
+    is never swallowed by the wildcard.
+    """
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = day_query(date_from)
+        if date_to:
+            date_filter["$lte"] = day_query_end(date_to)
+        query["payment_date"] = date_filter
+
+    cursor = payments_collection.find(query).sort("payment_date", -1).skip(skip).limit(limit)
+    results = []
+    async for doc in cursor:
+        try:
+            serialized = _serialize_payment(doc)
+            results.append(await attach_verification_to("payment", doc["_id"], serialized))
+        except HTTPException:
+            pass
+    return results
+
+
 @router.get("/{bill_id}", response_model=BillModel)
 async def get_bill(
     bill_id: str,
