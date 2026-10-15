@@ -15,11 +15,14 @@ def _now():
 
 
 def _auth_user(name="Alice"):
-    return {"auth_id": f"u-{name}", "user_name": name, "role": "ADMIN"}
+    from conftest import tenant_user
+
+    return tenant_user(f"u-{name}")
 
 
 def _gp_doc(number: str, client: str, receiving_date: str) -> dict:
     return {
+        "laundry_id": "acme",
         "gate_pass_number": number,
         "client_name": client,
         "client_name_search": get_search_token(client),
@@ -40,6 +43,7 @@ async def _store_gp(mocked_db, number: str, client: str, receiving_date: str) ->
 
 def _bill_doc(client: str, **extra) -> dict:
     doc = {
+        "laundry_id": "acme",
         "gate_pass_id": None,
         "client_name": client,
         "client_name_search": get_search_token(client),
@@ -65,6 +69,7 @@ async def _store_bill(mocked_db, client: str, **extra) -> str:
 
 async def _store_payment(mocked_db, bill_id: str, client: str, amount: float, payment_date) -> str:
     doc = {
+        "laundry_id": "acme",
         "bill_id": bill_id,
         "client_name": client,
         "client_name_search": get_search_token(client),

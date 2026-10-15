@@ -43,10 +43,10 @@ async def test_report_uses_active_gate_passes_and_separates_draft_cancelled(mock
         end_date=date(2026, 10, 31),
     )
 
-    defaulted = await operational_reports.monthly_operations_report(payload, {"role": "MANAGER"})
+    defaulted = await operational_reports.monthly_operations_report(payload, current_user={"role": "MANAGER", "laundry_id": "lovelaundry", "laundries": [{"id": "lovelaundry", "role": "MANAGER", "status": "ACTIVE"}]})
     explicitly_unpriced = await operational_reports.monthly_operations_report(
         payload.model_copy(update={"selected_quotations": {"Sunrise Hotel": None}}),
-        {"role": "MANAGER"},
+        current_user={"role": "MANAGER", "laundry_id": "lovelaundry", "laundries": [{"id": "lovelaundry", "role": "MANAGER", "status": "ACTIVE"}]},
     )
 
     assert defaulted["total_income"] == 100.0
@@ -76,7 +76,7 @@ async def test_report_defaults_to_latest_hotel_quotation(mocked_db, monkeypatch)
             start_date=date(2026, 9, 1),
             end_date=date(2026, 10, 31),
         ),
-        {"role": "MANAGER"},
+        current_user={"role": "MANAGER", "laundry_id": "lovelaundry", "laundries": [{"id": "lovelaundry", "role": "MANAGER", "status": "ACTIVE"}]},
     )
 
     assert ("new-quote",) in [call.args for call in quote_prices.await_args_list]
@@ -108,7 +108,7 @@ async def test_postgresql_style_quote_id_uses_selected_quotation_snapshot(mocked
                 },
             },
         ),
-        {"role": "MANAGER"},
+        current_user={"role": "MANAGER", "laundry_id": "lovelaundry", "laundries": [{"id": "lovelaundry", "role": "MANAGER", "status": "ACTIVE"}]},
     )
 
     assert report["total_income"] == 100.0
@@ -223,7 +223,7 @@ async def test_report_decrypts_encrypted_gate_passes(mocked_db, monkeypatch):
             start_date=date(2026, 10, 1),
             end_date=date(2026, 10, 31),
         ),
-        {"role": "MANAGER"},
+        current_user={"role": "MANAGER", "laundry_id": "lovelaundry", "laundries": [{"id": "lovelaundry", "role": "MANAGER", "status": "ACTIVE"}]},
     )
 
     assert report["total_income"] == 100.0
@@ -249,6 +249,7 @@ async def test_gate_pass_creation_persists_quotation_price_snapshot(mocked_db, m
             )],
         ),
         {"auth_id": "admin-1", "user_name": "Admin"},
+        laundry_id="lovelaundry",
     )
     stored = await mocked_db["gatepasses_collection"].find_one({"gate_pass_number": "GP-20261001-9001"})
 

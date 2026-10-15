@@ -187,6 +187,72 @@ async def clean_db(mocked_db):
     yield
 
 
-def auth_user(name: str = "Alice", role: str = "ADMIN") -> dict:
-    """A realistic current-user dict as FastAPI dependencies receive."""
-    return {"auth_id": f"u-{name}", "user_name": name, "role": role}
+def auth_user(name: str = "Alice", role: str = "ADMIN", laundry_id: str = "lovelaundry") -> dict:
+    """A realistic current-user dict as FastAPI dependencies receive.
+
+    Defaults to the LoveLaundry tenant, exercising the transitional path
+    production takes during migration (mixed stamped/unstamped documents).
+    Strict per-laundry paths are covered by test_tenant_isolation.py and
+    test_list_safety.py with stamped fixtures.
+    """
+    return {
+        "auth_id": f"u-{name}",
+        "user_name": name,
+        "role": role,
+        "laundry_id": laundry_id,
+        "laundries": [{"id": laundry_id, "role": role, "status": "ACTIVE"}],
+    }
+
+# ── Tenant test helpers (single-tenant suites run inside one laundry) ──
+"""Shared fixtures for tenant isolation: every test acts as a laundry member.
+
+Single-tenant suites keep working by operating inside one laundry ("acme");
+cross-tenant suites use a second laundry ("other") to prove denial.
+"""
+from datetime import datetime, timezone
+
+LAUNDRY_A = "acme"
+LAUNDRY_B = "other"
+
+TENANT_COLLECTIONS = (
+    "gatepasses_collection",
+    "deliveries_collection",
+    "bills_collection",
+    "payments_collection",
+    "shop_bills_collection",
+    "returns_collection",
+    "adjustments_collection",
+    "monthly_entries_collection",
+    "rewashes_collection",
+    "linens_collection",
+    "linen_events_collection",
+    "dispatch_jobs_collection",
+    "loyalty_accounts_collection",
+)
+
+
+def tenant_user(auth_id="tester", laundry_id=LAUNDRY_A, role="ADMIN"):
+    """Authenticated session scoped to one ACTIVE laundry."""
+    return {
+        "auth_id": auth_id,
+        "user_name": auth_id,
+        "role": role,
+        "laundry_id": laundry_id,
+        "laundries": [{"id": laundry_id, "role": role, "status": "ACTIVE"}],
+    }
+
+
+async def stamp_laundry(mocked_db, laundry_id=LAUNDRY_A):
+    """Attribute pre-tenancy fixture documents to one laundry (migration)."""
+    for name in TENANT_COLLECTIONS:
+        try:
+            await mocked_db[name].update_many(
+                {"laundry_id": {"$exists": False}},
+                {"$set": {"laundry_id": laundry_id}},
+            )
+        except Exception:
+            pass
+
+
+def now():
+    return datetime.now(timezone.utc)

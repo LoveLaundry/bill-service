@@ -46,7 +46,9 @@ def _req(headers=None):
 
 
 def user(name="Alice"):
-    return {"auth_id": f"u-{name}", "user_name": name, "role": "ADMIN"}
+    from conftest import tenant_user
+
+    return tenant_user(f"u-{name}", "lovelaundry")
 
 
 async def put(kind, quantities, client=CLIENT, year=Y, month=MO, day=1):

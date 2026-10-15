@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth_helper import require_capability
+from ..tenancy import LOVE_LAUNDRY_ID, assert_same_laundry, laundry_match, resolve_laundry_id, scoped_query
 from ..database.main_db import returns_collection, gatepasses_collection, deliveries_collection
 from ..models import ReturnCreate, ReturnUpdate, RETURN_STATUSES
 from ..router_utils import parse_object_id, log_audit
@@ -66,10 +67,13 @@ async def _validate_return_relationships_and_quantity(
     items: list[dict],
     delivery_id: Optional[str] = None,
     exclude_return_id: Optional[str] = None,
+    laundry_id: Optional[str] = None,
 ) -> None:
     """Check return links and quantities against active canonical movements."""
     gp_oid = parse_object_id(gate_pass_id, "Gate Pass ID")
     gp_raw = await gatepasses_collection.find_one({"_id": gp_oid})
+    if laundry_id:
+        assert_same_laundry(gp_raw, laundry_id, "Gate pass")
     if not gp_raw:
         raise HTTPException(status_code=404, detail="Gate pass not found")
     gp = _decrypted(gp_raw)
@@ -85,6 +89,8 @@ async def _validate_return_relationships_and_quantity(
     if delivery_id:
         dl_oid = parse_object_id(delivery_id, "Delivery ID")
         dl_raw = await deliveries_collection.find_one({"_id": dl_oid})
+        if laundry_id:
+            assert_same_laundry(dl_raw, laundry_id, "Delivery")
         if not dl_raw:
             raise HTTPException(status_code=404, detail="Delivery not found")
         selected_delivery = _decrypted(dl_raw)
@@ -167,6 +173,22 @@ async def _validate_return_relationships_and_quantity(
                 )
 
 
+async def _owned_return(return_id: str, current_user: dict):
+    """Fetch a return iff it belongs to the caller's laundry (404 otherwise)."""
+    laundry_id = resolve_laundry_id(current_user)
+    raw_doc = await returns_collection.find_one({"return_id": return_id})
+    assert_same_laundry(raw_doc, laundry_id, "Return")
+    if not raw_doc:
+        raise HTTPException(status_code=404, detail="Return not found")
+    return laundry_id, raw_doc
+
+
+def _return_write_filter(return_id: str, laundry_id: str) -> dict:
+    filt: dict = {"return_id": return_id}
+    filt.update(laundry_match(laundry_id))
+    return filt
+
+
 async def _refresh_return_gate_pass_status(gate_pass_id: str) -> None:
     await ops.refresh_gate_pass_statuses([gate_pass_id])
 
@@ -179,6 +201,7 @@ async def create_return(
     """Record a garment return from a client."""
     now = datetime.now(timezone.utc)
     return_id = _generate_return_id()
+    laundry_id = resolve_laundry_id(current_user)
 
     items_data = [item.model_dump() for item in payload.items]
     await _validate_return_relationships_and_quantity(
@@ -186,9 +209,11 @@ async def create_return(
         client_name=payload.client_name,
         items=items_data,
         delivery_id=payload.delivery_id,
+        laundry_id=laundry_id,
     )
 
     doc = {
+        "laundry_id": laundry_id,
         "return_id": return_id,
         "gate_pass_id": payload.gate_pass_id,
         "delivery_id": payload.delivery_id,
@@ -253,8 +278,8 @@ async def list_returns(
     if gate_pass_id:
         query["gate_pass_id"] = gate_pass_id
 
-    total = await returns_collection.count_documents(query)
-    cursor = returns_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    total = await returns_collection.count_documents(scoped_query(query, resolve_laundry_id(current_user)))
+    cursor = returns_collection.find(scoped_query(query, resolve_laundry_id(current_user))).sort("created_at", -1).skip(skip).limit(limit)
     items = []
     async for doc in cursor:
         items.append(_dec(doc))
@@ -272,7 +297,7 @@ async def pending_resent_items(
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 
-    cursor = returns_collection.find(query).sort("created_at", -1)
+    cursor = returns_collection.find(scoped_query(query, resolve_laundry_id(current_user))).sort("created_at", -1)
     results = []
     async for doc in cursor:
         try:
@@ -300,10 +325,11 @@ async def returns_summary(
     current_user: dict = Depends(require_capability("dashboard:read")),
 ):
     """Return stats summary for dashboard."""
-    total = await returns_collection.count_documents({})
-    pending = await returns_collection.count_documents({"status": "PENDING"})
-    received = await returns_collection.count_documents({"status": "RECEIVED"})
-    processed = await returns_collection.count_documents({"status": "PROCESSED"})
+    laundry_id = resolve_laundry_id(current_user)
+    total = await returns_collection.count_documents(scoped_query({}, laundry_id))
+    pending = await returns_collection.count_documents(scoped_query({"status": "PENDING"}, laundry_id))
+    received = await returns_collection.count_documents(scoped_query({"status": "RECEIVED"}, laundry_id))
+    processed = await returns_collection.count_documents(scoped_query({"status": "PROCESSED"}, laundry_id))
     return {
         "total": total,
         "pending": pending,
@@ -318,9 +344,7 @@ async def get_return(
     current_user: dict = Depends(require_capability("gatepass:read")),
 ):
     """Get a single return by return_id."""
-    raw_doc = await returns_collection.find_one({"return_id": return_id})
-    if not raw_doc:
-        raise HTTPException(status_code=404, detail="Return not found")
+    _, raw_doc = await _owned_return(return_id, current_user)
     return _dec(raw_doc)
 
 
@@ -331,9 +355,7 @@ async def update_return(
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     """Update a return record (status, items, adjustment)."""
-    raw_doc = await returns_collection.find_one({"return_id": return_id})
-    if not raw_doc:
-        raise HTTPException(status_code=404, detail="Return not found")
+    laundry_id, raw_doc = await _owned_return(return_id, current_user)
 
     doc = _dec(raw_doc)
 
@@ -365,9 +387,10 @@ async def update_return(
         items=merged.get("items", []),
         delivery_id=merged.get("delivery_id"),
         exclude_return_id=return_id,
+        laundry_id=laundry_id,
     )
     encrypted = encrypt_dict(merged, SENSITIVE_FIELDS)
-    await returns_collection.update_one({"return_id": return_id}, {"$set": encrypted})
+    await returns_collection.update_one(_return_write_filter(return_id, laundry_id), {"$set": encrypted})
 
     await log_audit(
         current_user.get("user_name", ""),
@@ -401,9 +424,7 @@ async def mark_item_resent(
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     """Mark a returned item as re-sent to client."""
-    raw_doc = await returns_collection.find_one({"return_id": return_id})
-    if not raw_doc:
-        raise HTTPException(status_code=404, detail="Return not found")
+    laundry_id, raw_doc = await _owned_return(return_id, current_user)
 
     doc = _dec(raw_doc)
     await _validate_return_relationships_and_quantity(
@@ -412,6 +433,7 @@ async def mark_item_resent(
         items=doc.get("items", []),
         delivery_id=doc.get("delivery_id"),
         exclude_return_id=return_id,
+        laundry_id=laundry_id,
     )
 
     now = datetime.now(timezone.utc)
@@ -437,7 +459,7 @@ async def mark_item_resent(
     merged["updated_at"] = now
     encrypted = encrypt_dict(merged, SENSITIVE_FIELDS)
     await returns_collection.update_one(
-        {"return_id": return_id},
+        _return_write_filter(return_id, laundry_id),
         {"$set": encrypted},
     )
 

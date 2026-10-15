@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from bill_service.crypto_helper import decrypt_dict, encrypt_dict
 from bill_service.models import PaymentCreate
 from bill_service.routers import bills
+from conftest import tenant_user
 
 BILL_SENSITIVE_FIELDS = ["client_name", "quotation_title", "notes", "items"]
 PAYMENT_SENSITIVE_FIELDS = ["client_name", "notes"]
@@ -60,7 +61,7 @@ async def _post_payment(bill_id, amount):
     return await bills.create_payment(
         bill_id,
         _payment(amount),
-        current_user={"auth_id": "payment-test-user", "user_name": "Tester"},
+        current_user=tenant_user("payment-test-user", "lovelaundry"),
         request=_request(),
     )
 

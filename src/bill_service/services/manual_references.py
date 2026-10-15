@@ -32,15 +32,23 @@ def normalize_reference(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
+def _hotel_scope(scope_key: str) -> str:
+    """Scope key without our ``|laundry:`` suffix (ours always trails)."""
+    return re.sub(r"\|laundry:[a-z0-9-]+$", "", scope_key or "")
+
+
 async def _existing_document_reference(
     value: str,
     *,
     client_name: str | None = None,
+    laundry_id: str | None = None,
 ) -> bool:
     """Check whether *value* already exists in any live document.
 
-    For bill-number fields the check is scoped to ``client_name`` (same hotel).
-    All other reference fields are checked globally.
+    For bill-number fields the check is scoped to ``client_name`` (same hotel)
+    and, when provided, ``laundry_id`` (same laundry). All other reference
+    fields are checked globally: gate-pass and ALRS numbers stay unique
+    across laundries by design.
     """
     parts = value.split()
     pattern = r"^\s*" + r"\s+".join(re.escape(part) for part in parts) + r"\s*$"
@@ -58,7 +66,8 @@ async def _existing_document_reference(
         if await collection.find_one({field: {"$regex": pattern, "$options": "i"}}):
             return True
 
-    # Bill-number checks: scope to hotel when client_name is provided.
+    # Bill-number checks: scope to hotel when client_name is provided, and to
+    # laundry when laundry_id is provided.
     bill_number_checks = (
         (gatepasses_collection, "manual_bill_number"),
         (bills_collection, "manual_bill_number"),
@@ -68,6 +77,8 @@ async def _existing_document_reference(
         query: dict = {field: {"$regex": pattern, "$options": "i"}}
         if client_name:
             query["client_name_search"] = get_search_token(client_name)
+        if laundry_id:
+            query["laundry_id"] = laundry_id
         if await collection.find_one(query):
             return True
 
@@ -81,17 +92,20 @@ async def _find_conflicting_reservation(
     owner: str,
     *,
     client_name: str | None,
+    laundry_id: str | None = None,
 ):
     """Return an existing reservation that conflicts with a new claim.
 
     A reservation sharing the same normalized value conflicts unless:
 
-    * it is owned by the same ``owner`` (an update of our own claim), or
-    * both the new claim and the reservation are hotel-scoped bill numbers
-      for *different* hotels (same value, different ``scope_key``).
+    * it is owned by the same ``owner`` (an update of our own claim),
+    * both sides are hotel-scoped bill numbers for *different* hotels, or
+    * both sides carry a laundry and the laundries differ (tenant independence).
 
-    Note that an *unscoped* bill-number reservation (no ``client_name``) is
-    global and therefore still collides with any hotel-scoped claim.
+    Reservations predating laundry scoping carry no ``laundry_id`` and keep
+    the legacy behavior: they conflict unless the hotel-divergence rule
+    applies. Note that an *unscoped* bill-number reservation (no
+    ``client_name``) is global and therefore still collides.
     """
     async for reservation in manual_references_collection.find(
         {"normalized": normalized}
@@ -100,18 +114,26 @@ async def _find_conflicting_reservation(
             continue
         if reservation.get("scope_key") == scope:
             return reservation
-        existing_is_hotel_scoped = (
-            reservation.get("scope_key") != normalized
-            and bool(reservation.get("client_name_search"))
-        )
         if (
             field in HOTEL_SCOPED_FIELDS
             and reservation.get("reference_type") in HOTEL_SCOPED_FIELDS
             and client_name
-            and existing_is_hotel_scoped
+            and reservation.get("scope_key") != normalized
+            and bool(reservation.get("client_name_search"))
         ):
-            # Same value is allowed for a different hotel's bill number.
-            continue
+            # Both sides are hotel-scoped bill numbers with different scope
+            # keys. Compare hotel scopes ignoring the laundry suffix: a
+            # difference means a different hotel (or a different laundry, or
+            # both) and therefore independence. An equal hotel scope conflicts
+            # unless both sides provably belong to different laundries —
+            # legacy reservations without a laundry stamp stay conservative
+            # and conflict.
+            if _hotel_scope(reservation.get("scope_key")) != _hotel_scope(scope):
+                continue
+            existing_laundry = reservation.get("laundry_id")
+            if laundry_id and existing_laundry and existing_laundry != laundry_id:
+                continue
+            return reservation
         return reservation
     return None
 
@@ -121,6 +143,7 @@ async def reserve_references(
     references: dict[str, str | None],
     *,
     client_name: str | None = None,
+    laundry_id: str | None = None,
 ) -> None:
     """Claim reference values for *owner*, raising ``ValueError`` on conflict.
 
@@ -133,6 +156,10 @@ async def reserve_references(
     client_name:
         The hotel/client the reservation belongs to.  Required for
         bill-number reservations so that uniqueness is scoped per hotel.
+    laundry_id:
+        The laundry the reservation belongs to. Hotel-scoped bill numbers
+        additionally scope per laundry, so identical hotels in different
+        laundries never collide.
     """
     values: dict[str, str] = {}
     for field in REFERENCE_FIELDS:
@@ -149,10 +176,14 @@ async def reserve_references(
 
     # Choose the scope key used inside manual_references_collection.
     # For hotel-scoped fields, include the hotel token so the same
-    # normalized value can coexist for different hotels.
+    # normalized value can coexist for different hotels, plus the laundry so
+    # identical hotels in different laundries never collide.
     def _scope_key(normalized: str, field: str) -> str:
         if field in HOTEL_SCOPED_FIELDS and client_name:
-            return f"{normalized}|hotel:{get_search_token(client_name)}"
+            scope = f"{normalized}|hotel:{get_search_token(client_name)}"
+            if laundry_id:
+                scope += f"|laundry:{laundry_id}"
+            return scope
         return normalized
 
     for normalized, field in values.items():
@@ -163,6 +194,7 @@ async def reserve_references(
             scope,
             owner,
             client_name=client_name,
+            laundry_id=laundry_id,
         )
         if reservation:
             raise ValueError(
@@ -172,6 +204,7 @@ async def reserve_references(
         if await _existing_document_reference(
             references[field],
             client_name=client_name if field in HOTEL_SCOPED_FIELDS else None,
+            laundry_id=laundry_id if field in HOTEL_SCOPED_FIELDS else None,
         ):
             raise ValueError(
                 f"'{references[field]}' is already used by another document."
@@ -200,6 +233,7 @@ async def reserve_references(
                             if field in HOTEL_SCOPED_FIELDS and client_name
                             else None
                         ),
+                        "laundry_id": laundry_id,
                     }
                 },
                 upsert=True,
@@ -232,6 +266,7 @@ async def release_references(
     references: dict[str, str | None],
     *,
     client_name: str | None = None,
+    laundry_id: str | None = None,
 ) -> None:
     normalized_list = [
         normalize_reference(value.strip())
@@ -248,7 +283,10 @@ async def release_references(
             continue
         norm = normalize_reference(value.strip())
         if field in HOTEL_SCOPED_FIELDS and client_name:
-            scope_keys.append(f"{norm}|hotel:{get_search_token(client_name)}")
+            scope = f"{norm}|hotel:{get_search_token(client_name)}"
+            if laundry_id:
+                scope += f"|laundry:{laundry_id}"
+            scope_keys.append(scope)
         else:
             scope_keys.append(norm)  # legacy entries without scope_key also covered below
 

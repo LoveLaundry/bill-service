@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ..crypto_helper import decrypt_dict, encrypt_dict
+from ..tenancy import laundry_match
 from ..database.main_db import audit_collection, bills_collection, deliveries_collection
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services.transaction_events import (
@@ -161,6 +162,7 @@ async def sync_bills_to_gate_pass(
     user_id: str = "system",
     user_name: Optional[str] = None,
     reason: Optional[str] = None,
+    laundry_id: Optional[str] = None,
 ) -> list[dict]:
     """Clamp every linked, editable bill to the corrected received quantities.
 
@@ -170,18 +172,29 @@ async def sync_bills_to_gate_pass(
     received = _snapshot_received(gp_items)
     outcomes = []
 
+    delivery_query: dict = {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
+    if laundry_id:
+        delivery_query.update(laundry_match(laundry_id))
     delivery_ids = []
-    async for d in deliveries_collection.find(
-        {"gate_pass_id": gate_pass_id, "status": {"$ne": "CANCELLED"}}
-    ):
+    async for d in deliveries_collection.find(delivery_query):
         delivery_ids.append(str(d["_id"]))
 
     billed_filter: dict = {
         "payment_status": {"$ne": "CANCELLED"},
-        "$or": [{"gate_pass_id": gate_pass_id}],
     }
+    linkage = [{"gate_pass_id": gate_pass_id}]
     if delivery_ids:
-        billed_filter["$or"].append({"delivery_ids": {"$in": delivery_ids}})
+        linkage.append({"delivery_ids": {"$in": delivery_ids}})
+    if laundry_id:
+        match = laundry_match(laundry_id)
+        if "$or" in match:
+            # Transitional laundry $or must not overwrite the linkage $or.
+            billed_filter["$and"] = [{"$or": linkage}, match]
+        else:
+            billed_filter["$or"] = linkage
+            billed_filter.update(match)
+    else:
+        billed_filter["$or"] = linkage
 
     cursor = bills_collection.find(billed_filter)
     async for bill_doc in cursor:

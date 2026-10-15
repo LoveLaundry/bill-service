@@ -37,6 +37,7 @@ async def log_audit(
     entity_id: str,
     details: Optional[dict] = None,
     audit_collection=None,
+    laundry_id: Optional[str] = None,
 ):
     """Write an audit log entry."""
     if audit_collection is None:
@@ -51,4 +52,6 @@ async def log_audit(
         "details": details or {},
         "timestamp": datetime.now(timezone.utc),
     }
+    if laundry_id:
+        log_entry["laundry_id"] = laundry_id
     await audit_collection.insert_one(log_entry)
