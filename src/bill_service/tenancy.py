@@ -134,3 +134,8 @@ async def stamp_missing_laundry_ids(collections: Dict[str, Any], laundry_id: str
         )
         stamped[name] = result.modified_count
     return stamped
+
+
+def match_stage(laundry_id: str) -> dict:
+    """Aggregation $match stage restricting to one laundry's documents."""
+    return {"$match": laundry_match(laundry_id)}

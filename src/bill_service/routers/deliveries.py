@@ -134,7 +134,14 @@ def _client_mismatch_error(expected: str, actual: str) -> HTTPException:
     )
 
 
-async def log_audit(user_id: str, action: str, entity: str, entity_id: str, details: dict = None):
+async def log_audit(
+    user_id: str,
+    action: str,
+    entity: str,
+    entity_id: str,
+    details: dict = None,
+    laundry_id: str | None = None,
+):
     doc = {
         "user_id": user_id,
         "action": action,
@@ -144,6 +151,8 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str, deta
     }
     if details:
         doc["details"] = details
+    if laundry_id:
+        doc["laundry_id"] = laundry_id
     await audit_collection.insert_one(doc)
 
 
@@ -357,6 +366,7 @@ async def create_delivery(
             entity_type="delivery",
             entity_id=delivery_id,
             event_type=EVENT_DELIVERY_CREATED,
+            laundry_id=laundry_id,
             gate_pass_id=gp_id,
             user_id=auth_id,
             user_name=current_user.get("user_name"),
@@ -383,6 +393,7 @@ async def create_delivery(
         "delivery",
         delivery_id,
         {"source_gate_pass_ids": source_ids, "client_name": canonical_client},
+        laundry_id=laundry_id,
     )
     await idempotency.record_created(request, auth_id, "delivery", delivery_id)
     return serialized
@@ -505,6 +516,7 @@ async def activate_delivery(
         entity_type="delivery",
         entity_id=serialized["id"],
         event_type=EVENT_DELIVERY_ACTIVATED,
+        laundry_id=laundry_id,
         gate_pass_id=gp_id,
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -518,6 +530,7 @@ async def activate_delivery(
         "DELIVERY_ACTIVATE",
         "delivery",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -562,6 +575,7 @@ async def update_delivery_date(
         entity_type="delivery",
         entity_id=serialized["id"],
         event_type=EVENT_DELIVERY_DATE_CHANGED,
+        laundry_id=laundry_id,
         gate_pass_id=serialized.get("gate_pass_id"),
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -577,6 +591,7 @@ async def update_delivery_date(
         "DELIVERY_DATE_UPDATE",
         "delivery",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -833,6 +848,7 @@ async def correct_delivery_items(
             entity_type="delivery",
             entity_id=str(current.get("id")),
             event_type=EVENT_DELIVERY_CORRECTED,
+            laundry_id=laundry_id,
             gate_pass_id=gp_id,
             user_id=current_user.get("auth_id", "system"),
             user_name=current_user.get("user_name"),
@@ -858,6 +874,7 @@ async def correct_delivery_items(
         "delivery",
         str(current.get("id")),
         {"reason": payload.reason, "changes": correction_record["changes"]},
+        laundry_id=laundry_id,
     )
 
     updated = _serialize(await deliveries_collection.find_one({"_id": oid}))
@@ -909,6 +926,7 @@ async def cancel_delivery(
             entity_type="delivery",
             entity_id=str(current.get("id")),
             event_type=EVENT_DELIVERY_CANCELLED,
+            laundry_id=laundry_id,
             gate_pass_id=gp_id,
             user_id=current_user.get("auth_id", "system"),
             user_name=current_user.get("user_name"),
@@ -936,6 +954,7 @@ async def cancel_delivery(
         "delivery",
         str(current.get("id")),
         {"reason": payload.reason},
+        laundry_id=laundry_id,
     )
     updated = _serialize(await deliveries_collection.find_one({"_id": oid}))
     return await attach_verification_to("delivery", oid, updated)

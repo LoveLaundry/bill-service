@@ -180,14 +180,15 @@ async def _require_month_doc(
 # --------------------------------------------------------------------------
 # Item rows: quotation prices + per-client historical usage ordering
 # --------------------------------------------------------------------------
-async def _historical_usage(client_name: str) -> Dict[str, float]:
+async def _historical_usage(client_name: str, laundry_id: str | None = None) -> Dict[str, float]:
     """Sum of received_qty per item_key across the client's gate passes."""
     usage: Dict[str, float] = {}
+    base: dict = {
+        "client_name_search": get_search_token(client_name),
+        "status": {"$ne": "CANCELLED"},
+    }
     cursor = gatepasses_collection.find(
-        {
-            "client_name_search": get_search_token(client_name),
-            "status": {"$ne": "CANCELLED"},
-        }
+        scoped_query(base, laundry_id) if laundry_id else base
     )
     async for gp in cursor:
         try:
@@ -200,7 +201,9 @@ async def _historical_usage(client_name: str) -> Dict[str, float]:
     return usage
 
 
-async def _build_rows(client_name: str, quotation_id: Optional[str]) -> List[dict]:
+async def _build_rows(
+    client_name: str, quotation_id: Optional[str], laundry_id: str | None = None
+) -> List[dict]:
     """Rows = quotation line items (expanded by specification) + historical
     extras, ordered by usage desc, priced first, then name."""
     quotation = await _find_quotation(quotation_id)
@@ -232,7 +235,7 @@ async def _build_rows(client_name: str, quotation_id: Optional[str]) -> List[dic
                     "has_price": bool(base_price),
                 }
 
-    usage = await _historical_usage(client_name)
+    usage = await _historical_usage(client_name, laundry_id)
     for key in usage:
         if key in row_map:
             continue
@@ -342,10 +345,10 @@ def _cells_from_days(doc: Optional[dict]) -> Dict[str, Dict[str, float]]:
 
 
 async def _live_operations_summary(
-    client_name: str, year: int, month: int
+    client_name: str, year: int, month: int, laundry_id: str | None = None
 ) -> dict:
     """Return month activity plus the client's current live gate-pass balance."""
-    receiving_month = await _find_month_doc(client_name, "receiving", year, month)
+    receiving_month = await _find_month_doc(client_name, "receiving", year, month, laundry_id)
     receiving_days = (receiving_month or {}).get("days") or {}
     gate_pass_ids = list(
         dict.fromkeys(
@@ -356,8 +359,11 @@ async def _live_operations_summary(
     )
     month_gate_pass_ids = set(gate_pass_ids)
     all_gate_pass_ids = set(gate_pass_ids)
+    _gp_query: dict = {"client_name_search": get_search_token(client_name)}
+    if laundry_id:
+        _gp_query = scoped_query(_gp_query, laundry_id)
     async for gate_pass_doc in gatepasses_collection.find(
-        {"client_name_search": get_search_token(client_name)}
+        _gp_query
     ):
         all_gate_pass_ids.add(str(gate_pass_doc["_id"]))
     gate_passes = await ops_ctx.load_gate_passes(list(all_gate_pass_ids))
@@ -443,9 +449,10 @@ async def get_monthly_matrix(
             detail=f"Kind must be one of {', '.join(MONTHLY_KINDS)}.",
         )
     month_length = _parse_month_numbers(year, month)
-    doc = await _find_month_doc(client_name, kind, year, month)
+    laundry_id = resolve_laundry_id(current_user)
+    doc = await _find_month_doc(client_name, kind, year, month, laundry_id)
     effective_quotation = quotation_id or (doc or {}).get("quotation_id")
-    rows = await _build_rows(client_name, effective_quotation)
+    rows = await _build_rows(client_name, effective_quotation, laundry_id)
 
     return {
         "client_name": client_name,
@@ -458,7 +465,7 @@ async def get_monthly_matrix(
         "days": _day_states(doc, month_length),
         "cells": _cells_from_days(doc),
         "operations_summary": await _live_operations_summary(
-            client_name, year, month
+            client_name, year, month, laundry_id
         ),
     }
 
@@ -773,7 +780,7 @@ async def confirm_monthly_day(
     date_str = f"{year:04d}-{month:02d}-{day:02d}"
 
     quotation_id = payload.quotation_id or month_doc.get("quotation_id")
-    rows = await _build_rows(client_name, quotation_id)
+    rows = await _build_rows(client_name, quotation_id, laundry_id)
     row_lookup = _row_lookup(rows)
 
     user_name = current_user.get("user_name") or "system"
@@ -974,6 +981,7 @@ async def confirm_monthly_day(
                 entity_type="delivery",
                 entity_id=dl_id,
                 event_type=EVENT_MONTHLY_DAY_CONFIRMED,
+                laundry_id=laundry_id,
                 gate_pass_id=plan["gate_pass_id"],
                 user_id=auth_id,
                 user_name=user_name,
@@ -1040,6 +1048,7 @@ async def confirm_monthly_day(
             entity_type="rewash",
             entity_id=rw_id,
             event_type=EVENT_REWASH_RECORDED,
+            laundry_id=laundry_id,
             user_id=auth_id,
             user_name=user_name,
             item_deltas=[
@@ -1086,6 +1095,7 @@ async def confirm_monthly_day(
         entity_type="monthly",
         entity_id=str(month_oid),
         event_type=EVENT_MONTHLY_DAY_CONFIRMED,
+        laundry_id=laundry_id,
         user_id=auth_id,
         user_name=user_name,
         meta={"kind": kind, "year": year, "month": month, "day": day,
@@ -1296,9 +1306,9 @@ async def get_sync_status(
     _parse_month_numbers(year, month)
 
     # Find all monthly entries for this month
-    cursor = monthly_entries_collection.find({
+    cursor = monthly_entries_collection.find(scoped_query({
         "year": year, "month": month,
-    })
+    }, resolve_laundry_id(current_user)))
     # Group by client_name
     hotels: dict = {}
     async for raw in cursor:
@@ -1479,9 +1489,10 @@ async def get_monthly_print_data(
             detail=f"Kind must be one of {', '.join(MONTHLY_KINDS)}.",
         )
     month_length = _parse_month_numbers(year, month)
-    doc = await _find_month_doc(client_name, kind, year, month)
+    laundry_id = resolve_laundry_id(current_user)
+    doc = await _find_month_doc(client_name, kind, year, month, laundry_id)
     effective_quotation = quotation_id or (doc or {}).get("quotation_id")
-    rows = await _build_rows(client_name, effective_quotation)
+    rows = await _build_rows(client_name, effective_quotation, laundry_id)
 
     days = _day_states(doc, month_length)
     days = _strip_day_prefixes(days, include_prefix)
@@ -1497,6 +1508,6 @@ async def get_monthly_print_data(
         "days": days,
         "cells": _cells_from_days(doc),
         "operations_summary": await _live_operations_summary(
-            client_name, year, month
+            client_name, year, month, laundry_id
         ),
     }

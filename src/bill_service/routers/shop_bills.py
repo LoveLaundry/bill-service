@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from ..app_time import day_bounds, day_start, lkt, MONGO_TIME_ZONE, month_bounds, month_start, parse_day, this_month_number, this_year, today, week_start, year_bounds
 from ..auth_helper import require_capability
-from ..tenancy import resolve_laundry_id
+from ..tenancy import assert_same_laundry, laundry_match, match_stage, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -90,10 +90,23 @@ def _dec_template(doc: dict) -> dict:
     return decrypted
 
 
-async def _find_bill(bill_id: str) -> dict:
-    """Find a shop bill by id (ObjectId or string). Raises 404 if missing."""
+async def _owned_template(template_id: str, current_user: dict) -> tuple:
+    """Fetch a template iff it belongs to the caller's laundry."""
+    laundry_id = resolve_laundry_id(current_user)
+    raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
+    assert_same_laundry(raw, laundry_id, "Template")
+    if not raw:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return laundry_id, raw
+
+
+async def _find_bill(bill_id: str, laundry_id: str | None = None) -> dict:
+    """Find a shop bill by id (ObjectId or string). Raises 404 if missing
+    or (when a laundry is given) owned by another laundry."""
     oid = parse_object_id(bill_id, "Bill ID")
     doc = await shop_bills_collection.find_one({"_id": oid})
+    if laundry_id:
+        assert_same_laundry(doc, laundry_id, "Shop bill")
     if not doc:
         raise HTTPException(status_code=404, detail="Shop bill not found")
     return doc
@@ -277,10 +290,12 @@ def _dec_legacy(doc: dict) -> dict:
     return decrypted
 
 
-async def _find_legacy_invoice(invoice_id: str) -> dict:
-    """Find a legacy invoice by id. Raises 404 if missing."""
+async def _find_legacy_invoice(invoice_id: str, laundry_id: str | None = None) -> dict:
+    """Find a legacy invoice by id. Raises 404 if missing or foreign."""
     oid = parse_object_id(invoice_id, "Invoice ID")
     doc = await legacy_invoices_collection.find_one({"_id": oid})
+    if laundry_id:
+        assert_same_laundry(doc, laundry_id, "Legacy invoice")
     if not doc:
         raise HTTPException(status_code=404, detail="Legacy invoice not found")
     return doc
@@ -346,6 +361,7 @@ async def create_legacy_invoice(
 
     invoice_number = await _generate_legacy_invoice_number(now)
     doc = {
+        "laundry_id": resolve_laundry_id(current_user),
         "invoice_number": invoice_number,
         "shop_name": shop_name,
         "shop_name_search": get_search_token(shop_name),
@@ -399,6 +415,7 @@ async def list_legacy_invoices(
     if search:
         query["shop_name_search"] = {"$regex": get_search_token(search), "$options": "i"}
 
+    query = scoped_query(query, resolve_laundry_id(current_user))
     total = await legacy_invoices_collection.count_documents(query)
     items = []
     async for doc in (
@@ -416,7 +433,7 @@ async def get_legacy_invoice(
     invoice_id: str,
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    doc = await _find_legacy_invoice(invoice_id)
+    doc = await _find_legacy_invoice(invoice_id, resolve_laundry_id(current_user))
     return _dec_legacy(doc)
 
 
@@ -433,7 +450,7 @@ async def print_legacy_invoice_data(
     The ``invoice_number`` is always returned as-is. Each entry's
     ``bill_number`` is formatted according to ``include_prefix``.
     """
-    doc = await _find_legacy_invoice(invoice_id)
+    doc = await _find_legacy_invoice(invoice_id, resolve_laundry_id(current_user))
     result = _dec_legacy(doc)
     for entry in result.get("entries", []):
         if entry.get("bill_number"):
@@ -455,7 +472,7 @@ async def update_legacy_invoice(
     shop, description and bill entries are rewritten. A PAID invoice is a
     final record and is rejected here.
     """
-    raw = await _find_legacy_invoice(invoice_id)
+    raw = await _find_legacy_invoice(invoice_id, resolve_laundry_id(current_user))
     _require_editable_legacy(raw)
 
     shop_name = (payload.shop_name or "").strip()
@@ -504,7 +521,7 @@ async def mark_legacy_invoice_paid(
     current_user: dict = Depends(require_capability("bill:write")),
 ):
     """Mark a legacy invoice as PAID, freezing it against further edits."""
-    raw = await _find_legacy_invoice(invoice_id)
+    raw = await _find_legacy_invoice(invoice_id, resolve_laundry_id(current_user))
     if (raw.get("payment_status") or "PENDING") == "PAID":
         return _dec_legacy(raw)
 
@@ -535,7 +552,7 @@ async def delete_legacy_invoice(
     invoice_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_legacy_invoice(invoice_id)
+    raw = await _find_legacy_invoice(invoice_id, resolve_laundry_id(current_user))
     _require_editable_legacy(raw)
     # Bump before deleting: bump_version needs the document to still exist.
     new_version = await bump_version("legacy_invoice", raw["_id"])
@@ -660,6 +677,7 @@ async def list_bills(
     sort_field = sort_by if sort_by in ("created_at", "updated_at", "grand_total", "bill_number") else "created_at"
     direction = 1 if str(sort_order).lower() == "asc" else -1
 
+    query = scoped_query(query, resolve_laundry_id(current_user))
     total = await shop_bills_collection.count_documents(query)
     items = []
     async for doc in (
@@ -676,7 +694,7 @@ async def update_bill(
     payload: ShopBillUpdate,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
 
     if doc.get("locked"):
@@ -734,7 +752,7 @@ async def delete_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
 
     if doc.get("locked"):
@@ -764,7 +782,7 @@ async def change_status(
     if new_status not in SHOP_BILL_STATUSES:
         raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of {SHOP_BILL_STATUSES}")
 
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     now = datetime.now(timezone.utc)
 
@@ -792,7 +810,7 @@ async def lock_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     now = datetime.now(timezone.utc)
 
     await shop_bills_collection.update_one(
@@ -817,7 +835,7 @@ async def unlock_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     now = datetime.now(timezone.utc)
 
     await shop_bills_collection.update_one(
@@ -843,7 +861,7 @@ async def record_payment(
     payload: ShopBillPayment,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     now = datetime.now(timezone.utc)
 
@@ -902,7 +920,7 @@ async def split_bill(
     payload: ShopBillSplit,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
 
     if doc.get("locked"):
@@ -935,6 +953,7 @@ async def split_bill(
     new_bn = await _generate_bill_number()
 
     new_doc = {
+        "laundry_id": raw.get("laundry_id") or resolve_laundry_id(current_user),
         "bill_number": new_bn,
         "client_name": doc.get("client_name", ""),
         "client_name_search": _get_search_token(doc.get("client_name", "")),
@@ -985,7 +1004,7 @@ async def merge_bills(
     payload: ShopBillMerge,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     base = _dec(raw)
 
     if base.get("locked"):
@@ -998,7 +1017,7 @@ async def merge_bills(
     for other_id in payload.bill_ids:
         if other_id == bill_id:
             continue
-        other_raw = await _find_bill(other_id)
+        other_raw = await _find_bill(other_id, resolve_laundry_id(current_user))
         other_doc = _dec(other_raw)
 
         if other_doc.get("locked"):
@@ -1038,7 +1057,7 @@ async def duplicate_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    src = await _find_bill(bill_id)
+    src = await _find_bill(bill_id, resolve_laundry_id(current_user))
     src_doc = _dec(src)
     now = datetime.now(timezone.utc)
 
@@ -1048,6 +1067,7 @@ async def duplicate_bill(
     new_bn = await _generate_bill_number()
 
     doc = {
+        "laundry_id": src_doc.get("laundry_id") or resolve_laundry_id(current_user),
         "bill_number": new_bn,
         "client_name": src_doc.get("client_name", ""),
         "client_name_search": _get_search_token(src_doc.get("client_name", "")),
@@ -1101,7 +1121,7 @@ async def make_recurring(
     if interval not in RECURRING_INTERVALS:
         raise HTTPException(status_code=400, detail=f"Invalid interval. Must be one of {RECURRING_INTERVALS}")
 
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     now = datetime.now(timezone.utc)
 
@@ -1131,7 +1151,7 @@ async def cancel_recurring(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     now = datetime.now(timezone.utc)
 
@@ -1168,7 +1188,8 @@ async def get_recurring_due(
     }
 
     due = []
-    async for raw in shop_bills_collection.find({"is_recurring": True}):
+    laundry_id = resolve_laundry_id(current_user)
+    async for raw in shop_bills_collection.find(scoped_query({"is_recurring": True}, laundry_id)):
         doc = _dec(raw)
         end_date = doc.get("recurring_end_date")
         if end_date and isinstance(end_date, str):
@@ -1207,10 +1228,12 @@ async def quick_bill(
 ):
     now = datetime.now(timezone.utc)
     bn = await _generate_bill_number()
+    laundry_id = resolve_laundry_id(current_user)
 
     items = [dict(i) for i in (body.get("items", []) or [])]
     if not items and body.get("template_id"):
         tpl_raw = await bill_templates_collection.find_one({"_id": parse_object_id(body["template_id"], "Template ID")})
+        assert_same_laundry(tpl_raw, laundry_id, "Template")
         if tpl_raw:
             tpl = _dec_template(tpl_raw)
             items = [dict(i) for i in tpl.get("items", [])]
@@ -1220,6 +1243,7 @@ async def quick_bill(
     grand_total = totals["grand_total"]
 
     doc = {
+        "laundry_id": resolve_laundry_id(current_user),
         "bill_number": bn,
         "client_name": body.get("client_name", ""),
         "client_name_search": _get_search_token(body.get("client_name", "")),
@@ -1272,6 +1296,7 @@ async def manual_bill(
     bn = await _generate_bill_number()
 
     doc = _build_bill_doc(body, bn, now)
+    doc["laundry_id"] = resolve_laundry_id(current_user)
     doc["status"] = body.get("status", "PENDING")
     doc["payment_status"] = body.get("payment_status", "DRAFT")
     doc["client_name_search"] = _get_search_token(doc.get("client_name", ""))
@@ -1297,7 +1322,7 @@ async def update_notes(
     body: dict = Body(...),
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     now = datetime.now(timezone.utc)
     new_notes = body.get("notes", "")
@@ -1335,7 +1360,7 @@ async def get_notes_history(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    doc = await _find_bill(bill_id)
+    doc = await _find_bill(bill_id, resolve_laundry_id(current_user))
     dec = _dec(doc)
     return {"notes_history": dec.get("notes_history", [])}
 
@@ -1346,7 +1371,7 @@ async def add_tag(
     body: dict = Body(...),
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     now = datetime.now(timezone.utc)
     tag = body.get("tag", "").strip()
@@ -1376,7 +1401,7 @@ async def remove_tag(
     tag: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     now = datetime.now(timezone.utc)
 
@@ -1402,7 +1427,7 @@ async def add_item(
     body: dict = Body(...),
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     if doc.get("locked"):
         raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
@@ -1443,7 +1468,7 @@ async def remove_item(
     item_index: int,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     if doc.get("locked"):
         raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
@@ -1475,7 +1500,7 @@ async def remove_item(
 async def stats_overview(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    pipeline = [
+    pipeline = [match_stage(resolve_laundry_id(current_user)),
         {
             "$group": {
                 "_id": None,
@@ -1507,7 +1532,7 @@ async def stats_by_status(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     result = []
-    async for doc in shop_bills_collection.aggregate([{"$group": {"_id": "$status", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}}]):
+    async for doc in shop_bills_collection.aggregate([match_stage(resolve_laundry_id(current_user)), {"$group": {"_id": "$status", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}}]):
         result.append({"status": doc["_id"], "count": doc["count"], "total": round(doc["total"], 2)})
     return {"items": result, "counts": result}
 
@@ -1519,7 +1544,7 @@ async def stats_by_client(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     result = []
-    pipeline = [
+    pipeline = [match_stage(resolve_laundry_id(current_user)),
         {"$group": {"_id": "$client_name_search", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}, "paid": {"$sum": "$paid_amount"}}},
         {"$sort": {"total": -1}},
         {"$skip": skip},
@@ -1539,7 +1564,7 @@ async def stats_by_client(
 async def stats_revenue(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    pipeline = [
+    pipeline = [match_stage(resolve_laundry_id(current_user)),
         {
             "$group": {
                 "_id": {
@@ -1570,7 +1595,7 @@ async def stats_revenue(
 async def payment_summary(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    pipeline = [
+    pipeline = [match_stage(resolve_laundry_id(current_user)),
         {"$group": {"_id": "$payment_status", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}, "paid": {"$sum": "$paid_amount"}}}
     ]
     result = []
@@ -1590,7 +1615,7 @@ async def export_csv(
     status_filter: Optional[str] = Query(None, alias="status"),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    query = {"status": status_filter} if status_filter else {}
+    query = scoped_query({"status": status_filter} if status_filter else {}, resolve_laundry_id(current_user))
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Bill Number", "Client", "Status", "Payment Status", "Grand Total", "Paid", "Outstanding", "Created At"])
@@ -1625,9 +1650,14 @@ async def export_csv_selected(
     writer = csv.writer(output)
     writer.writerow(["Bill Number", "Client", "Status", "Payment Status", "Grand Total", "Paid", "Outstanding"])
 
+    _export_laundry = resolve_laundry_id(current_user)
     for bid in body.get("bill_ids", []):
         raw = await shop_bills_collection.find_one({"_id": parse_object_id(bid, "Bill ID")})
         if raw:
+            try:
+                assert_same_laundry(raw, _export_laundry, "Shop bill")
+            except HTTPException:
+                continue
             d = _dec(raw)
             writer.writerow([
                 d.get("bill_number"),
@@ -1653,7 +1683,7 @@ async def list_overdue(
     limit: int = Query(50, ge=1, le=200),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    query = {"payment_status": {"$in": ["PENDING", "PARTIALLY_PAID", "OVERDUE"]}, "outstanding_amount": {"$gt": 0}}
+    query = scoped_query({"payment_status": {"$in": ["PENDING", "PARTIALLY_PAID", "OVERDUE"]}, "outstanding_amount": {"$gt": 0}}, resolve_laundry_id(current_user))
     total = await shop_bills_collection.count_documents(query)
     items = []
     async for doc in shop_bills_collection.find(query).sort("created_at", -1).skip(skip).limit(limit):
@@ -1672,9 +1702,14 @@ async def bulk_status(
     now = datetime.now(timezone.utc)
     updated = 0
 
+    laundry_id = resolve_laundry_id(current_user)
     for bid in payload.bill_ids:
         raw = await shop_bills_collection.find_one({"_id": parse_object_id(bid, "Bill ID")})
         if not raw:
+            continue
+        try:
+            assert_same_laundry(raw, laundry_id, "Shop bill")
+        except HTTPException:
             continue
         doc = _dec(raw)
         if doc.get("locked"):
@@ -1707,10 +1742,19 @@ async def bulk_delete(
     bill_ids = body.get("bill_ids", [])
     now = datetime.now(timezone.utc)
     deleted = 0
+    laundry_id = resolve_laundry_id(current_user)
 
     for bid in bill_ids:
         raw = await shop_bills_collection.find_one({"_id": parse_object_id(bid, "Bill ID")})
         if not raw:
+            continue
+        try:
+            assert_same_laundry(raw, _bulk_laundry, "Shop bill")
+        except HTTPException:
+            continue
+        try:
+            assert_same_laundry(raw, laundry_id, "Shop bill")
+        except HTTPException:
             continue
         doc = _dec(raw)
         if doc.get("locked"):
@@ -1736,7 +1780,7 @@ async def mark_delivered(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     now = datetime.now(timezone.utc)
 
@@ -1766,7 +1810,7 @@ async def search_clients(
 ):
     needle = q.strip().lower()
     found: dict = {}
-    async for raw in shop_bills_collection.find({}).sort("created_at", -1).limit(500):
+    async for raw in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))).sort("created_at", -1).limit(500):
         d = _dec(raw)
         name = (d.get("client_name") or "").strip()
         if needle and needle in name.lower():
@@ -1789,7 +1833,7 @@ async def bills_by_client(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     token = _get_search_token(client_name)
-    query = {"client_name_search": token}
+    query = scoped_query({"client_name_search": token}, resolve_laundry_id(current_user))
     total = await shop_bills_collection.count_documents(query)
     items = []
     async for doc in shop_bills_collection.find(query).sort("created_at", -1).skip(skip).limit(limit):
@@ -1808,7 +1852,7 @@ async def client_statement(
     total_paid = 0.0
     bills = []
 
-    async for doc in shop_bills_collection.find({"client_name_search": token}).sort("created_at", -1):
+    async for doc in shop_bills_collection.find(scoped_query({"client_name_search": token}, resolve_laundry_id(current_user))).sort("created_at", -1):
         d = _dec(doc)
         total_bills += 1
         total_revenue += d.get("grand_total", 0)
@@ -1831,6 +1875,8 @@ async def audit_trail(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     logs = []
+    # Ownership gate first: a foreign bill id must 404, never leak its trail.
+    await _find_bill(bill_id, resolve_laundry_id(current_user))
     async for doc in audit_collection.find({"entity_id": bill_id}).sort("timestamp", -1).limit(100):
         doc["id"] = str(doc.pop("_id", ""))
         logs.append(doc)
@@ -1858,7 +1904,7 @@ async def advanced_search(
             query[f] = filters[f]
 
     items = []
-    async for doc in shop_bills_collection.find(query).sort("created_at", -1).limit(_bounded_limit(body)):
+    async for doc in shop_bills_collection.find(scoped_query(query, resolve_laundry_id(current_user))).sort("created_at", -1).limit(_bounded_limit(body)):
         items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
@@ -1869,7 +1915,7 @@ async def recent_activity(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     items = []
-    async for doc in shop_bills_collection.find().sort("updated_at", -1).limit(limit):
+    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))).sort("updated_at", -1).limit(limit):
         d = _dec(doc)
         items.append({
             "id": d.get("id"),
@@ -1901,7 +1947,7 @@ async def dashboard_summary(
     today_count = today_revenue = 0.0
     week_count = week_revenue = 0.0
     month_count = month_revenue = 0.0
-    async for doc in shop_bills_collection.find({}):
+    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))):
         d = _dec(doc)
         gt = d.get("grand_total", 0) or 0
         total_revenue += gt
@@ -1956,7 +2002,7 @@ async def dashboard_summary(
 
 @router.patch("/{bill_id}/transport-fee")
 async def update_transport_fee(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw)
     if doc.get("locked"): raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
     now = datetime.now(timezone.utc); new_fee = body.get("transport_fee", 0)
     totals = _calc_totals(doc.get("items", []), doc.get("discounts", 0), new_fee, doc.get("taxes", 0))
@@ -1968,7 +2014,7 @@ async def update_transport_fee(bill_id: str, body: dict = Body(...), current_use
 
 @router.patch("/{bill_id}/taxes")
 async def update_taxes(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw)
     if doc.get("locked"): raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
     now = datetime.now(timezone.utc); new_taxes = body.get("taxes", 0)
     totals = _calc_totals(doc.get("items", []), doc.get("discounts", 0), doc.get("transport_fee", 0), new_taxes)
@@ -1980,7 +2026,7 @@ async def update_taxes(bill_id: str, body: dict = Body(...), current_user: dict 
 
 @router.patch("/{bill_id}/items/{item_index}")
 async def update_item(bill_id: str, item_index: int, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw)
     if doc.get("locked"): raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
     items = doc.get("items", [])
     if item_index < 0 or item_index >= len(items): raise HTTPException(status_code=400, detail="Invalid item index")
@@ -1997,7 +2043,7 @@ async def update_item(bill_id: str, item_index: int, body: dict = Body(...), cur
 
 @router.patch("/{bill_id}/items/reorder")
 async def reorder_items(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw)
     if doc.get("locked"): raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
     items = doc.get("items", []); order = body.get("order", [])
     if len(order) != len(items): raise HTTPException(status_code=400, detail="Order must match items")
@@ -2012,7 +2058,7 @@ async def reorder_items(bill_id: str, body: dict = Body(...), current_user: dict
 
 @router.patch("/{bill_id}/link-quotation")
 async def link_quotation(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     merged["quotation_id"] = body.get("quotation_id"); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
@@ -2021,7 +2067,7 @@ async def link_quotation(bill_id: str, body: dict = Body(...), current_user: dic
 
 @router.delete("/{bill_id}/link-quotation")
 async def unlink_quotation(bill_id: str, current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     merged["quotation_id"] = None; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
@@ -2030,6 +2076,7 @@ async def unlink_quotation(bill_id: str, current_user: dict = Depends(require_ca
 
 @router.post("/bulk-status-notes")
 async def bulk_status_notes(body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
+    _bulk_laundry = resolve_laundry_id(current_user)
     bill_ids, status_val, notes = body.get("bill_ids", []), body.get("status"), body.get("notes", "")
     if not bill_ids or not status_val: raise HTTPException(status_code=400, detail="bill_ids and status required")
     if status_val not in SHOP_BILL_STATUSES: raise HTTPException(status_code=400, detail=f"Invalid status: {status_val}")
@@ -2050,10 +2097,10 @@ async def bulk_status_notes(body: dict = Body(...), current_user: dict = Depends
 
 @router.post("/{bill_id}/duplicate-options")
 async def dup_opts(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); src = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); src = _dec(raw); now = datetime.now(timezone.utc)
     items = [i.copy() for i in src.get("items", [])] if body.get("keep_items", True) else []
     bn = await _generate_bill_number(); gt = sum(i.get("line_total", 0) for i in items)
-    doc = {"bill_number": bn, "client_name": body.get("client_name", src.get("client_name")), "quotation_id": src.get("quotation_id"), "items": items, "total_quantity": sum(i.get("quantity", 0) for i in items), "total_amount": gt, "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": gt, "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": gt, "notes": None, "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": src["id"], "created_at": now, "updated_at": now}
+    doc = {"laundry_id": src.get("laundry_id") or resolve_laundry_id(current_user), "bill_number": bn, "client_name": body.get("client_name", src.get("client_name")), "quotation_id": src.get("quotation_id"), "items": items, "total_quantity": sum(i.get("quantity", 0) for i in items), "total_amount": gt, "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": gt, "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": gt, "notes": None, "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": src["id"], "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
     return _dec(doc)
@@ -2063,28 +2110,29 @@ async def fulltext(body: dict = Body(...), current_user: dict = Depends(require_
     q = body.get("q", "")
     if not q: return {"items": [], "total": 0}
     items = []
-    async for doc in shop_bills_collection.find({"$or": [{"bill_number": {"$regex": _search_pattern(q), "$options": "i"}}, {"client_name": {"$regex": _search_pattern(q), "$options": "i"}}, {"notes": {"$regex": _search_pattern(q), "$options": "i"}}]}).limit(_bounded_limit(body)):
+    async for doc in shop_bills_collection.find(scoped_query({"$or": [{"bill_number": {"$regex": _search_pattern(q), "$options": "i"}}, {"client_name": {"$regex": _search_pattern(q), "$options": "i"}}, {"notes": {"$regex": _search_pattern(q), "$options": "i"}}]}, resolve_laundry_id(current_user))).limit(_bounded_limit(body)):
         items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
 @router.get("/tags")
 async def all_tags(current_user: dict = Depends(require_capability("bill:read"))):
     all_t: set = set()
-    async for doc in shop_bills_collection.find({"tags": {"$exists": True, "$ne": []}}, {"tags": 1}):
+    async for doc in shop_bills_collection.find(scoped_query({"tags": {"$exists": True, "$ne": []}}, resolve_laundry_id(current_user)), {"tags": 1}):
         for t in doc.get("tags", []): all_t.add(t)
     return {"tags": sorted(all_t)}
 
 @router.get("/by-tag/{tag}")
 async def by_tag(tag: str, skip: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200), current_user: dict = Depends(require_capability("bill:read"))):
-    total = await shop_bills_collection.count_documents({"tags": tag})
+    query = scoped_query({"tags": tag}, resolve_laundry_id(current_user))
+    total = await shop_bills_collection.count_documents(query)
     items = []
-    async for doc in shop_bills_collection.find({"tags": tag}).sort("created_at", -1).skip(skip).limit(limit):
+    async for doc in shop_bills_collection.find(query).sort("created_at", -1).skip(skip).limit(limit):
         items.append(_dec(doc))
     return {"items": items, "total": total}
 
 @router.post("/{bill_id}/notes-category")
 async def note_cat(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     history = doc.get("notes_history", [])
     history.append({"old_notes": doc.get("notes", ""), "new_notes": body.get("note", ""), "category": body.get("category", "general"), "changed_by": current_user.get("auth_id", "system"), "changed_at": now.isoformat()})
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
@@ -2104,7 +2152,9 @@ async def from_quotation(quotation_id: str, current_user: dict = Depends(require
     now = datetime.now(timezone.utc)
     items_data = [{"item_name": qi.get("item_name", ""), "specification": qi.get("specification"), "category": qi.get("category"), "unit_price": qi.get("unit_price", 0), "quantity": qi.get("quantity", 1), "discount": 0, "discount_type": "FIXED"} for qi in q_doc.get("items", [])]
     _prepare_items(items_data); totals = _calc_totals(items_data); bn = await _generate_bill_number()
-    doc = {"bill_number": bn, "client_name": q_doc.get("client_name", ""), "quotation_id": quotation_id, "items": items_data, "total_quantity": totals["total_quantity"], "total_amount": totals["total_amount"], "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": totals["grand_total"], "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": totals["grand_total"], "notes": q_doc.get("notes"), "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": None, "created_at": now, "updated_at": now}
+    # Quotation ownership itself is verified once quotation-service is migrated;
+    # until then the bill is stamped with the creator's laundry (fail-closed reads apply).
+    doc = {"laundry_id": resolve_laundry_id(current_user), "bill_number": bn, "client_name": q_doc.get("client_name", ""), "quotation_id": quotation_id, "items": items_data, "total_quantity": totals["total_quantity"], "total_amount": totals["total_amount"], "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": totals["grand_total"], "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": totals["grand_total"], "notes": q_doc.get("notes"), "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": None, "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
     return _dec(doc)
@@ -2113,14 +2163,14 @@ async def from_quotation(quotation_id: str, current_user: dict = Depends(require
 async def daily_summary(date: Optional[str] = Query(None), current_user: dict = Depends(require_capability("bill:read"))):
     target = parse_day(date) if date else today()
     start, end = day_bounds(target)
-    result = await shop_bills_collection.aggregate([{"$match": {"created_at": {"$gte": start, "$lt": end}}}, {"$group": {"_id": "$status", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}}]).to_list(length=20)
+    result = await shop_bills_collection.aggregate([{"$match": {**{"created_at": {"$gte": start, "$lt": end}}, **laundry_match(resolve_laundry_id(current_user))}}, {"$group": {"_id": "$status", "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}}]).to_list(length=20)
     return {"date": start.strftime("%Y-%m-%d"), "total_bills": sum(r["count"] for r in result), "total_revenue": round(sum(r["total"] for r in result), 2)}
 
 @router.get("/stats/weekly")
 async def weekly_summary(current_user: dict = Depends(require_capability("bill:read"))):
     start = week_start(today())
     result = await shop_bills_collection.aggregate([
-        {"$match": {"created_at": {"$gte": start, "$lt": start + timedelta(days=7)}}},
+        {"$match": {**{"created_at": {"$gte": start, "$lt": start + timedelta(days=7)}}, **laundry_match(resolve_laundry_id(current_user))}},
         # $dayOfWeek is UTC-only, so bucket on a Sri Lankan-local date string.
         {"$group": {"_id": {"day": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at", "timezone": MONGO_TIME_ZONE}}}, "count": {"$sum": 1}, "total": {"$sum": "$grand_total"}}},
     ]).to_list(length=7)
@@ -2130,7 +2180,7 @@ async def weekly_summary(current_user: dict = Depends(require_capability("bill:r
 async def monthly_summary(year: Optional[int] = Query(None), month: Optional[int] = Query(None), current_user: dict = Depends(require_capability("bill:read"))):
     y, m = year or this_year(), month or this_month_number()
     start, end = month_bounds(y, m)
-    result = await shop_bills_collection.aggregate([{"$match": {"created_at": {"$gte": start, "$lt": end}}}, {"$group": {"_id": None, "count": {"$sum": 1}, "revenue": {"$sum": "$grand_total"}, "paid": {"$sum": "$paid_amount"}}}]).to_list(length=1)
+    result = await shop_bills_collection.aggregate([{"$match": {**{"created_at": {"$gte": start, "$lt": end}}, **laundry_match(resolve_laundry_id(current_user))}}, {"$group": {"_id": None, "count": {"$sum": 1}, "revenue": {"$sum": "$grand_total"}, "paid": {"$sum": "$paid_amount"}}}]).to_list(length=1)
     r = result[0] if result else {"count": 0, "revenue": 0, "paid": 0}
     return {"year": y, "month": m, "total_bills": r["count"], "total_revenue": round(r["revenue"], 2), "total_paid": round(r["paid"], 2), "outstanding": round(r["revenue"] - r["paid"], 2)}
 
@@ -2138,7 +2188,7 @@ async def monthly_summary(year: Optional[int] = Query(None), month: Optional[int
 async def yearly_summary(year: Optional[int] = Query(None), current_user: dict = Depends(require_capability("bill:read"))):
     y = year or this_year(); start, end = year_bounds(y)
     result = await shop_bills_collection.aggregate([
-        {"$match": {"created_at": {"$gte": start, "$lt": end}}},
+        {"$match": {**{"created_at": {"$gte": start, "$lt": end}}, **laundry_match(resolve_laundry_id(current_user))}},
         # $month is UTC-only; bucket on a Sri Lankan-local month string instead.
         {"$group": {"_id": {"month": {"$dateToString": {"format": "%m", "date": "$created_at", "timezone": MONGO_TIME_ZONE}}}, "count": {"$sum": 1}, "revenue": {"$sum": "$grand_total"}, "paid": {"$sum": "$paid_amount"}}},
     ]).to_list(length=12)
@@ -2148,7 +2198,7 @@ async def yearly_summary(year: Optional[int] = Query(None), current_user: dict =
 @router.get("/client-loyalty/{client_name}")
 async def loyalty(client_name: str, current_user: dict = Depends(require_capability("bill:read"))):
     token = get_search_token(client_name); total_bills, total_spent = 0, 0.0; fb = lb = None
-    async for raw in shop_bills_collection.find({"client_name_search": token}):
+    async for raw in shop_bills_collection.find(scoped_query({"client_name_search": token}, resolve_laundry_id(current_user))):
         doc = _dec(raw); total_bills += 1; total_spent += doc.get("grand_total", 0); dt = doc.get("created_at")
         if dt:
             if fb is None or dt < fb: fb = dt
@@ -2157,25 +2207,22 @@ async def loyalty(client_name: str, current_user: dict = Depends(require_capabil
 
 @router.get("/templates/{template_id}/usage")
 async def tpl_usage(template_id: str, current_user: dict = Depends(require_capability("bill:read"))):
-    raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
-    if not raw: raise HTTPException(status_code=404, detail="Template not found")
+    _, raw = await _owned_template(template_id, current_user)
     doc = _dec_template(raw)
     return {"template_id": template_id, "name": doc.get("name"), "use_count": doc.get("use_count", 0)}
 
 @router.post("/templates/{template_id}/duplicate", status_code=201)
 async def dup_template(template_id: str, current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
-    if not raw: raise HTTPException(status_code=404, detail="Template not found")
+    laundry_id, raw = await _owned_template(template_id, current_user)
     src = _dec_template(raw); now = datetime.now(timezone.utc)
-    doc = {"name": f"{src['name']} (Copy)", "client_name": src.get("client_name"), "items": [i.copy() for i in src.get("items", [])], "discounts": src.get("discounts", 0), "transport_fee": src.get("transport_fee", 0), "taxes": src.get("taxes", 0), "notes": src.get("notes"), "use_count": 0, "created_at": now, "updated_at": now}
+    doc = {"laundry_id": laundry_id, "name": f"{src['name']} (Copy)", "client_name": src.get("client_name"), "items": [i.copy() for i in src.get("items", [])], "discounts": src.get("discounts", 0), "transport_fee": src.get("transport_fee", 0), "taxes": src.get("taxes", 0), "notes": src.get("notes"), "use_count": 0, "created_at": now, "updated_at": now}
     result = await bill_templates_collection.insert_one(_enc_template(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("bill_template", result.inserted_id); await enqueue_sync("bill_template", result.inserted_id, v)
     return _dec_template(doc)
 
 @router.patch("/templates/{template_id}")
 async def update_tpl(template_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
-    if not raw: raise HTTPException(status_code=404, detail="Template not found")
+    laundry_id, raw = await _owned_template(template_id, current_user)
     doc = _dec_template(raw); now = datetime.now(timezone.utc)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     for f in ("name", "client_name", "items", "discounts", "transport_fee", "taxes", "notes"):
@@ -2187,7 +2234,7 @@ async def update_tpl(template_id: str, body: dict = Body(...), current_user: dic
 
 @router.post("/{bill_id}/attachments")
 async def add_att(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     atts = doc.get("attachments", []); atts.append({"name": body.get("name", ""), "url": body.get("url", ""), "added_at": now.isoformat()})
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}; merged["attachments"] = atts; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
@@ -2196,11 +2243,11 @@ async def add_att(bill_id: str, body: dict = Body(...), current_user: dict = Dep
 
 @router.get("/{bill_id}/attachments")
 async def get_att(bill_id: str, current_user: dict = Depends(require_capability("bill:read"))):
-    return {"attachments": _dec(await _find_bill(bill_id)).get("attachments", [])}
+    return {"attachments": _dec(await _find_bill(bill_id, resolve_laundry_id(current_user))).get("attachments", [])}
 
 @router.delete("/{bill_id}/attachments/{index}")
 async def del_att(bill_id: str, index: int, current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); atts = doc.get("attachments", [])
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); atts = doc.get("attachments", [])
     if index < 0 or index >= len(atts): raise HTTPException(status_code=400, detail="Invalid index")
     now = datetime.now(timezone.utc); atts.pop(index)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}; merged["attachments"] = atts; merged["updated_at"] = now
@@ -2211,6 +2258,8 @@ async def del_att(bill_id: str, index: int, current_user: dict = Depends(require
 @router.get("/{bill_id}/versions")
 async def versions(bill_id: str, current_user: dict = Depends(require_capability("bill:read"))):
     from ..database.main_db import versions_collection
+    # Ownership gate: version history must not leak across laundries.
+    await _find_bill(bill_id, resolve_laundry_id(current_user))
     vs = []
     async for doc in versions_collection.find({"entity_type": "shop_bill", "entity_id": bill_id}).sort("version", -1).limit(20):
         vs.append({"version": doc.get("version"), "timestamp": doc.get("timestamp"), "user": doc.get("user")})
@@ -2222,7 +2271,7 @@ async def print_data(
     include_prefix: bool = Query(False, description="Include hotel-code prefix in bill number"),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    doc = _dec(await _find_bill(bill_id))
+    doc = _dec(await _find_bill(bill_id, resolve_laundry_id(current_user)))
     result = {k: doc.get(k) for k in (
         "bill_number", "client_name", "delivery_date", "items",
         "total_amount", "discounts", "transport_fee", "taxes",
@@ -2238,9 +2287,14 @@ async def bulk_print(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     bills = []
+    _bulk_print_laundry = resolve_laundry_id(current_user)
     for bid in body.get("bill_ids", [])[:10]:
         raw = await shop_bills_collection.find_one({"_id": parse_object_id(bid, "Bill ID")})
         if raw:
+            try:
+                assert_same_laundry(raw, _bulk_print_laundry, "Shop bill")
+            except HTTPException:
+                continue
             d = _dec(raw)
             bills.append({
                 "bill_number": format_bill_number(d.get("bill_number"), include_prefix),
@@ -2290,40 +2344,40 @@ async def batch(body: dict = Body(...), current_user: dict = Depends(require_cap
 @router.get("/lookup")
 async def lookup(q: str = Query(..., min_length=1), current_user: dict = Depends(require_capability("bill:read"))):
     items = []
-    async for doc in shop_bills_collection.find({"$or": [{"bill_number": {"$regex": _search_pattern(q), "$options": "i"}}, {"client_name_search": {"$regex": _search_pattern(q), "$options": "i"}}]}).limit(10):
+    async for doc in shop_bills_collection.find(scoped_query({"$or": [{"bill_number": {"$regex": _search_pattern(q), "$options": "i"}}, {"client_name_search": {"$regex": _search_pattern(q), "$options": "i"}}]}, resolve_laundry_id(current_user))).limit(10):
         d = _dec(doc); items.append({"id": d.get("id"), "bill_number": d.get("bill_number"), "client_name": d.get("client_name"), "grand_total": d.get("grand_total", 0)})
     return {"items": items}
 
 @router.get("/client-count/{client_name}")
 async def client_cnt(client_name: str, current_user: dict = Depends(require_capability("bill:read"))):
-    count = await shop_bills_collection.count_documents({"client_name_search": get_search_token(client_name)})
+    count = await shop_bills_collection.count_documents(scoped_query({"client_name_search": get_search_token(client_name)}, resolve_laundry_id(current_user)))
     return {"client_name": client_name, "bill_count": count}
 
 @router.get("/today")
 async def bills_today(current_user: dict = Depends(require_capability("bill:read"))):
     start, end = day_bounds(today())
     items = []
-    async for doc in shop_bills_collection.find({"created_at": {"$gte": start, "$lt": end}}).sort("created_at", -1): items.append(_dec(doc))
+    async for doc in shop_bills_collection.find(scoped_query({"created_at": {"$gte": start, "$lt": end}}, resolve_laundry_id(current_user))).sort("created_at", -1): items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
 @router.get("/this-week")
 async def bills_this_week(current_user: dict = Depends(require_capability("bill:read"))):
     start = week_start(today())
     items = []
-    async for doc in shop_bills_collection.find({"created_at": {"$gte": start}}).sort("created_at", -1): items.append(_dec(doc))
+    async for doc in shop_bills_collection.find(scoped_query({"created_at": {"$gte": start}}, resolve_laundry_id(current_user))).sort("created_at", -1): items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
 @router.get("/this-month")
 async def bills_this_month(current_user: dict = Depends(require_capability("bill:read"))):
     start = month_start(this_year(), this_month_number())
     items = []
-    async for doc in shop_bills_collection.find({"created_at": {"$gte": start}}).sort("created_at", -1): items.append(_dec(doc))
+    async for doc in shop_bills_collection.find(scoped_query({"created_at": {"$gte": start}}, resolve_laundry_id(current_user))).sort("created_at", -1): items.append(_dec(doc))
     return {"items": items, "total": len(items)}
 
 @router.get("/stats/client-turnaround")
 async def turnaround(current_user: dict = Depends(require_capability("bill:read"))):
     ts = []
-    async for raw in shop_bills_collection.find({"delivery_date": {"$exists": True, "$ne": None}}):
+    async for raw in shop_bills_collection.find(scoped_query({"delivery_date": {"$exists": True, "$ne": None}}, resolve_laundry_id(current_user))):
         doc = _dec(raw); c, d = doc.get("created_at"), doc.get("delivery_date")
         if c and d:
             try:
@@ -2339,13 +2393,14 @@ async def pay_methods(current_user: dict = Depends(require_capability("bill:read
 
 @router.get("/export/json")
 async def json_export(status: Optional[str] = Query(None), current_user: dict = Depends(require_capability("bill:read"))):
-    query = {"status": status} if status else {}; items = []
+    query = scoped_query({"status": status} if status else {}, resolve_laundry_id(current_user)); items = []
     async for doc in shop_bills_collection.find(query).sort("created_at", -1).limit(1000): items.append(_dec(doc))
     return {"bills": items, "total": len(items), "exported_at": datetime.now(timezone.utc).isoformat()}
 
 @router.post("/diff")
 async def bill_diff(body: dict = Body(...), current_user: dict = Depends(require_capability("bill:read"))):
-    d1 = _dec(await _find_bill(body.get("bill_id_1"))); d2 = _dec(await _find_bill(body.get("bill_id_2")))
+    laundry_id = resolve_laundry_id(current_user)
+    d1 = _dec(await _find_bill(body.get("bill_id_1"), laundry_id)); d2 = _dec(await _find_bill(body.get("bill_id_2"), laundry_id))
     diff = {}
     for key in ("client_name", "grand_total", "total_amount", "discounts", "transport_fee", "taxes", "status", "payment_status"):
         v1, v2 = d1.get(key), d2.get(key)
@@ -2355,7 +2410,8 @@ async def bill_diff(body: dict = Body(...), current_user: dict = Depends(require
 
 @router.get("/health")
 async def health_check(current_user: dict = Depends(require_capability("bill:read"))):
-    return {"status": "ok", "bills_count": await shop_bills_collection.count_documents({}), "templates_count": await bill_templates_collection.count_documents({})}
+    laundry_id = resolve_laundry_id(current_user)
+    return {"status": "ok", "bills_count": await shop_bills_collection.count_documents(scoped_query({}, laundry_id)), "templates_count": await bill_templates_collection.count_documents(scoped_query({}, laundry_id))}
 
 @router.get("/schema")
 async def schema_info(current_user: dict = Depends(require_capability("bill:read"))):
@@ -2365,21 +2421,27 @@ async def schema_info(current_user: dict = Depends(require_capability("bill:read
 async def csv_ids(body: dict = Body(...), current_user: dict = Depends(require_capability("bill:read"))):
     output = io.StringIO(); writer = csv.writer(output)
     writer.writerow(["Bill Number", "Client", "Grand Total", "Paid", "Outstanding", "Status"])
+    laundry_id = resolve_laundry_id(current_user)
     for bid in body.get("bill_ids", []):
         raw = await shop_bills_collection.find_one({"_id": parse_object_id(bid, "Bill ID")})
-        if raw: d = _dec(raw); writer.writerow([d.get("bill_number"), d.get("client_name"), d.get("grand_total", 0), d.get("paid_amount", 0), d.get("outstanding_amount", 0), d.get("status")])
+        if raw:
+            try:
+                assert_same_laundry(raw, laundry_id, "Shop bill")
+            except HTTPException:
+                continue
+            d = _dec(raw); writer.writerow([d.get("bill_number"), d.get("client_name"), d.get("grand_total", 0), d.get("paid_amount", 0), d.get("outstanding_amount", 0), d.get("status")])
     output.seek(0)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=selected-bills.csv"})
 
 @router.get("/stats/payment-projection")
 async def projection(days: int = Query(30, ge=1, le=90), current_user: dict = Depends(require_capability("bill:read"))):
     total = 0.0
-    async for raw in shop_bills_collection.find({"outstanding_amount": {"$gt": 0}, "status": {"$ne": "CANCELLED"}}): total += _dec(raw).get("outstanding_amount", 0)
+    async for raw in shop_bills_collection.find(scoped_query({"outstanding_amount": {"$gt": 0}, "status": {"$ne": "CANCELLED"}}, resolve_laundry_id(current_user))): total += _dec(raw).get("outstanding_amount", 0)
     return {"total_outstanding": round(total, 2), "projected_days": days, "avg_daily_collection": round(total / days, 2) if days > 0 else 0}
 
 @router.post("/{bill_id}/refund")
 async def refund(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("payment:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc); amt = body.get("amount", 0)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc); amt = body.get("amount", 0)
     new_paid = max(0, doc.get("paid_amount", 0) - amt)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     merged["paid_amount"] = round(new_paid, 2); merged["outstanding_amount"] = round(doc.get("grand_total", 0) - new_paid, 2)
@@ -2391,15 +2453,15 @@ async def refund(bill_id: str, body: dict = Body(...), current_user: dict = Depe
 
 @router.post("/{bill_id}/credit-note")
 async def credit_note(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    src = _dec(await _find_bill(bill_id)); now = datetime.now(timezone.utc); amt = body.get("amount", 0); bn = await _generate_bill_number()
-    doc = {"bill_number": bn, "client_name": src["client_name"], "quotation_id": None, "items": [], "total_quantity": 0, "total_amount": -amt, "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": -amt, "status": "COMPLETED", "payment_status": "PAID", "paid_amount": -amt, "outstanding_amount": 0, "notes": f"Credit note for {src.get('bill_number')}: {body.get(chr(114)+chr(101)+chr(97)+chr(115)+chr(111)+chr(110), '')}", "notes_history": [], "delivery_date": None, "tags": ["credit-note"], "locked": True, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": src["id"], "created_at": now, "updated_at": now}
+    src = _dec(await _find_bill(bill_id, resolve_laundry_id(current_user))); now = datetime.now(timezone.utc); amt = body.get("amount", 0); bn = await _generate_bill_number()
+    doc = {"laundry_id": src.get("laundry_id") or resolve_laundry_id(current_user), "bill_number": bn, "client_name": src["client_name"], "quotation_id": None, "items": [], "total_quantity": 0, "total_amount": -amt, "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": -amt, "status": "COMPLETED", "payment_status": "PAID", "paid_amount": -amt, "outstanding_amount": 0, "notes": f"Credit note for {src.get('bill_number')}: {body.get(chr(114)+chr(101)+chr(97)+chr(115)+chr(111)+chr(110), '')}", "notes_history": [], "delivery_date": None, "tags": ["credit-note"], "locked": True, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": src["id"], "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
     return _dec(doc)
 
 @router.patch("/{bill_id}/items/bulk-update")
 async def bulk_items(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw)
     if doc.get("locked"): raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
     items = doc.get("items", []); now = datetime.now(timezone.utc)
     for u in body.get("items", []):
@@ -2417,7 +2479,7 @@ async def bulk_items(bill_id: str, body: dict = Body(...), current_user: dict = 
 
 @router.get("/export/summary")
 async def export_summary(current_user: dict = Depends(require_capability("bill:read"))):
-    result = await shop_bills_collection.aggregate([{"$group": {"_id": None, "total_bills": {"$sum": 1}, "total_revenue": {"$sum": "$grand_total"}, "total_paid": {"$sum": "$paid_amount"}, "total_outstanding": {"$sum": "$outstanding_amount"}}}]).to_list(length=1)
+    result = await shop_bills_collection.aggregate([match_stage(resolve_laundry_id(current_user)), {"$group": {"_id": None, "total_bills": {"$sum": 1}, "total_revenue": {"$sum": "$grand_total"}, "total_paid": {"$sum": "$paid_amount"}, "total_outstanding": {"$sum": "$outstanding_amount"}}}]).to_list(length=1)
     r = result[0] if result else {"total_bills": 0, "total_revenue": 0, "total_paid": 0, "total_outstanding": 0}
     return {"total_bills": r["total_bills"], "total_revenue": round(r["total_revenue"], 2), "total_paid": round(r["total_paid"], 2), "total_outstanding": round(r["total_outstanding"], 2), "exported_at": datetime.now(timezone.utc).isoformat()}
 
@@ -2430,7 +2492,8 @@ async def due_v2(current_user: dict = Depends(require_capability("bill:read"))):
     now = datetime.now(timezone.utc)
     dm = {"DAILY": timedelta(days=1), "WEEKLY": timedelta(weeks=1), "BIWEEKLY": timedelta(weeks=2), "MONTHLY": timedelta(days=30)}
     due = []
-    async for raw in shop_bills_collection.find({"is_recurring": True}):
+    laundry_id = resolve_laundry_id(current_user)
+    async for raw in shop_bills_collection.find(scoped_query({"is_recurring": True}, laundry_id)):
         doc = _dec(raw); ed = doc.get("recurring_end_date")
         if ed and isinstance(ed, str):
             try: ed = datetime.fromisoformat(ed)
@@ -2456,6 +2519,8 @@ async def list_templates(
     query: dict = {}
     if search:
         query["name"] = {"$regex": _search_pattern(search), "$options": "i"}
+    query = scoped_query(query, resolve_laundry_id(current_user))
+    query = scoped_query(query, resolve_laundry_id(current_user))
     total = await bill_templates_collection.count_documents(query)
     items = []
     async for doc in bill_templates_collection.find(query).sort("created_at", -1).skip(skip).limit(limit):
@@ -2468,9 +2533,7 @@ async def get_template(
     template_id: str,
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
-    if not raw:
-        raise HTTPException(status_code=404, detail="Template not found")
+    _, raw = await _owned_template(template_id, current_user)
     return _dec_template(raw)
 
 
@@ -2483,6 +2546,7 @@ async def create_template(
     items = [i.model_dump() for i in payload.items]
     _prepare_items(items)
     doc = {
+        "laundry_id": resolve_laundry_id(current_user),
         "name": payload.name,
         "client_name": payload.client_name,
         "items": items,
@@ -2507,11 +2571,9 @@ async def delete_template(
     template_id: str,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    raw = await bill_templates_collection.find_one({"_id": parse_object_id(template_id, "Template ID")})
-    if not raw:
-        raise HTTPException(status_code=404, detail="Template not found")
+    _, raw = await _owned_template(template_id, current_user)
     v = await bump_version("bill_template", raw["_id"])
-    await bill_templates_collection.delete_one({"_id": raw["_id"]})
+    await bill_templates_collection.delete_one(owned_filter(raw["_id"], raw.get("laundry_id") or resolve_laundry_id(current_user)))
     await enqueue_delete("bill_template", raw["_id"], v)
     await log_audit(current_user.get("auth_id", "system"), "TEMPLATE_DELETE", "bill_template", str(raw["_id"]))
     return {"message": "Template deleted"}
@@ -2525,7 +2587,7 @@ async def expiring_bills(
     now = datetime.now(timezone.utc)
     horizon = now + timedelta(days=days)
     items = []
-    async for doc in shop_bills_collection.find({"status": {"$nin": ["DELIVERED", "CANCELLED"]}}):
+    async for doc in shop_bills_collection.find(scoped_query({"status": {"$nin": ["DELIVERED", "CANCELLED"]}}, resolve_laundry_id(current_user))):
         d = _dec(doc)
         dd = d.get("delivery_date")
         if dd is None:
@@ -2548,7 +2610,7 @@ async def attention_needed(
 ):
     now = datetime.now(timezone.utc)
     items = []
-    async for doc in shop_bills_collection.find({"outstanding_amount": {"$gt": 0}, "status": {"$ne": "CANCELLED"}}):
+    async for doc in shop_bills_collection.find(scoped_query({"outstanding_amount": {"$gt": 0}, "status": {"$ne": "CANCELLED"}}, resolve_laundry_id(current_user))):
         d = _dec(doc)
         reasons = []
         if d.get("payment_status") == "OVERDUE":
@@ -2573,7 +2635,7 @@ async def attention_needed(
 
 @router.post("/{bill_id}/archive")
 async def archive_bill(bill_id: str, current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     merged["archived"] = True; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
@@ -2583,7 +2645,7 @@ async def archive_bill(bill_id: str, current_user: dict = Depends(require_capabi
 
 @router.post("/{bill_id}/restore")
 async def restore_bill(bill_id: str, current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     merged["archived"] = False; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
@@ -2597,7 +2659,7 @@ async def list_archived(
     limit: int = Query(50, ge=1, le=200),
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    query = {"archived": True}
+    query = scoped_query({"archived": True}, resolve_laundry_id(current_user))
     total = await shop_bills_collection.count_documents(query)
     items = []
     async for doc in shop_bills_collection.find(query).sort("updated_at", -1).skip(skip).limit(limit):
@@ -2608,9 +2670,14 @@ async def list_archived(
 @router.post("/bulk-mark-paid")
 async def bulk_mark_paid(body: dict = Body(...), current_user: dict = Depends(require_capability("payment:write"))):
     now = datetime.now(timezone.utc); updated = 0
+    laundry_id = resolve_laundry_id(current_user)
     for bid in body.get("bill_ids", []):
         raw = await shop_bills_collection.find_one({"_id": parse_object_id(bid, "Bill ID")})
         if not raw:
+            continue
+        try:
+            assert_same_laundry(raw, laundry_id, "Shop bill")
+        except HTTPException:
             continue
         doc = _dec(raw)
         if doc.get("locked"):
@@ -2630,7 +2697,7 @@ async def bulk_mark_paid(body: dict = Body(...), current_user: dict = Depends(re
 @router.get("/stats/collection-rate")
 async def collection_rate(current_user: dict = Depends(require_capability("bill:read"))):
     total_revenue = 0.0; total_paid = 0.0
-    async for doc in shop_bills_collection.find({}):
+    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))):
         d = _dec(doc); total_revenue += d.get("grand_total", 0) or 0; total_paid += d.get("paid_amount", 0) or 0
     rate = round((total_paid / total_revenue) * 100, 2) if total_revenue > 0 else 0.0
     return {"total_revenue": round(total_revenue, 2), "total_paid": round(total_paid, 2), "collection_rate": rate}
@@ -2643,7 +2710,7 @@ async def monthly_trends(
 ):
     now = datetime.now(timezone.utc)
     buckets: dict = {}
-    async for doc in shop_bills_collection.find({}):
+    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))):
         d = _dec(doc); created = _as_dt(d.get("created_at"))
         if created is None:
             continue
@@ -2664,7 +2731,7 @@ async def top_items(
     current_user: dict = Depends(require_capability("bill:read")),
 ):
     agg: dict = {}
-    async for doc in shop_bills_collection.find({}):
+    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))):
         for item in _dec(doc).get("items", []):
             name = item.get("item_name") or "(unnamed)"
             a = agg.setdefault(name, {"item_name": name, "quantity": 0, "revenue": 0.0, "bill_count": 0})
@@ -2680,7 +2747,7 @@ async def top_items(
 @router.get("/stats/tag-summary")
 async def tag_summary(current_user: dict = Depends(require_capability("bill:read"))):
     agg: dict = {}
-    async for doc in shop_bills_collection.find({"tags": {"$exists": True, "$ne": []}}, {"tags": 1, "grand_total": 1}):
+    async for doc in shop_bills_collection.find(scoped_query({"tags": {"$exists": True, "$ne": []}}, resolve_laundry_id(current_user)), {"tags": 1, "grand_total": 1}):
         gt = doc.get("grand_total", 0) or 0
         for t in doc.get("tags", []):
             a = agg.setdefault(t, {"tag": t, "count": 0, "total": 0.0})
@@ -2698,7 +2765,7 @@ async def avg_value(
 ):
     start = datetime.now(timezone.utc) - timedelta(days=days)
     count = 0; total = 0.0
-    async for doc in shop_bills_collection.find({}):
+    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))):
         d = _dec(doc); created = _as_dt(d.get("created_at"))
         if created is not None and created >= start:
             count += 1; total += d.get("grand_total", 0) or 0
@@ -2714,7 +2781,7 @@ async def date_range_stats(
     start = day_start(parse_day(start_date))
     end = day_start(parse_day(end_date)) + timedelta(days=1)
     count = 0; revenue = 0.0; paid = 0.0
-    async for doc in shop_bills_collection.find({}):
+    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))):
         d = _dec(doc); created = _as_dt(d.get("created_at"))
         if created is not None and start <= created < end:
             count += 1; revenue += d.get("grand_total", 0) or 0; paid += d.get("paid_amount", 0) or 0
@@ -2730,7 +2797,7 @@ async def tax_report(
     start = day_start(parse_day(start_date)) if start_date else None
     end = (day_start(parse_day(end_date)) + timedelta(days=1)) if end_date else None
     taxes = 0.0; revenue = 0.0; count = 0
-    async for doc in shop_bills_collection.find({}):
+    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))):
         d = _dec(doc); created = _as_dt(d.get("created_at"))
         if start is not None and (created is None or created < start):
             continue
@@ -2751,12 +2818,14 @@ async def bill_count(
         query["status"] = status
     if payment_status:
         query["payment_status"] = payment_status
-    return {"count": await shop_bills_collection.count_documents(query)}
+    return {"count": await shop_bills_collection.count_documents(scoped_query(query, resolve_laundry_id(current_user)))}
 
 
 @router.get("/by-number/{bill_number}")
 async def by_number(bill_number: str, current_user: dict = Depends(require_capability("bill:read"))):
+    laundry_id = resolve_laundry_id(current_user)
     raw = await shop_bills_collection.find_one({"bill_number": bill_number})
+    assert_same_laundry(raw, laundry_id, "Shop bill")
     if not raw:
         raise HTTPException(status_code=404, detail="Shop bill not found")
     return _dec(raw)
@@ -2764,6 +2833,8 @@ async def by_number(bill_number: str, current_user: dict = Depends(require_capab
 
 @router.get("/{bill_id}/timeline")
 async def bill_timeline(bill_id: str, current_user: dict = Depends(require_capability("bill:read"))):
+    # Ownership gate first: a foreign bill id must 404, never leak its trail.
+    await _find_bill(bill_id, resolve_laundry_id(current_user))
     events = []
     async for doc in audit_collection.find({"entity_id": bill_id}).sort("timestamp", 1).limit(200):
         doc["id"] = str(doc.pop("_id", ""))
@@ -2773,7 +2844,7 @@ async def bill_timeline(bill_id: str, current_user: dict = Depends(require_capab
 
 @router.get("/{bill_id}/payment-history")
 async def payment_history(bill_id: str, current_user: dict = Depends(require_capability("bill:read"))):
-    raw = await _find_bill(bill_id)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user))
     doc = _dec(raw)
     history = [
         h for h in doc.get("notes_history", [])
@@ -2784,7 +2855,7 @@ async def payment_history(bill_id: str, current_user: dict = Depends(require_cap
 
 @router.patch("/{bill_id}/discount")
 async def update_discount(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw)
     if doc.get("locked"):
         raise HTTPException(status_code=400, detail="Cannot modify a locked bill")
     now = datetime.now(timezone.utc); new_discount = body.get("discount", 0)
@@ -2799,7 +2870,7 @@ async def update_discount(bill_id: str, body: dict = Body(...), current_user: di
 
 @router.patch("/{bill_id}/delivery-date")
 async def change_delivery_date(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     merged["delivery_date"] = body.get("delivery_date"); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
@@ -2809,7 +2880,7 @@ async def change_delivery_date(bill_id: str, body: dict = Body(...), current_use
 
 @router.post("/{bill_id}/transfer-client")
 async def transfer_client(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     new_name = (body.get("client_name") or "").strip()
     if not new_name:
         raise HTTPException(status_code=400, detail="client_name is required")
@@ -2822,7 +2893,7 @@ async def transfer_client(bill_id: str, body: dict = Body(...), current_user: di
 
 @router.post("/{bill_id}/void")
 async def void_bill(bill_id: str, body: dict = Body(...), current_user: dict = Depends(require_capability("bill:write"))):
-    raw = await _find_bill(bill_id); doc = _dec(raw); now = datetime.now(timezone.utc)
+    raw = await _find_bill(bill_id, resolve_laundry_id(current_user)); doc = _dec(raw); now = datetime.now(timezone.utc)
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
     merged["status"] = "CANCELLED"; merged["payment_status"] = "CANCELLED"; merged["locked"] = True
     reason = body.get("reason", "")
@@ -2842,12 +2913,13 @@ async def expire_old(
 ):
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_days)
     expired = 0
-    async for raw in shop_bills_collection.find({"outstanding_amount": {"$gt": 0}, "payment_status": {"$in": ["PENDING", "PARTIALLY_PAID"]}}):
+    laundry_id = resolve_laundry_id(current_user)
+    async for raw in shop_bills_collection.find(scoped_query({"outstanding_amount": {"$gt": 0}, "payment_status": {"$in": ["PENDING", "PARTIALLY_PAID"]}}, laundry_id)):
         doc = _dec(raw); created = _as_dt(doc.get("created_at"))
         if created is not None and created < cutoff:
             merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}
             merged["payment_status"] = "OVERDUE"
-            await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
+            await shop_bills_collection.update_one(owned_filter(raw["_id"], laundry_id), {"$set": _enc(merged)})
             v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
             expired += 1
     return {"expired": expired}
@@ -2861,5 +2933,5 @@ async def get_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    doc = await _find_bill(bill_id)
+    doc = await _find_bill(bill_id, resolve_laundry_id(current_user))
     return _dec(doc)

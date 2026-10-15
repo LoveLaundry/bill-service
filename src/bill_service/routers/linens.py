@@ -12,6 +12,7 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
+from ..tenancy import assert_same_laundry, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import get_search_token
 from ..database.main_db import (
     linens_collection,
@@ -60,6 +61,16 @@ def _parse_object_id(linen_id: str) -> ObjectId:
         raise HTTPException(status_code=400, detail="Invalid linen document ID")
 
 
+async def _owned_linen(oid, current_user: dict, label: str = "Linen not found"):
+    """Fetch a linen doc iff it belongs to the caller's laundry."""
+    laundry_id = resolve_laundry_id(current_user)
+    doc = await linens_collection.find_one({"_id": oid})
+    assert_same_laundry(doc, laundry_id, "Linen")
+    if not doc:
+        raise HTTPException(status_code=404, detail=label)
+    return laundry_id, doc
+
+
 async def _log_audit(user_id: str, action: str, entity: str, entity_id: str):
     await audit_collection.insert_one({
         "user_id": user_id, "action": action, "entity": entity,
@@ -76,6 +87,7 @@ async def create_linen(
     current_user: dict = Depends(require_capability("linen:write")),
 ):
     now = datetime.now(timezone.utc)
+    laundry_id = resolve_laundry_id(current_user)
     linen_id = generate_linen_id()
 
     # Ensure uniqueness (retry on collision, max 5 attempts)
@@ -86,6 +98,7 @@ async def create_linen(
         linen_id = generate_linen_id()
 
     doc = {
+        "laundry_id": laundry_id,
         "linen_id": linen_id,
         "category": payload.category,
         "item_type": payload.item_type,
@@ -124,6 +137,7 @@ async def create_linen_bulk(
     current_user: dict = Depends(require_capability("linen:write")),
 ):
     now = datetime.now(timezone.utc)
+    laundry_id = resolve_laundry_id(current_user)
     created = []
     linen_ids = set()
 
@@ -140,6 +154,7 @@ async def create_linen_bulk(
             raise HTTPException(status_code=500, detail="Failed to generate unique linen ID after 10 attempts")
 
         doc = {
+            "laundry_id": laundry_id,
             "linen_id": lid,
             "category": payload.category,
             "item_type": payload.item_type,
@@ -205,6 +220,7 @@ async def list_linens(
     valid_sorts = {"created_at", "linen_id", "category", "status", "client_name", "wash_count", "last_scanned_date", "updated_at"}
     sort_field = sort_by if sort_by in valid_sorts else "created_at"
 
+    query = scoped_query(query, resolve_laundry_id(current_user))
     total = await linens_collection.count_documents(query)
     cursor = linens_collection.find(query).sort(sort_field, sort_dir).skip(skip).limit(limit)
     items = []
@@ -223,9 +239,7 @@ async def get_linen(
     current_user: dict = Depends(require_capability("linen:read")),
 ):
     oid = _parse_object_id(doc_id)
-    doc = await linens_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Linen not found")
+    _, doc = await _owned_linen(oid, current_user)
     return _serialize(doc)
 
 
@@ -237,13 +251,15 @@ async def get_linen_by_code(
     linen_code: str,
     current_user: dict = Depends(require_capability("linen:read")),
 ):
+    laundry_id = resolve_laundry_id(current_user)
     doc = await linens_collection.find_one({"linen_id": linen_code.upper()})
+    assert_same_laundry(doc, laundry_id, "Linen")
     if not doc:
         raise HTTPException(status_code=404, detail="Linen not found")
     # Update last_scanned_date
     now = datetime.now(timezone.utc)
     await linens_collection.update_one(
-        {"_id": doc["_id"]},
+        owned_filter(doc["_id"], laundry_id),
         {"$set": {"last_scanned_date": now, "updated_at": now}},
     )
     doc["last_scanned_date"] = now
@@ -265,7 +281,9 @@ async def update_linen(
         raise HTTPException(status_code=400, detail="No fields to update")
     updates["updated_at"] = datetime.now(timezone.utc)
 
-    result = await linens_collection.update_one({"_id": oid}, {"$set": updates})
+    laundry_id = resolve_laundry_id(current_user)
+    await _owned_linen(oid, current_user)
+    result = await linens_collection.update_one(owned_filter(oid, laundry_id), {"$set": updates})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Linen not found")
 
@@ -282,13 +300,14 @@ async def delete_linen(
     current_user: dict = Depends(require_capability("linen:write")),
 ):
     oid = _parse_object_id(doc_id)
+    laundry_id, _ = await _owned_linen(oid, current_user)
     # Bump the version while the document still exists, then remove it and
     # enqueue a DELETE so the SECONDARY replica drops the record too.
     try:
         new_version = await bump_version("linen", oid)
     except KeyError:
         raise HTTPException(status_code=404, detail="Linen not found")
-    result = await linens_collection.delete_one({"_id": oid})
+    result = await linens_collection.delete_one(owned_filter(oid, laundry_id))
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Linen not found")
     await enqueue_delete("linen", oid, new_version)
@@ -305,9 +324,7 @@ async def scan_linen(
     current_user: dict = Depends(require_capability("linen:scan")),
 ):
     oid = _parse_object_id(doc_id)
-    doc = await linens_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Linen not found")
+    laundry_id, doc = await _owned_linen(oid, current_user)
 
     action = payload.action.lower()
     now = datetime.now(timezone.utc)
@@ -350,10 +367,11 @@ async def scan_linen(
     if payload.location:
         update_fields["location"] = payload.location
 
-    await linens_collection.update_one({"_id": oid}, {"$set": update_fields})
+    await linens_collection.update_one(owned_filter(oid, laundry_id), {"$set": update_fields})
 
     # Create event record (audit trail — never overwritten)
     event_doc = {
+        "laundry_id": laundry_id,
         "linen_id": doc["linen_id"],
         "action": action,
         "from_status": from_status,
@@ -402,12 +420,14 @@ async def bulk_scan_linens(
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
     now = datetime.now(timezone.utc)
+    laundry_id = resolve_laundry_id(current_user)
     results = []
     errors = []
 
     for code in linen_codes:
         code = code.strip().upper()
         doc = await linens_collection.find_one({"linen_id": code})
+        assert_same_laundry(doc, laundry_id, "Linen")
         if not doc:
             errors.append({"linen_id": code, "error": "Not found"})
             continue
@@ -426,9 +446,10 @@ async def bulk_scan_linens(
         if location:
             update_fields["location"] = location
 
-        await linens_collection.update_one({"_id": doc["_id"]}, {"$set": update_fields})
+        await linens_collection.update_one(owned_filter(doc["_id"], laundry_id), {"$set": update_fields})
 
         event_doc = {
+            "laundry_id": laundry_id,
             "linen_id": code,
             "action": action_lower,
             "from_status": from_status,
@@ -457,10 +478,7 @@ async def get_linen_events(
     limit: int = Query(50, ge=1, le=500),
     current_user: dict = Depends(require_capability("linen:read")),
 ):
-    oid = _parse_object_id(doc_id)
-    doc = await linens_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Linen not found")
+    _, doc = await _owned_linen(oid, current_user)
 
     query = {"linen_id": doc["linen_id"]}
     total = await linen_events_collection.count_documents(query)
@@ -479,7 +497,11 @@ async def get_linen_events(
 async def get_linen_stats(
     current_user: dict = Depends(require_capability("linen:read")),
 ):
-    pipeline = [
+    laundry_id = resolve_laundry_id(current_user)
+    match = scoped_query({}, laundry_id)
+    pipeline = (
+        [{"$match": match}] if match else []
+    ) + [
         {"$group": {
             "_id": "$status",
             "count": {"$sum": 1},
@@ -498,7 +520,9 @@ async def get_linen_stats(
 
     # Recently scanned (last 24h)
     yesterday = datetime.now(timezone.utc) - timedelta(hours=24)
-    recently = await linens_collection.count_documents({"last_scanned_date": {"$gte": yesterday}})
+    recently = await linens_collection.count_documents(
+        scoped_query({"last_scanned_date": {"$gte": yesterday}}, laundry_id)
+    )
 
     return LinenStats(
         total=total,
@@ -528,6 +552,7 @@ async def generate_linen_tags(
     current_user: dict = Depends(require_capability("linen:write")),
 ):
     now = datetime.now(timezone.utc)
+    laundry_id = resolve_laundry_id(current_user)
     created = []
     linen_ids = set()
 
@@ -543,6 +568,7 @@ async def generate_linen_tags(
             raise HTTPException(status_code=500, detail="Failed to generate unique ID")
 
         doc = {
+            "laundry_id": laundry_id,
             "linen_id": lid,
             "category": payload.category,
             "item_type": payload.item_type,

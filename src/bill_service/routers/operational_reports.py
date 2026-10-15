@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from ..auth_helper import require_capability, require_role
+from ..tenancy import resolve_laundry_id, scoped_query
 from ..app_time import day_start, lkt
 from ..crypto_helper import decrypt_dict
 from ..database.connection_manager import get_client
@@ -697,6 +698,7 @@ async def monthly_operations_report(
 ):
     if payload.end_date < payload.start_date:
         raise HTTPException(status_code=400, detail="end_date must be on or after start_date.")
+    laundry_id = resolve_laundry_id(current_user)
     query: dict = {
         "receiving_date": {
             "$gte": day_start(payload.start_date),
@@ -704,7 +706,9 @@ async def monthly_operations_report(
         },
         "status": {"$nin": ["DRAFT", "CANCELLED"]},
     }
-    all_gate_passes = await gatepasses_collection.find(query).sort("receiving_date", 1).to_list(length=None)
+    all_gate_passes = await gatepasses_collection.find(
+        scoped_query(query, laundry_id)
+    ).sort("receiving_date", 1).to_list(length=None)
     available_hotels = set()
     for gate_pass in all_gate_passes:
         try:
@@ -727,12 +731,14 @@ async def monthly_operations_report(
     }
     if payload.hotel_name:
         draft_query["client_name_search"] = get_search_token(payload.hotel_name)
-    draft_passes = await gatepasses_collection.find(draft_query).to_list(length=None)
-    cancelled_count = await gatepasses_collection.count_documents({
+    draft_passes = await gatepasses_collection.find(
+        scoped_query(draft_query, laundry_id)
+    ).to_list(length=None)
+    cancelled_count = await gatepasses_collection.count_documents(scoped_query({
         "receiving_date": query["receiving_date"],
         "status": "CANCELLED",
         **({"client_name_search": get_search_token(payload.hotel_name)} if payload.hotel_name else {}),
-    })
+    }, laundry_id))
 
     selected_ids = {
         _normalized(name): str(quotation_id) if quotation_id else None

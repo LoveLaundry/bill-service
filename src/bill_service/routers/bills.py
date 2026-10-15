@@ -131,7 +131,14 @@ def _parse_object_id(bill_id: str) -> ObjectId:
         )
 
 
-async def log_audit(user_id: str, action: str, entity: str, entity_id: str, details: dict = None):
+async def log_audit(
+    user_id: str,
+    action: str,
+    entity: str,
+    entity_id: str,
+    details: dict = None,
+    laundry_id: str | None = None,
+):
     audit_doc = {
         "user_id": user_id,
         "action": action,
@@ -141,6 +148,8 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str, deta
     }
     if details:
         audit_doc["details"] = details
+    if laundry_id:
+        audit_doc["laundry_id"] = laundry_id
     await audit_collection.insert_one(audit_doc)
 
 
@@ -721,6 +730,7 @@ async def create_bill(
         entity_type="bill",
         entity_id=serialized["id"],
         event_type=EVENT_BILL_CREATED,
+        laundry_id=laundry_id,
         gate_pass_id=payload.gate_pass_id,
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -739,6 +749,7 @@ async def create_bill(
         "BILL_CREATE",
         "bill",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     await idempotency.record_created(request, auth_id, "bill", serialized["id"])
     return serialized
@@ -1146,6 +1157,7 @@ async def update_bill_status(
         "BILL_STATUS_UPDATE",
         "bill",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -1263,6 +1275,7 @@ async def edit_bill(
         "bill",
         serialized["id"],
         details={"edited_fields": list(update_fields.keys())},
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -1293,7 +1306,11 @@ async def delete_bill(
     await enqueue_sync("bill", oid, new_version)
 
     await log_audit(
-        current_user.get("auth_id", "system"), "BILL_CANCEL", "bill", bill_id
+        current_user.get("auth_id", "system"),
+        "BILL_CANCEL",
+        "bill",
+        bill_id,
+        laundry_id=laundry_id,
     )
     return {"message": "Bill cancelled successfully"}
 
@@ -1509,6 +1526,7 @@ async def create_payment(
         "PAYMENT_CREATE",
         "payment",
         serialized_pay["id"],
+        laundry_id=laundry_id,
     )
     await idempotency.record_created(request, auth_id, "payment", serialized_pay["id"])
     return serialized_pay

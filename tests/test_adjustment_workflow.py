@@ -222,9 +222,9 @@ async def test_concurrent_adjustments_do_not_overwrite_gate_pass(monkeypatch, mo
     both_read = asyncio.Event()
     read_count = 0
 
-    async def synchronized_get_open_gp(gate_pass_id):
+    async def synchronized_get_open_gp(gate_pass_id, laundry_id=None):
         nonlocal read_count
-        result = await original_get_open_gp(gate_pass_id)
+        result = await original_get_open_gp(gate_pass_id, laundry_id)
         read_count += 1
         if read_count == 2:
             both_read.set()

@@ -26,7 +26,9 @@ ENTRIES = [
 
 
 def user(name="Alice"):
-    return {"auth_id": f"u-{name}", "user_name": name, "role": "ADMIN"}
+    from conftest import tenant_user
+
+    return tenant_user(f"u-{name}", "lovelaundry")
 
 
 def create_payload(shop=SHOP, entries=None):

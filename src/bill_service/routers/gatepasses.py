@@ -87,7 +87,13 @@ def _parse_object_id(gate_pass_id: str) -> ObjectId:
         )
 
 
-async def log_audit(user_id: str, action: str, entity: str, entity_id: str):
+async def log_audit(
+    user_id: str,
+    action: str,
+    entity: str,
+    entity_id: str,
+    laundry_id: str | None = None,
+):
     await audit_collection.insert_one(
         {
             "user_id": user_id,
@@ -95,6 +101,7 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str):
             "entity": entity,
             "entity_id": entity_id,
             "timestamp": datetime.now(timezone.utc),
+            **({"laundry_id": laundry_id} if laundry_id else {}),
         }
     )
 
@@ -164,6 +171,7 @@ async def create_gate_pass(
         "RECEIVING_CREATE",
         "gatepass",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     await idempotency.record_created(request, auth_id, "gatepass", serialized["id"])
 
@@ -406,6 +414,7 @@ async def update_gate_pass_status(
         entity_type="gatepass",
         entity_id=serialized["id"],
         event_type=EVENT_STATUS_CHANGED,
+        laundry_id=laundry_id,
         gate_pass_id=serialized["id"],
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -419,6 +428,7 @@ async def update_gate_pass_status(
         "RECEIVING_STATUS_UPDATE",
         "gatepass",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -582,6 +592,7 @@ async def catch_up_delivery(
         entity_type="delivery",
         entity_id=dl_id,
         event_type=EVENT_CATCH_UP_DELIVERY,
+        laundry_id=laundry_id,
         gate_pass_id=gate_pass_id,
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -600,6 +611,7 @@ async def catch_up_delivery(
         "RECEIVING_CATCH_UP_DELIVERY",
         "delivery",
         dl_id,
+        laundry_id=laundry_id,
     )
 
     serialized = _serialize(await gatepasses_collection.find_one({"_id": oid}))
@@ -675,6 +687,7 @@ async def _reopen_legacy_doc(gp_doc: dict, current_user: dict, laundry_id: str) 
             entity_type="gatepass",
             entity_id=gp_id,
             event_type=EVENT_LEGACY_FLAG,
+            laundry_id=laundry_id,
             gate_pass_id=gp_id,
             user_id=current_user.get("auth_id", "system"),
             user_name=current_user.get("user_name"),
@@ -694,6 +707,7 @@ async def _reopen_legacy_doc(gp_doc: dict, current_user: dict, laundry_id: str) 
             "REOPENED_LEGACY_GATEPASS",
             "gatepass",
             gp_id,
+            laundry_id=laundry_id,
         )
 
         return {
@@ -789,6 +803,7 @@ async def update_gate_pass_date(
         entity_type="gatepass",
         entity_id=serialized["id"],
         event_type=EVENT_RECEIVING_DATE_CHANGED,
+        laundry_id=laundry_id,
         gate_pass_id=serialized["id"],
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -801,6 +816,7 @@ async def update_gate_pass_date(
         "RECEIVING_DATE_UPDATE",
         "gatepass",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -938,6 +954,7 @@ async def update_gate_pass(
                 entity_type="gatepass",
                 entity_id=serialized["id"],
                 event_type=EVENT_RECEIVING_EDITED,
+                laundry_id=laundry_id,
                 gate_pass_id=serialized["id"],
                 user_id=current_user.get("auth_id", "system"),
                 user_name=current_user.get("user_name"),
@@ -950,6 +967,7 @@ async def update_gate_pass(
                 entity_type="gatepass",
                 entity_id=serialized["id"],
                 event_type=EVENT_RECEIVING_EDITED,
+                laundry_id=laundry_id,
                 gate_pass_id=serialized["id"],
                 user_id=current_user.get("auth_id", "system"),
                 user_name=current_user.get("user_name"),
@@ -962,6 +980,7 @@ async def update_gate_pass(
             "RECEIVING_UPDATE",
             "gatepass",
             serialized["id"],
+            laundry_id=laundry_id,
         )
 
         # Keep monthly operations in sync with reference changes.

@@ -87,6 +87,7 @@ async def ensure_indexes():
     await dispatch_jobs_collection.create_index("status")
     await dispatch_jobs_collection.create_index("assigned_to")
     await dispatch_jobs_collection.create_index("scheduled_at")
+    await dispatch_jobs_collection.create_index("laundry_id")
 
     # Payments indexes
     await payments_collection.create_index("bill_id")
@@ -97,14 +98,27 @@ async def ensure_indexes():
 
     # Loyalty indexes
     await loyalty_collection.create_index("client_name_search", unique=True)
+    await loyalty_collection.create_index("laundry_id")
+    # Loyalty accounts are per hotel per laundry: migrate the legacy global
+    # unique index to the tenant-compound one. The old index is dropped only
+    # after the new one exists, so uniqueness is never unenforced.
+    await loyalty_collection.create_index(
+        [("client_name_search", 1), ("laundry_id", 1)], unique=True
+    )
+    try:
+        await loyalty_collection.drop_index("client_name_search_1")
+    except Exception:
+        pass
 
     # Audit logs indexes
     await audit_collection.create_index("timestamp")
     await audit_collection.create_index("user_id")
     await audit_collection.create_index("entity_id")
+    await audit_collection.create_index("laundry_id")
 
     # Linens indexes
     await linens_collection.create_index("linen_id", unique=True)
+    await linens_collection.create_index("laundry_id")
     await linens_collection.create_index("category")
     await linens_collection.create_index("status")
     await linens_collection.create_index("client_name")
@@ -114,6 +128,7 @@ async def ensure_indexes():
 
     # Linen events indexes
     await linen_events_collection.create_index("linen_id")
+    await linen_events_collection.create_index("laundry_id")
     await linen_events_collection.create_index("timestamp")
     await linen_events_collection.create_index([("linen_id", 1), ("timestamp", -1)])
     # Transaction/entity journal indexes

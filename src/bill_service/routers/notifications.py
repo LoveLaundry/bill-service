@@ -15,6 +15,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Query
 
 from ..auth_helper import require_capability
+from ..tenancy import resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, get_search_token
 from ..database.main_db import gatepasses_collection
 from ..services import balance_engine as be
@@ -49,7 +50,9 @@ async def gatepass_pending(
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 
-    docs = await gatepasses_collection.find(query).to_list(length=None)
+    docs = await gatepasses_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).to_list(length=None)
     if not docs:
         return []
 

@@ -210,3 +210,19 @@ async def test_unbilled_list_is_tenant_scoped(mocked_db):
     assert {u["gate_pass_number"] for u in rows_b} == {"GP-X-8"}
     rows_a = await bills.get_unbilled_gatepasses(None, user_a())
     assert {u["gate_pass_number"] for u in rows_a} == {"GP-X-7"}
+
+
+def test_platform_admin_holds_full_capabilities():
+    from bill_service.auth_helper import ROLE_CAPABILITIES, require_capability
+
+    assert set(ROLE_CAPABILITIES["PLATFORM_ADMIN"]) == set(ROLE_CAPABILITIES["ADMIN"])
+    dep = require_capability("payment:write")
+    caller = {
+        "auth_id": "root",
+        "role": "PLATFORM_ADMIN",
+        "platform_admin": True,
+        "support_entry": True,
+        "laundry_id": LAUNDRY_B,
+        "laundries": [],
+    }
+    assert dep(caller) is caller

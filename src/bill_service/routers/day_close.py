@@ -20,6 +20,7 @@ from ..app_time import day_end, parse_day, today
 from ..auth_helper import require_capability
 from ..database.main_db import linen_events_collection
 from ..services.transaction_events import EVENT_DAY_CLOSED, record_event
+from ..tenancy import resolve_laundry_id, scoped_query
 
 router = APIRouter(prefix="/day-close", tags=["day-close"])
 
@@ -62,7 +63,10 @@ async def get_day_close(
     """Return the latest DAY_CLOSED snapshot for a business day, or null."""
     _validate_date(date)
     doc = await linen_events_collection.find_one(
-        {"entity_type": "day", "entity_id": date, "event_type": EVENT_DAY_CLOSED},
+        scoped_query(
+            {"entity_type": "day", "entity_id": date, "event_type": EVENT_DAY_CLOSED},
+            resolve_laundry_id(current_user),
+        ),
         sort=[("occurred_at", -1)],
     )
     if not doc:
@@ -79,15 +83,19 @@ async def close_day(
     """Record an end-of-day snapshot. Append-only; safe to run repeatedly."""
     day_end_value = _validate_date(payload.date)
     ensure_not_future(day_end_value.date(), today())
+    laundry_id = resolve_laundry_id(current_user)
 
     # Guardrail: never close a day out of order. If a later day already has a
     # snapshot, closing this one would silently imply an un-closed gap exists.
     out_of_order = await linen_events_collection.find_one(
-        {
-            "entity_type": "day",
-            "event_type": EVENT_DAY_CLOSED,
-            "occurred_at": {"$gt": day_end_value},
-        },
+        scoped_query(
+            {
+                "entity_type": "day",
+                "event_type": EVENT_DAY_CLOSED,
+                "occurred_at": {"$gt": day_end_value},
+            },
+            laundry_id,
+        ),
         sort=[("occurred_at", 1)],
     )
     if out_of_order:
@@ -110,6 +118,7 @@ async def close_day(
         reason=payload.note or None,
         meta={"totals": payload.totals, "closed_at": now.isoformat()},
         occurred_at=day_end_value,
+        laundry_id=laundry_id,
     )
     doc = await linen_events_collection.find_one({"_id": event_id})
     if doc:
