@@ -45,6 +45,8 @@ try:
         # Production fallback — restrict to known domains
         ALLOWED_ORIGINS = [
             "https://lovelaundry-manager.vercel.app",
+
+            "https://system-lovelaundry-lk.vercel.app",
             "https://public.lovelaundry.lk",
             "http://localhost:5173",
             "http://localhost:3000",

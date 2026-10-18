@@ -71,6 +71,12 @@ def apply_security(app: FastAPI, rate_limit: int = 300, origins: list[str] | Non
     if origins is None:
         origins = settings.cors_origins
 
+    # Order matters: Starlette runs the most recently added middleware first.
+    # CORS is added LAST so it wraps the rate limiter and the security headers —
+    # otherwise a 429 short-circuits before CORS and the browser reports the
+    # rejected request as a CORS failure instead of a rate limit.
+    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(RateLimitMiddleware, requests_per_minute=rate_limit)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
@@ -78,5 +84,3 @@ def apply_security(app: FastAPI, rate_limit: int = 300, origins: list[str] | Non
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.add_middleware(SecurityHeadersMiddleware)
-    app.add_middleware(RateLimitMiddleware, requests_per_minute=rate_limit)
