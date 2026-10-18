@@ -2,6 +2,7 @@
 Linen Tracking — CRUD, scanning, events, stats, tag generation.
 """
 import random
+import re
 import string
 import asyncio
 from datetime import datetime, timezone, timedelta
@@ -34,6 +35,19 @@ from ..models import (
 )
 
 router = APIRouter(prefix="/linens", tags=["linens"])
+
+# User-supplied search terms are substring lookups, never expressions. Interpolating
+# them into `$regex` directly allowed callers to inject their own pattern (`.*`
+# returned the whole collection) and to trigger catastrophic backtracking, which
+# pins the Mongo matcher. Escape the metacharacters and cap the length instead.
+MAX_SEARCH_LENGTH = 100
+
+
+def _search_pattern(term: Optional[str]) -> str:
+    """Return a literal, length-bounded Mongo `$regex` body."""
+    if term is None:
+        return ""
+    return re.escape(str(term)[:MAX_SEARCH_LENGTH])
 
 # --- Linen ID generator ---
 # Safe charset: avoids O/0/I/1/l to prevent confusion
@@ -185,18 +199,19 @@ async def list_linens(
 ):
     query: dict = {}
     if search:
+        pattern = _search_pattern(search)
         query["$or"] = [
-            {"linen_id": {"$regex": search, "$options": "i"}},
-            {"item_type": {"$regex": search, "$options": "i"}},
-            {"client_name": {"$regex": search, "$options": "i"}},
-            {"description": {"$regex": search, "$options": "i"}},
+            {"linen_id": {"$regex": pattern, "$options": "i"}},
+            {"item_type": {"$regex": pattern, "$options": "i"}},
+            {"client_name": {"$regex": pattern, "$options": "i"}},
+            {"description": {"$regex": pattern, "$options": "i"}},
         ]
     if category:
         query["category"] = category
     if status_filter:
         query["status"] = status_filter
     if client_name:
-        query["client_name"] = {"$regex": client_name, "$options": "i"}
+        query["client_name"] = {"$regex": _search_pattern(client_name), "$options": "i"}
     if condition:
         query["condition"] = condition
 

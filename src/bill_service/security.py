@@ -34,11 +34,23 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.limit = requests_per_minute
         self._buckets: dict[str, list[float]] = {}
+        self._last_prune = time.time()
 
     async def dispatch(self, request: Request, call_next):
         key = request.client.host if request.client else "unknown"
         now = time.time()
         window_start = now - 60.0
+        # Opportunistically drop idle keys. Without this the bucket dict keeps one
+        # entry per distinct client IP for the lifetime of the process, which is an
+        # unbounded memory leak under scanning traffic.
+        if now - self._last_prune >= 60.0:
+            pruned = {}
+            for bucket_key, stamps in self._buckets.items():
+                live = [t for t in stamps if t >= window_start]
+                if live:
+                    pruned[bucket_key] = live
+            self._buckets = pruned
+            self._last_prune = now
         hits = [t for t in self._buckets.get(key, []) if t >= window_start]
         self._buckets[key] = hits
         if len(hits) >= self.limit:

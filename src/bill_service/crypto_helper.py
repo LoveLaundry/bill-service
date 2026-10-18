@@ -4,6 +4,11 @@ import hashlib
 import hmac
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from dotenv import load_dotenv
+
+# See auth_helper: pydantic-settings does not export .env into os.environ.
+load_dotenv()
+
 _master_key = os.getenv("MASTER_KEY")
 if not _master_key:
     raise RuntimeError("FATAL: MASTER_KEY environment variable is not set. Refusing to start.")

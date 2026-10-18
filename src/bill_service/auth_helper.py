@@ -4,6 +4,13 @@ from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer
 import jwt
 
+from dotenv import load_dotenv
+
+# Load .env before reading secrets. config.Settings uses pydantic-settings, which
+# parses .env into the model WITHOUT exporting to os.environ — so without this,
+# the service refused to start unless JWT_SECRET was exported by the host shell.
+load_dotenv()
+
 _jwt_secret = os.getenv("JWT_SECRET")
 if not _jwt_secret:
     raise RuntimeError("FATAL: JWT_SECRET environment variable is not set. Refusing to start.")
