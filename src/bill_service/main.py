@@ -1,4 +1,3 @@
-from .tenancy import TenantMiddleware
 import asyncio
 import traceback
 
@@ -73,7 +72,6 @@ from .security import apply_security
 origins = ALLOWED_ORIGINS if settings.cors_origins == ["*"] or not settings.cors_origins else settings.cors_origins
 apply_security(app, rate_limit=300, origins=origins)
 
-app.add_middleware(TenantMiddleware)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):

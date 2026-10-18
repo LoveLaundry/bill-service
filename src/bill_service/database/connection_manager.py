@@ -13,7 +13,6 @@ Roles:
 """
 
 from __future__ import annotations
-from ..tenancy import resolve_db_name
 
 import asyncio
 import motor.motor_asyncio
@@ -56,12 +55,10 @@ def get_client(role: str) -> motor.motor_asyncio.AsyncIOMotorClient:
 def get_database(role: str) -> motor.motor_asyncio.AsyncIOMotorDatabase:
     """Return the role-specific database object. NEVER cross roles."""
     role = role.upper()
-    uri, db_name = _resolve(role)
-    db_name = resolve_db_name(db_name)
-    cache_key = f"{role}:{db_name}"
-    if cache_key not in _databases:
-        _databases[cache_key] = motor.motor_asyncio.AsyncIOMotorDatabase(get_client(role), db_name)
-    return _databases[cache_key]
+    if role not in _databases:
+        uri, db_name = _resolve(role)
+        _databases[role] = motor.motor_asyncio.AsyncIOMotorDatabase(get_client(role), db_name)
+    return _databases[role]
 
 
 async def ping(role: str) -> bool:

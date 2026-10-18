@@ -127,14 +127,28 @@ async def test_gatepass_list_paginates_with_skip_and_limit(mocked_db):
 
 def test_gatepass_lookup_stage_tolerates_null_ids():
     """The join stage must use $convert (null-safe), never bare $toObjectId."""
-    stage = bills._gatepass_lookup_stage()
-    expr = stage["$lookup"]["pipeline"][0]["$match"]["$expr"]["$eq"]
-    assert expr[0] == "$_id"
-    convert = expr[1]["$convert"]
+    stage = bills._gatepass_lookup_stage("lovelaundry")
+    conditions = stage["$lookup"]["pipeline"][0]["$match"]["$expr"]["$and"]
+    id_equality = conditions[0]["$eq"]
+    assert id_equality[0] == "$_id"
+    convert = id_equality[1]["$convert"]
     assert convert["input"] == "$$gp_id_str"
     assert convert["to"] == "objectId"
     assert convert["onError"] is None
     assert convert["onNull"] is None
+
+
+def test_gatepass_lookup_stage_never_joins_another_tenant():
+    """A bill must not attach a gate pass belonging to a different laundry."""
+    legacy = bills._gatepass_lookup_stage("lovelaundry")
+    legacy_conditions = legacy["$lookup"]["pipeline"][0]["$match"]["$expr"]["$and"]
+    legacy_tenant = legacy_conditions[1]
+    assert {"$eq": ["$laundry_id", "lovelaundry"]} in legacy_tenant["$or"]
+    assert {"$eq": [{"$type": "$laundry_id"}, "missing"]} in legacy_tenant["$or"]
+
+    strict = bills._gatepass_lookup_stage("acme")
+    strict_conditions = strict["$lookup"]["pipeline"][0]["$match"]["$expr"]["$and"]
+    assert strict_conditions[1] == {"$eq": ["$laundry_id", "acme"]}
 
 
 def test_combine_name_filters_intersects_without_dropping():

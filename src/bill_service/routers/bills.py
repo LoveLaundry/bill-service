@@ -6,7 +6,13 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth_helper import get_current_user, require_capability
-from ..tenancy import assert_same_laundry, owned_filter, resolve_laundry_id, scoped_query
+from ..tenancy import (
+    LOVE_LAUNDRY_ID,
+    assert_same_laundry,
+    owned_filter,
+    resolve_laundry_id,
+    scoped_query,
+)
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -755,13 +761,30 @@ async def create_bill(
     return serialized
 
 
-def _gatepass_lookup_stage() -> dict:
+def _gatepass_lookup_stage(laundry_id: str) -> dict:
     """Join bills to their gate pass for receiving-date filtering.
 
     ``gate_pass_id`` is a string, ``_id`` an ObjectId. ``$convert`` maps
     missing/malformed ids (manual bills carry ``gate_pass_id=None``) to null
     instead of throwing like ``$toObjectId`` did.
+
+    The join is also constrained to the caller's laundry. Matching on ``_id``
+    alone would happily attach another tenant's gate pass if a bill ever held a
+    foreign ``gate_pass_id``; the same transitional rule as
+    :func:`tenancy.laundry_match` keeps legacy (unstamped) gate passes visible to
+    the historical tenant only.
     """
+    if laundry_id == LOVE_LAUNDRY_ID:
+        tenant_condition = {
+            "$or": [
+                {"$eq": ["$laundry_id", LOVE_LAUNDRY_ID]},
+                {"$eq": [{"$type": "$laundry_id"}, "missing"]},
+                {"$eq": ["$laundry_id", None]},
+            ]
+        }
+    else:
+        tenant_condition = {"$eq": ["$laundry_id", laundry_id]}
+
     return {
         "$lookup": {
             "from": "gatepasses",
@@ -770,16 +793,21 @@ def _gatepass_lookup_stage() -> dict:
                 {
                     "$match": {
                         "$expr": {
-                            "$eq": [
-                                "$_id",
+                            "$and": [
                                 {
-                                    "$convert": {
-                                        "input": "$$gp_id_str",
-                                        "to": "objectId",
-                                        "onError": None,
-                                        "onNull": None,
-                                    }
+                                    "$eq": [
+                                        "$_id",
+                                        {
+                                            "$convert": {
+                                                "input": "$$gp_id_str",
+                                                "to": "objectId",
+                                                "onError": None,
+                                                "onNull": None,
+                                            }
+                                        },
+                                    ]
                                 },
+                                tenant_condition,
                             ]
                         }
                     }
@@ -834,11 +862,14 @@ async def list_bills(
                     get_search_token(search),
                 )
             )
-        if base_match:
-            pipeline.append({"$match": scoped_query(base_match, resolve_laundry_id(current_user))})
+        laundry_id = resolve_laundry_id(current_user)
+        # The tenant match is unconditional: with only a gate-pass date filter the
+        # pipeline used to start with no $match at all and scanned every tenant's
+        # bills before filtering. scoped_query() handles the empty-filter case.
+        pipeline.append({"$match": scoped_query(base_match, laundry_id)})
 
-        # Join with gatepasses to access receiving_date
-        pipeline.append(_gatepass_lookup_stage())
+        # Join with gatepasses to access receiving_date (same tenant only)
+        pipeline.append(_gatepass_lookup_stage(laundry_id))
 
         # Filter by gate pass receiving_date
         gp_date_match: dict = {}
