@@ -3,6 +3,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
+from ..tenancy import assert_same_laundry, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import loyalty_collection
 from ..models import LoyaltyAccount, LoyaltyAdjust, loyalty_tier
@@ -32,7 +33,7 @@ async def list_loyalty(
     query: dict = {}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
-    cursor = loyalty_collection.find(query).sort("points", -1)
+    cursor = loyalty_collection.find(scoped_query(query, resolve_laundry_id(current_user))).sort("points", -1)
     results = []
     async for doc in cursor:
         try:
@@ -47,9 +48,11 @@ async def get_loyalty(
     client_name: str,
     current_user: dict = Depends(require_capability("loyalty:read")),
 ):
+    laundry_id = resolve_laundry_id(current_user)
     doc = await loyalty_collection.find_one(
         {"client_name_search": get_search_token(client_name)}
     )
+    assert_same_laundry(doc, laundry_id, "Loyalty account")
     if not doc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="No loyalty account found"
@@ -64,13 +67,16 @@ async def adjust_loyalty(
 ):
     token = get_search_token(payload.client_name)
     now = datetime.now(timezone.utc)
-    existing = await loyalty_collection.find_one({"client_name_search": token})
+    laundry_id = resolve_laundry_id(current_user)
+    existing = await loyalty_collection.find_one(
+        scoped_query({"client_name_search": token}, laundry_id)
+    )
 
     if existing:
         new_points = max(0, (existing.get("points") or 0) + payload.delta_points)
         visits = (existing.get("visits") or 0) + (1 if payload.delta_points > 0 else 0)
         await loyalty_collection.update_one(
-            {"_id": existing["_id"]},
+            owned_filter(existing["_id"], laundry_id),
             {
                 "$set": {
                     "points": new_points,
@@ -85,6 +91,7 @@ async def adjust_loyalty(
 
     points = max(0, payload.delta_points)
     doc = {
+        "laundry_id": laundry_id,
         "client_name": payload.client_name,
         "client_name_search": token,
         "points": points,

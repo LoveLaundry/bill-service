@@ -67,6 +67,7 @@ async def record_event(
     prev_status: Optional[str] = None,
     new_status: Optional[str] = None,
     occurred_at: Optional[datetime] = None,
+    laundry_id: Optional[str] = None,
 ):
     """Append a journal entry. Never mutates any existing document.
 
@@ -95,6 +96,8 @@ async def record_event(
         event_doc["prev_status"] = prev_status
     if new_status:
         event_doc["new_status"] = new_status
+    if laundry_id:
+        event_doc["laundry_id"] = laundry_id
 
     result = await linen_events_collection.insert_one(event_doc)
     return result.inserted_id

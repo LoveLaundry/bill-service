@@ -6,6 +6,7 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth_helper import get_current_user, require_capability
+from ..tenancy import assert_same_laundry, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -17,6 +18,7 @@ from ..database.main_db import (
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..services import balance_engine as be
+from ..services.hotel_code import format_bill_number
 from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
 from pydantic import BaseModel
@@ -111,6 +113,15 @@ def _serialize_payment(doc: dict) -> dict:
     return decrypted
 
 
+async def _owned_bill(bill_id: str, current_user: dict):
+    """Fetch a bill iff it belongs to the caller's laundry (404 otherwise)."""
+    laundry_id = resolve_laundry_id(current_user)
+    oid = _parse_object_id(bill_id)
+    doc = await bills_collection.find_one({"_id": oid})
+    assert_same_laundry(doc, laundry_id, "Bill")
+    return laundry_id, oid, doc
+
+
 def _parse_object_id(bill_id: str) -> ObjectId:
     try:
         return ObjectId(bill_id)
@@ -120,7 +131,14 @@ def _parse_object_id(bill_id: str) -> ObjectId:
         )
 
 
-async def log_audit(user_id: str, action: str, entity: str, entity_id: str, details: dict = None):
+async def log_audit(
+    user_id: str,
+    action: str,
+    entity: str,
+    entity_id: str,
+    details: dict = None,
+    laundry_id: str | None = None,
+):
     audit_doc = {
         "user_id": user_id,
         "action": action,
@@ -130,6 +148,8 @@ async def log_audit(user_id: str, action: str, entity: str, entity_id: str, deta
     }
     if details:
         audit_doc["details"] = details
+    if laundry_id:
+        audit_doc["laundry_id"] = laundry_id
     await audit_collection.insert_one(audit_doc)
 
 
@@ -289,6 +309,7 @@ async def create_bill(
     request: Request = None,
 ):
     auth_id = current_user.get("auth_id", "system")
+    laundry_id = resolve_laundry_id(current_user)
 
     # Idempotent create: retried requests reuse the previously created bill.
     existing_created = await idempotency.find_previous(request, auth_id, bills_collection)
@@ -308,6 +329,7 @@ async def create_bill(
                 status_code=400, detail="Invalid gate_pass_id format."
             )
         gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
+        assert_same_laundry(gp_doc, laundry_id, "Gate Pass")
         if not gp_doc:
             raise HTTPException(
                 status_code=404, detail="Gate Pass not found."
@@ -351,6 +373,7 @@ async def create_bill(
         for d_id in del_ids_to_save:
             d_oid = ObjectId(d_id)
             d_doc = await deliveries_collection.find_one({"_id": d_oid})
+            assert_same_laundry(d_doc, laundry_id, "Delivery")
             if not d_doc:
                 raise HTTPException(
                     status_code=400,
@@ -376,6 +399,7 @@ async def create_bill(
             except InvalidId:
                 continue
             g_doc = await gatepasses_collection.find_one({"_id": g_obj})
+            assert_same_laundry(g_doc, laundry_id, "Gate Pass")
             if not g_doc:
                 continue
             g_dec = decrypt_dict(g_doc, GATEPASS_SENSITIVE_FIELDS)
@@ -664,6 +688,7 @@ async def create_bill(
     paid_amount = grand_total if payload.instant else 0.0
     outstanding_amount = 0.0 if payload.instant else grand_total
     doc = {
+        "laundry_id": laundry_id,
         "quotation_id": payload.quotation_id or "",
         "client_name": payload.client_name,
         "client_name_search": get_search_token(payload.client_name),
@@ -705,6 +730,7 @@ async def create_bill(
         entity_type="bill",
         entity_id=serialized["id"],
         event_type=EVENT_BILL_CREATED,
+        laundry_id=laundry_id,
         gate_pass_id=payload.gate_pass_id,
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -723,9 +749,56 @@ async def create_bill(
         "BILL_CREATE",
         "bill",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     await idempotency.record_created(request, auth_id, "bill", serialized["id"])
     return serialized
+
+
+def _gatepass_lookup_stage() -> dict:
+    """Join bills to their gate pass for receiving-date filtering.
+
+    ``gate_pass_id`` is a string, ``_id`` an ObjectId. ``$convert`` maps
+    missing/malformed ids (manual bills carry ``gate_pass_id=None``) to null
+    instead of throwing like ``$toObjectId`` did.
+    """
+    return {
+        "$lookup": {
+            "from": "gatepasses",
+            "let": {"gp_id_str": "$gate_pass_id"},
+            "pipeline": [
+                {
+                    "$match": {
+                        "$expr": {
+                            "$eq": [
+                                "$_id",
+                                {
+                                    "$convert": {
+                                        "input": "$$gp_id_str",
+                                        "to": "objectId",
+                                        "onError": None,
+                                        "onNull": None,
+                                    }
+                                },
+                            ]
+                        }
+                    }
+                },
+            ],
+            "as": "gp",
+        }
+    }
+
+
+def _combine_name_filters(*tokens: Optional[str]) -> dict:
+    """Merge client-name search tokens: multiple become an ``$and`` instead of
+    one silently overwriting the other (both resolve to one field)."""
+    clauses = [{"client_name_search": token} for token in tokens if token]
+    if len(clauses) == 1:
+        return clauses[0]
+    if len(clauses) > 1:
+        return {"$and": clauses}
+    return {}
 
 
 @router.get("", response_model=BillListResponse)
@@ -745,10 +818,8 @@ async def list_bills(
     use_pipeline = gate_pass_date_from or gate_pass_date_to
 
     if use_pipeline:
-        # Build aggregation pipeline — filter by gate pass receiving_date
         pipeline: list = []
 
-        # Start with basic bill-level filters (non-date)
         base_match: dict = {}
         if client_name:
             base_match["client_name_search"] = get_search_token(client_name)
@@ -757,24 +828,19 @@ async def list_bills(
         if payment_status:
             base_match["payment_status"] = payment_status
         if search:
-            base_match["client_name_search"] = get_search_token(search)
+            base_match.update(
+                _combine_name_filters(
+                    base_match.pop("client_name_search", None),
+                    get_search_token(search),
+                )
+            )
         if base_match:
-            pipeline.append({"$match": base_match})
+            pipeline.append({"$match": scoped_query(base_match, resolve_laundry_id(current_user))})
 
         # Join with gatepasses to access receiving_date
-        # gate_pass_id is stored as a string, _id is ObjectId — must convert
-        pipeline.append({
-            "$lookup": {
-                "from": "gatepasses",
-                "let": {"gp_id_str": "$gate_pass_id"},
-                "pipeline": [
-                    {"$match": {"$expr": {"$eq": ["$_id", {"$toObjectId": "$$gp_id_str"}]}}},
-                ],
-                "as": "gp",
-            }
-        })
+        pipeline.append(_gatepass_lookup_stage())
 
-        # Filter by gate pass receiving_date (handles null gate_pass_id too)
+        # Filter by gate pass receiving_date
         gp_date_match: dict = {}
         if gate_pass_date_from:
             gp_date_match["$gte"] = day_query(gate_pass_date_from)
@@ -802,7 +868,6 @@ async def list_bills(
         # Drop the gate-pass join field after exposing the date.
         pipeline.append({"$project": {"gp": 0}})
 
-        # Count total before sort/skip/limit
         count_pipeline = pipeline + [{"$count": "total"}]
         count_result = await bills_collection.aggregate(count_pipeline).to_list(1)
         total = count_result[0]["total"] if count_result else 0
@@ -824,11 +889,7 @@ async def list_bills(
 
         return {"items": docs, "total": total}
 
-    # Original simple query (no gate pass date filter)
     query: dict = {}
-
-    if client_name:
-        query["client_name_search"] = get_search_token(client_name)
 
     if quotation_id:
         query["quotation_id"] = quotation_id
@@ -844,9 +905,15 @@ async def list_bills(
             date_filter["$lte"] = day_query_end(date_to)
         query["created_at"] = date_filter
 
-    if search:
-        query["client_name_search"] = get_search_token(search)
+    if client_name or search:
+        query.update(
+            _combine_name_filters(
+                get_search_token(client_name) if client_name else None,
+                get_search_token(search) if search else None,
+            )
+        )
 
+    query = scoped_query(query, resolve_laundry_id(current_user))
     total = await bills_collection.count_documents(query)
     cursor = (
         bills_collection.find(query)
@@ -886,7 +953,9 @@ async def get_unbilled_gatepasses(
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 
-    gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
+    gp_cursor = gatepasses_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("receiving_date", -1)
 
     unbilled_gatepasses = []
 
@@ -995,17 +1064,51 @@ async def get_unbilled_gatepasses(
     return unbilled_gatepasses
 
 
+@router.get("/payments", response_model=list)
+async def list_all_payments(
+    client_name: Optional[str] = Query(None),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=5000),
+    current_user: dict = Depends(require_capability("payment:read")),
+):
+    """All payment receipts in scope, newest first.
+
+    One request replaces N per-bill ``/{bill_id}/payments`` calls for
+    ledger-style screens. Defined before ``/{bill_id}`` so the static path
+    is never swallowed by the wildcard.
+    """
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = day_query(date_from)
+        if date_to:
+            date_filter["$lte"] = day_query_end(date_to)
+        query["payment_date"] = date_filter
+
+    cursor = payments_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("payment_date", -1).skip(skip).limit(limit)
+    results = []
+    async for doc in cursor:
+        try:
+            serialized = _serialize_payment(doc)
+            results.append(await attach_verification_to("payment", doc["_id"], serialized))
+        except HTTPException:
+            pass
+    return results
+
+
 @router.get("/{bill_id}", response_model=BillModel)
 async def get_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    oid = _parse_object_id(bill_id)
-    doc = await bills_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
-        )
+    laundry_id, oid, doc = await _owned_bill(bill_id, current_user)
     serialized = _serialize(doc)
     return await attach_verification_to("bill", oid, serialized)
 
@@ -1030,15 +1133,10 @@ async def update_bill_status(
             detail=f"Invalid status. Must be one of {valid_statuses}",
         )
 
-    oid = _parse_object_id(bill_id)
-    doc = await bills_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
-        )
+    laundry_id, oid, doc = await _owned_bill(bill_id, current_user)
 
     await bills_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {
             "$set": {
                 "payment_status": status_update,
@@ -1059,6 +1157,7 @@ async def update_bill_status(
         "BILL_STATUS_UPDATE",
         "bill",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -1082,10 +1181,7 @@ async def edit_bill(
     payload: BillEdit,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    oid = _parse_object_id(bill_id)
-    doc = await bills_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Bill not found")
+    laundry_id, oid, doc = await _owned_bill(bill_id, current_user)
 
     dec = decrypt_dict(doc, SENSITIVE_FIELDS)
     if dec.get("payment_status") in ("PAID", "CANCELLED"):
@@ -1163,7 +1259,7 @@ async def edit_bill(
         merged["client_name_search"] = get_search_token(merged["client_name"])
 
     await bills_collection.replace_one(
-        {"_id": oid}, encrypt_dict(merged, SENSITIVE_FIELDS)
+        owned_filter(oid, laundry_id), encrypt_dict(merged, SENSITIVE_FIELDS)
     )
 
     updated_doc = await bills_collection.find_one({"_id": oid})
@@ -1179,6 +1275,7 @@ async def edit_bill(
         "bill",
         serialized["id"],
         details={"edited_fields": list(update_fields.keys())},
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -1188,10 +1285,11 @@ async def delete_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("payment:write")),
 ):
+    laundry_id = resolve_laundry_id(current_user)
     oid = _parse_object_id(bill_id)
     # Prefer Cancellation / status CANCELLED instead of hard delete
     result = await bills_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {
             "$set": {
                 "payment_status": "CANCELLED",
@@ -1208,7 +1306,11 @@ async def delete_bill(
     await enqueue_sync("bill", oid, new_version)
 
     await log_audit(
-        current_user.get("auth_id", "system"), "BILL_CANCEL", "bill", bill_id
+        current_user.get("auth_id", "system"),
+        "BILL_CANCEL",
+        "bill",
+        bill_id,
+        laundry_id=laundry_id,
     )
     return {"message": "Bill cancelled successfully"}
 
@@ -1348,10 +1450,12 @@ async def create_payment(
     if existing_created:
         return _serialize_payment(existing_created)
 
-    oid = _parse_object_id(bill_id)
+    laundry_id, oid, _verified_bill = await _owned_bill(bill_id, current_user)
     now = datetime.now(timezone.utc)
     dec_bill, _ = await _reserve_bill_payment(oid, payload.amount, now)
+    assert_same_laundry(dec_bill, laundry_id, "Bill")
     payment_doc = {
+        "laundry_id": laundry_id,
         "bill_id": bill_id,
         "client_name": dec_bill["client_name"],
         "client_name_search": get_search_token(dec_bill["client_name"]),
@@ -1422,6 +1526,7 @@ async def create_payment(
         "PAYMENT_CREATE",
         "payment",
         serialized_pay["id"],
+        laundry_id=laundry_id,
     )
     await idempotency.record_created(request, auth_id, "payment", serialized_pay["id"])
     return serialized_pay
@@ -1432,7 +1537,10 @@ async def list_payments_for_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("payment:read")),
 ):
-    cursor = payments_collection.find({"bill_id": bill_id}).sort("payment_date", -1)
+    laundry_id, _, _ = await _owned_bill(bill_id, current_user)
+    cursor = payments_collection.find(
+        scoped_query({"bill_id": bill_id}, laundry_id)
+    ).sort("payment_date", -1)
     results = []
     async for doc in cursor:
         try:
@@ -1441,3 +1549,34 @@ async def list_payments_for_bill(
         except HTTPException:
             pass
     return results
+
+
+@router.get("/{bill_id}/print-data")
+async def print_bill_data(
+    bill_id: str,
+    include_prefix: bool = Query(
+        False, description="Include hotel-code prefix in bill / gate-pass numbers"
+    ),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    """Return a print-ready projection of a hotel bill.
+
+    When ``include_prefix`` is False (default), the hotel-code prefix is
+    stripped from ``manual_bill_number``, ``manual_gate_pass_number`` and
+    ``alrs_number`` — matching the legacy numbering the hotels are used to
+    seeing on printed invoices.
+    """
+    laundry_id, oid, doc = await _owned_bill(bill_id, current_user)
+    serialized = _serialize(doc)
+    serialized = await _attach_receiving_date(doc, serialized)
+
+    serialized["manual_bill_number"] = format_bill_number(
+        serialized.get("manual_bill_number"), include_prefix
+    )
+    serialized["manual_gate_pass_number"] = format_bill_number(
+        serialized.get("manual_gate_pass_number"), include_prefix
+    )
+    serialized["alrs_number"] = format_bill_number(
+        serialized.get("alrs_number"), include_prefix
+    )
+    return serialized

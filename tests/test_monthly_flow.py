@@ -56,7 +56,9 @@ def _req():
 
 
 def user(name="Alice"):
-    return {"auth_id": f"u-{name}", "user_name": name, "role": "ADMIN"}
+    from conftest import tenant_user
+
+    return tenant_user(f"u-{name}", "lovelaundry")
 
 
 async def put(kind, quantities, day=1, client=CLIENT, year=Y, month=MO):
@@ -146,7 +148,7 @@ async def test_monthly_manual_references_round_trip_to_gate_pass(mocked_db):
     assert bill["alrs_number"] == "ALRS-17"
 
 
-async def test_manual_references_conflict_case_and_whitespace_insensitively():
+async def test_bill_number_conflict_is_case_and_whitespace_insensitive_per_hotel():
     first = MonthlyQuantitiesUpdate(
         quantities={"Towel||": 1}, bill_number="Hotel   Bill 42"
     )
@@ -155,13 +157,30 @@ async def test_manual_references_conflict_case_and_whitespace_insensitively():
     )
 
     duplicate = MonthlyQuantitiesUpdate(
-        quantities={}, gate_pass_number=" hotel bill 42 "
+        quantities={"Towel||": 1}, bill_number=" hotel bill 42 "
     )
     with pytest.raises(HTTPException) as exc:
         await m.update_day_quantities(
             "receiving", CLIENT, Y, MO, 2, duplicate, current_user=user()
         )
     assert exc.value.status_code == 409
+
+
+async def test_same_bill_number_is_allowed_for_different_hotels():
+    first = MonthlyQuantitiesUpdate(
+        quantities={"Towel||": 1}, bill_number="SHARED-1001"
+    )
+    await m.update_day_quantities(
+        "receiving", CLIENT, Y, MO, 1, first, current_user=user()
+    )
+
+    other = MonthlyQuantitiesUpdate(
+        quantities={"Towel||": 1}, bill_number="shared-1001"
+    )
+    result = await m.update_day_quantities(
+        "receiving", "Hotel Kandy", Y, MO, 1, other, current_user=user()
+    )
+    assert result["days"]["1"]["bill_number"].casefold().endswith("shared-1001")
 
 
 async def test_generated_bill_reference_skips_manually_reserved_number(mocked_db):

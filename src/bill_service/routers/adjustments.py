@@ -12,6 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..auth_helper import require_capability
+from ..tenancy import assert_same_laundry, laundry_match, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     adjustments_collection,
@@ -36,10 +37,12 @@ router = APIRouter(prefix="/adjustments", tags=["adjustments"])
 SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 
 
-async def _get_open_gp(gate_pass_id: str):
+async def _get_open_gp(gate_pass_id: str, laundry_id: str | None = None):
     """Fetch and decrypt a non-cancelled gate pass."""
     oid = parse_object_id(gate_pass_id, "gate pass ID")
     gp_doc = await gatepasses_collection.find_one({"_id": oid})
+    if laundry_id:
+        assert_same_laundry(gp_doc, laundry_id, "Gate pass")
     if not gp_doc:
         raise HTTPException(status_code=404, detail="Gate pass not found")
     if gp_doc.get("status") == "CANCELLED":
@@ -54,7 +57,8 @@ async def create_adjustment_request(
     current_user: dict,
 ) -> dict:
     """Create an adjustment request. Does NOT change any quantity."""
-    gp_oid, decrypted = await _get_open_gp(payload.gate_pass_id)
+    laundry_id = resolve_laundry_id(current_user)
+    gp_oid, decrypted = await _get_open_gp(payload.gate_pass_id, laundry_id)
 
     original_qty = None
     for it in decrypted.get("items", []):
@@ -72,6 +76,7 @@ async def create_adjustment_request(
 
     now = datetime.now(timezone.utc)
     adj_doc = {
+        "laundry_id": laundry_id,
         "gate_pass_id": str(gp_oid),
         "item_name": payload.item_name,
         "specification": payload.specification or "",
@@ -100,6 +105,7 @@ async def create_adjustment_request(
             build_item_delta(payload.item_name, payload.specification, original_qty, payload.corrected_qty)
         ],
         meta={"status": "REQUESTED"},
+        laundry_id=laundry_id,
     )
     return adj_doc
 
@@ -124,7 +130,9 @@ async def list_adjustments(
         query["gate_pass_id"] = gate_pass_id
     if status:
         query["status"] = status
-    cursor = adjustments_collection.find(query).sort("created_at", -1)
+    cursor = adjustments_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("created_at", -1)
     out = []
     async for doc in cursor:
         doc["id"] = str(doc["_id"])
@@ -133,9 +141,11 @@ async def list_adjustments(
     return out
 
 
-async def _get_adjustment(adj_id: str):
+async def _get_adjustment(adj_id: str, laundry_id: str | None = None):
     oid = parse_object_id(adj_id, "adjustment ID")
     doc = await adjustments_collection.find_one({"_id": oid})
+    if laundry_id:
+        assert_same_laundry(doc, laundry_id, "Adjustment")
     if not doc:
         raise HTTPException(status_code=404, detail="Adjustment not found")
     return oid, doc
@@ -147,7 +157,8 @@ async def approve_adjustment(
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
     """Approve and apply an adjustment. Must be a different user than the requester."""
-    oid, adj_doc = await _get_adjustment(adjustment_id)
+    laundry_id = resolve_laundry_id(current_user)
+    oid, adj_doc = await _get_adjustment(adjustment_id, laundry_id)
 
     if adj_doc.get("status") != "REQUESTED":
         raise HTTPException(
@@ -162,7 +173,7 @@ async def approve_adjustment(
             detail="Adjustments must be approved by a different user than the requester.",
         )
 
-    gp_oid, gp_dec = await _get_open_gp(adj_doc["gate_pass_id"])
+    gp_oid, gp_dec = await _get_open_gp(adj_doc["gate_pass_id"], laundry_id)
     updated_items, original_qty = be.apply_received_correction(
         gp_dec.get("items", []),
         adj_doc["item_name"],
@@ -213,7 +224,7 @@ async def approve_adjustment(
     )
 
     claim = await adjustments_collection.update_one(
-        {"_id": oid, "status": "REQUESTED"},
+        {"_id": oid, "status": "REQUESTED", **laundry_match(laundry_id)},
         {"$set": {"status": "APPROVING", "updated_at": now}},
     )
     if claim.matched_count != 1:
@@ -223,7 +234,7 @@ async def approve_adjustment(
         )
 
     encrypted_gp = encrypt_dict(new_gp, SENSITIVE_FIELDS)
-    gp_version_filter = {"_id": gp_oid}
+    gp_version_filter = {"_id": gp_oid, **laundry_match(laundry_id)}
     if "updated_at" in gp_dec:
         gp_version_filter["updated_at"] = gp_dec["updated_at"]
     else:
@@ -233,7 +244,7 @@ async def approve_adjustment(
     )
     if write_result.matched_count != 1:
         await adjustments_collection.update_one(
-            {"_id": oid, "status": "APPROVING"},
+            {"_id": oid, "status": "APPROVING", **laundry_match(laundry_id)},
             {
                 "$set": {
                     "status": "REQUESTED",
@@ -255,6 +266,7 @@ async def approve_adjustment(
             user_id=current_user.get("auth_id", "system"),
             user_name=current_user.get("user_name"),
             reason=adj_doc.get("reason"),
+            laundry_id=laundry_id,
         )
     except Exception:
         import logging
@@ -263,7 +275,7 @@ async def approve_adjustment(
         )
 
     await adjustments_collection.update_one(
-        {"_id": oid, "status": "APPROVING"},
+        {"_id": oid, "status": "APPROVING", **laundry_match(laundry_id)},
         {
             "$set": {
                 "status": "APPROVED",
@@ -279,6 +291,7 @@ async def approve_adjustment(
         entity_type="adjustment",
         entity_id=str(oid),
         event_type=EVENT_ADJUSTMENT_APPROVED,
+        laundry_id=laundry_id,
         gate_pass_id=str(gp_oid),
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -302,7 +315,8 @@ async def reject_adjustment(
     adjustment_id: str,
     current_user: dict = Depends(require_capability("gatepass:write")),
 ):
-    oid, adj_doc = await _get_adjustment(adjustment_id)
+    laundry_id = resolve_laundry_id(current_user)
+    oid, adj_doc = await _get_adjustment(adjustment_id, laundry_id)
     if adj_doc.get("status") != "REQUESTED":
         raise HTTPException(
             status_code=409,
@@ -310,7 +324,7 @@ async def reject_adjustment(
         )
     now = datetime.now(timezone.utc)
     result = await adjustments_collection.update_one(
-        {"_id": oid, "status": "REQUESTED"},
+        {"_id": oid, "status": "REQUESTED", **laundry_match(laundry_id)},
         {
             "$set": {
                 "status": "REJECTED",
@@ -329,6 +343,7 @@ async def reject_adjustment(
         entity_type="adjustment",
         entity_id=str(oid),
         event_type=EVENT_ADJUSTMENT_REJECTED,
+        laundry_id=laundry_id,
         gate_pass_id=adj_doc.get("gate_pass_id"),
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),

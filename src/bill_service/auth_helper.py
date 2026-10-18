@@ -99,6 +99,10 @@ ROLE_CAPABILITIES = {
     ]
 }
 
+# Platform administrators hold every capability: support-entry sessions must
+# be able to operate inside the entered laundry. Narrower roles are unchanged.
+ROLE_CAPABILITIES["PLATFORM_ADMIN"] = list(ROLE_CAPABILITIES["ADMIN"])
+
 def require_capability(capability: str):
     """FastAPI dependency to validate fine-grained capabilities."""
     def dependency(current_user: dict = Security(get_current_user)):

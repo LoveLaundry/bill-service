@@ -53,6 +53,24 @@ CANCELLED_STATUS = "CANCELLED"
 DRAFT_STATUS = "DRAFT"
 
 
+def as_qty(value) -> float:
+    """Coerce a stored quantity to a finite float, defaulting to 0.
+
+    Quantity fields are written as numbers, but legacy or hand-edited rows can
+    hold ``None``, a numeric string, or junk. A display/list path must never
+    500 on a bad row, yet the value must never silently become non-zero either.
+    """
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(number):
+        return 0.0
+    return number
+
+
 def item_key(name: str, spec: Optional[str] = None) -> str:
     """Canonical per-item key. Always ``name||spec`` even when spec is empty."""
     return f"{name}||{spec or ''}"
@@ -181,17 +199,22 @@ def compute_available(
     delivered_by_item: Optional[Dict[str, float]] = None,
     returned_by_item: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
-    """Quantity still deliverable per item, never negative.
+    """Quantity still deliverable per item, never negative or above received.
 
     available = received - delivered + returned-but-not-yet-resent
+
+    Clamped to the received quantity: an unvalidated or duplicated return can
+    otherwise push availability above what the hotel ever handed over, letting
+    a phantom quantity be delivered and later billed.
     """
     delivered_by_item = delivered_by_item or {}
     returned_by_item = returned_by_item or {}
     out: Dict[str, float] = {}
     for key, received in received_by_item.items():
-        value = float(received or 0) - float(delivered_by_item.get(key, 0) or 0)
+        received = float(received or 0)
+        value = received - float(delivered_by_item.get(key, 0) or 0)
         value += float(returned_by_item.get(key, 0) or 0)
-        out[key] = max(0, value)
+        out[key] = min(received, max(0, value))
     return out
 
 
@@ -323,7 +346,7 @@ def compute_gate_pass_balance(
         discrepancy = (delivered - float(counted)) if has_count else 0
 
         effective_delivered = max(delivered, received) if marked_delivered else delivered
-        outstanding = max(0, received - effective_delivered + returned)
+        outstanding = min(received, max(0, received - effective_delivered + returned))
         not_received = max(0, expected - received)
         extra_received = max(0, received - expected)
 
@@ -488,6 +511,47 @@ def compute_billable_received_by_name(
     return {
         name: max(0, received_by_name[name] - billed_by_name.get(name, 0))
         for name in received_by_name
+    }
+
+
+def compute_billable_delivered_by_name(
+    delivery_docs: List[dict],
+    billed_by_name: Optional[Dict[str, float]] = None,
+    rewashed_names: Optional[Iterable[str]] = None,
+) -> Dict[str, float]:
+    """Billable quantities for billing, aggregated by item NAME, on a
+    DELIVERED basis.
+
+    The delivered-basis ceiling is the other half of the billing invariant:
+    a hotel may only ever be invoiced for linen that has actually been
+    delivered back to it, minus whatever has already been billed. Billing on
+    the received quantity alone would let a pass that was received but not yet
+    delivered be invoiced in full.
+
+    Billing lines are item-name based, so quantities are summed across the
+    specifications of the same item. Cancelled and DRAFT deliveries never
+    contribute, ``rewashed`` item tags (free re-washes) are excluded, and
+    malformed rows degrade to 0 rather than raising. The result is floored at
+    0 so an over-billed name can never produce a negative ceiling.
+    """
+    billed_by_name = billed_by_name or {}
+    rewashed = {str(n) for n in (rewashed_names or [])}
+    delivered_by_name: Dict[str, float] = {}
+    for dl in delivery_docs or []:
+        if not isinstance(dl, dict):
+            continue
+        if dl.get("status") in (CANCELLED_STATUS, DRAFT_STATUS):
+            continue
+        for it in dl.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            name = it.get("item_name")
+            if not name or name in rewashed or is_rewashed(it):
+                continue
+            delivered_by_name[name] = delivered_by_name.get(name, 0) + as_qty(it.get("quantity"))
+    return {
+        name: max(0, qty - as_qty(billed_by_name.get(name, 0)))
+        for name, qty in delivered_by_name.items()
     }
 
 

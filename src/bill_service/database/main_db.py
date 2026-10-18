@@ -28,7 +28,9 @@ bill_templates_collection: AsyncIOMotorCollection = _db.get_collection("bill_tem
 legacy_invoices_collection: AsyncIOMotorCollection = _db.get_collection("legacy_invoices")
 rewashes_collection: AsyncIOMotorCollection = _db.get_collection("rewashes")
 monthly_entries_collection: AsyncIOMotorCollection = _db.get_collection("monthly_entries")
+linen_category_mappings_collection: AsyncIOMotorCollection = _db.get_collection("linen_category_mappings")
 manual_references_collection: AsyncIOMotorCollection = _db.get_collection("manual_references")
+hotel_codes_collection: AsyncIOMotorCollection = _db.get_collection("hotel_codes")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")
@@ -40,6 +42,8 @@ async def ensure_indexes():
     """Create all required indexes on the MAIN database."""
     # Bills indexes
     await bills_collection.create_index("created_at")
+    await bills_collection.create_index("laundry_id")
+    await bills_collection.create_index([("laundry_id", 1), ("created_at", -1)])
     await bills_collection.create_index("client_name_search")
     await bills_collection.create_index("quotation_id")
 
@@ -48,12 +52,23 @@ async def ensure_indexes():
     await gatepasses_collection.create_index("client_name_search")
     await gatepasses_collection.create_index("status")
     await gatepasses_collection.create_index("created_at")
-    await manual_references_collection.create_index("normalized", unique=True)
+    await gatepasses_collection.create_index([("receiving_date", 1), ("status", 1)])
+    await gatepasses_collection.create_index("laundry_id")
+    await gatepasses_collection.create_index([("laundry_id", 1), ("receiving_date", -1)])
+    # scope_key is the uniqueness key for manual references.
+    # For hotel-scoped fields (bill_number) it is ``{normalized}|hotel:{token}``;
+    # for globally-unique fields it equals ``normalized``.
+    await manual_references_collection.create_index("scope_key", unique=True)
+    # Keep normalized as a non-unique secondary index for look-ups.
+    await manual_references_collection.create_index("normalized")
+    await manual_references_collection.create_index("client_name_search")
 
     # Deliveries indexes
     await deliveries_collection.create_index("gate_pass_id")
     await deliveries_collection.create_index("client_name_search")
     await deliveries_collection.create_index("created_at")
+    await deliveries_collection.create_index("laundry_id")
+    await deliveries_collection.create_index([("laundry_id", 1), ("delivery_date", -1)])
     # A delivery can draw items from several gate passes, so every per-pass
     # balance, listing and availability query matches on this denormalised list
     # rather than on the document-level gate_pass_id. Sparse so legacy rows
@@ -72,22 +87,38 @@ async def ensure_indexes():
     await dispatch_jobs_collection.create_index("status")
     await dispatch_jobs_collection.create_index("assigned_to")
     await dispatch_jobs_collection.create_index("scheduled_at")
+    await dispatch_jobs_collection.create_index("laundry_id")
 
     # Payments indexes
     await payments_collection.create_index("bill_id")
     await payments_collection.create_index("client_name_search")
     await payments_collection.create_index("created_at")
+    await payments_collection.create_index("laundry_id")
+    await payments_collection.create_index([("laundry_id", 1), ("payment_date", -1)])
 
     # Loyalty indexes
     await loyalty_collection.create_index("client_name_search", unique=True)
+    await loyalty_collection.create_index("laundry_id")
+    # Loyalty accounts are per hotel per laundry: migrate the legacy global
+    # unique index to the tenant-compound one. The old index is dropped only
+    # after the new one exists, so uniqueness is never unenforced.
+    await loyalty_collection.create_index(
+        [("client_name_search", 1), ("laundry_id", 1)], unique=True
+    )
+    try:
+        await loyalty_collection.drop_index("client_name_search_1")
+    except Exception:
+        pass
 
     # Audit logs indexes
     await audit_collection.create_index("timestamp")
     await audit_collection.create_index("user_id")
     await audit_collection.create_index("entity_id")
+    await audit_collection.create_index("laundry_id")
 
     # Linens indexes
     await linens_collection.create_index("linen_id", unique=True)
+    await linens_collection.create_index("laundry_id")
     await linens_collection.create_index("category")
     await linens_collection.create_index("status")
     await linens_collection.create_index("client_name")
@@ -97,6 +128,7 @@ async def ensure_indexes():
 
     # Linen events indexes
     await linen_events_collection.create_index("linen_id")
+    await linen_events_collection.create_index("laundry_id")
     await linen_events_collection.create_index("timestamp")
     await linen_events_collection.create_index([("linen_id", 1), ("timestamp", -1)])
     # Transaction/entity journal indexes
@@ -109,6 +141,7 @@ async def ensure_indexes():
     await returns_collection.create_index("client_name_search")
     await returns_collection.create_index("status")
     await returns_collection.create_index("created_at")
+    await returns_collection.create_index("laundry_id")
 
     # Adjustments indexes
     await adjustments_collection.create_index("gate_pass_id")
@@ -120,10 +153,18 @@ async def ensure_indexes():
     await idempotency_collection.create_index("created_at")
 
     # Shop Bills indexes
-    await shop_bills_collection.create_index("bill_number", unique=True)
+    # bill_number is unique per hotel: the stored value includes the hotel-code
+    # prefix (e.g. "RH-1001") so the same suffix can appear for multiple hotels.
+    # A compound index on (client_name_search, bill_number) enforces uniqueness
+    # within each hotel; the plain bill_number index is non-unique for lookups.
+    await shop_bills_collection.create_index(
+        [("client_name_search", 1), ("bill_number", 1)], unique=True
+    )
+    await shop_bills_collection.create_index("bill_number")
     await shop_bills_collection.create_index("client_name_search")
     await shop_bills_collection.create_index("status")
     await shop_bills_collection.create_index("payment_status")
+    await shop_bills_collection.create_index("laundry_id")
     await shop_bills_collection.create_index("created_at")
     await shop_bills_collection.create_index("is_recurring")
     await shop_bills_collection.create_index("locked")
@@ -142,6 +183,7 @@ async def ensure_indexes():
     await rewashes_collection.create_index("client_name_search")
     await rewashes_collection.create_index("date")
     await rewashes_collection.create_index("status")
+    await rewashes_collection.create_index("laundry_id")
 
     # Monthly entries: one doc per (client_name, kind, year, month).
     # The unique index prevents duplicate month docs; day-level uniqueness is
@@ -149,7 +191,9 @@ async def ensure_indexes():
     await monthly_entries_collection.create_index(
         [("client_name", 1), ("kind", 1), ("year", 1), ("month", 1)], unique=True
     )
+    await linen_category_mappings_collection.create_index("normalized_item", unique=True)
     await monthly_entries_collection.create_index("client_name_search")
+    await monthly_entries_collection.create_index("laundry_id")
     await monthly_entries_collection.create_index([("year", 1), ("month", 1)])
 
     # Sync infrastructure indexes
