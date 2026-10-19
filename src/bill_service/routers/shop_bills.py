@@ -1397,6 +1397,8 @@ async def add_tag(
     new_version = await bump_version("shop_bill", raw["_id"])
     await enqueue_sync("shop_bill", raw["_id"], new_version)
 
+    await log_audit(current_user.get("auth_id", "system"), "BILL_TAG_ADD", "shop_bill", bill_id, {"tag": tag})
+
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 
@@ -1422,6 +1424,8 @@ async def remove_tag(
 
     new_version = await bump_version("shop_bill", raw["_id"])
     await enqueue_sync("shop_bill", raw["_id"], new_version)
+
+    await log_audit(current_user.get("auth_id", "system"), "BILL_TAG_REMOVE", "shop_bill", bill_id, {"tag": tag})
 
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
@@ -1464,6 +1468,8 @@ async def add_item(
     new_version = await bump_version("shop_bill", raw["_id"])
     await enqueue_sync("shop_bill", raw["_id"], new_version)
 
+    await log_audit(current_user.get("auth_id", "system"), "BILL_ITEM_ADD", "shop_bill", bill_id, {"item_name": new_item.get("item_name"), "quantity": new_item.get("quantity")})
+
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 
@@ -1497,6 +1503,8 @@ async def remove_item(
 
     new_version = await bump_version("shop_bill", raw["_id"])
     await enqueue_sync("shop_bill", raw["_id"], new_version)
+
+    await log_audit(current_user.get("auth_id", "system"), "BILL_ITEM_REMOVE", "shop_bill", bill_id, {"item_index": item_index})
 
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
@@ -2018,6 +2026,7 @@ async def update_transport_fee(bill_id: str, body: dict = Body(...), current_use
     merged["transport_fee"] = new_fee; merged.update(totals); merged["outstanding_amount"] = round(totals["grand_total"] - doc.get("paid_amount", 0), 2); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_TRANSPORT_FEE", "shop_bill", bill_id, {"transport_fee": new_fee})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.patch("/{bill_id}/taxes")
@@ -2030,6 +2039,7 @@ async def update_taxes(bill_id: str, body: dict = Body(...), current_user: dict 
     merged["taxes"] = new_taxes; merged.update(totals); merged["outstanding_amount"] = round(totals["grand_total"] - doc.get("paid_amount", 0), 2); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_TAXES", "shop_bill", bill_id, {"taxes": new_taxes})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.patch("/{bill_id}/items/{item_index}")
@@ -2047,6 +2057,7 @@ async def update_item(bill_id: str, item_index: int, body: dict = Body(...), cur
     merged["items"] = items; merged.update(totals); merged["outstanding_amount"] = round(totals["grand_total"] - doc.get("paid_amount", 0), 2); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_ITEM_UPDATE", "shop_bill", bill_id, {"item_index": item_index})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.patch("/{bill_id}/items/reorder")
@@ -2062,6 +2073,7 @@ async def reorder_items(bill_id: str, body: dict = Body(...), current_user: dict
     merged["items"] = reordered; merged.update(totals); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_ITEMS_REORDER", "shop_bill", bill_id, {"order": order})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.patch("/{bill_id}/link-quotation")
@@ -2071,6 +2083,7 @@ async def link_quotation(bill_id: str, body: dict = Body(...), current_user: dic
     merged["quotation_id"] = body.get("quotation_id"); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_LINK_QUOTATION", "shop_bill", bill_id, {"quotation_id": body.get("quotation_id")})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.delete("/{bill_id}/link-quotation")
@@ -2080,6 +2093,7 @@ async def unlink_quotation(bill_id: str, current_user: dict = Depends(require_ca
     merged["quotation_id"] = None; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_UNLINK_QUOTATION", "shop_bill", bill_id)
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.post("/bulk-status-notes")
@@ -2111,6 +2125,7 @@ async def dup_opts(bill_id: str, body: dict = Body(...), current_user: dict = De
     doc = {"laundry_id": src.get("laundry_id") or resolve_laundry_id(current_user), "bill_number": bn, "client_name": body.get("client_name", src.get("client_name")), "quotation_id": src.get("quotation_id"), "items": items, "total_quantity": sum(i.get("quantity", 0) for i in items), "total_amount": gt, "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": gt, "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": gt, "notes": None, "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": src["id"], "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_DUPLICATE", "shop_bill", doc["id"], {"source_bill_id": src.get("id")})
     return _dec(doc)
 
 @router.post("/fulltext-search")
@@ -2147,6 +2162,7 @@ async def note_cat(bill_id: str, body: dict = Body(...), current_user: dict = De
     merged["notes"] = body.get("note", ""); merged["notes_history"] = history; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_NOTES_UPDATE", "shop_bill", bill_id, {"category": body.get("category", "general")})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.post("/from-quotation/{quotation_id}", status_code=201)
@@ -2179,6 +2195,7 @@ async def from_quotation(quotation_id: str, current_user: dict = Depends(require
     doc = {"laundry_id": laundry_id, "bill_number": bn, "client_name": q_doc.get("client_name", ""), "quotation_id": quotation_id, "items": items_data, "total_quantity": totals["total_quantity"], "total_amount": totals["total_amount"], "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": totals["grand_total"], "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": totals["grand_total"], "notes": q_doc.get("notes"), "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": None, "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_FROM_QUOTATION", "shop_bill", doc["id"], {"quotation_id": quotation_id})
     return _dec(doc)
 
 @router.get("/stats/daily")
@@ -2240,6 +2257,7 @@ async def dup_template(template_id: str, current_user: dict = Depends(require_ca
     doc = {"laundry_id": laundry_id, "name": f"{src['name']} (Copy)", "client_name": src.get("client_name"), "items": [i.copy() for i in src.get("items", [])], "discounts": src.get("discounts", 0), "transport_fee": src.get("transport_fee", 0), "taxes": src.get("taxes", 0), "notes": src.get("notes"), "use_count": 0, "created_at": now, "updated_at": now}
     result = await bill_templates_collection.insert_one(_enc_template(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("bill_template", result.inserted_id); await enqueue_sync("bill_template", result.inserted_id, v)
+    await log_audit(current_user.get("auth_id", "system"), "TEMPLATE_DUPLICATE", "bill_template", doc["id"], {"source_template_id": template_id})
     return _dec_template(doc)
 
 @router.patch("/templates/{template_id}")
@@ -2252,6 +2270,7 @@ async def update_tpl(template_id: str, body: dict = Body(...), current_user: dic
     merged["updated_at"] = now
     await bill_templates_collection.update_one({"_id": raw["_id"]}, {"$set": _enc_template(merged)})
     v = await bump_version("bill_template", raw["_id"]); await enqueue_sync("bill_template", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "TEMPLATE_UPDATE", "bill_template", template_id)
     return _dec_template(await bill_templates_collection.find_one({"_id": raw["_id"]}))
 
 @router.post("/{bill_id}/attachments")
@@ -2261,6 +2280,7 @@ async def add_att(bill_id: str, body: dict = Body(...), current_user: dict = Dep
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}; merged["attachments"] = atts; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_ATTACHMENT_ADD", "shop_bill", bill_id, {"name": body.get("name", "")})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.get("/{bill_id}/attachments")
@@ -2275,6 +2295,7 @@ async def del_att(bill_id: str, index: int, current_user: dict = Depends(require
     merged = {k: v for k, v in doc.items() if k not in ("id", "_id")}; merged["attachments"] = atts; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_ATTACHMENT_REMOVE", "shop_bill", bill_id, {"index": index})
     return {"message": "Attachment deleted"}
 
 @router.get("/{bill_id}/versions")
@@ -2361,6 +2382,7 @@ async def batch(body: dict = Body(...), current_user: dict = Depends(require_cap
         result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
         v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
         created.append({"bill_number": bn, "id": doc["id"]})
+    await log_audit(current_user.get("auth_id", "system"), "BILL_BATCH_CREATE", "shop_bill", "batch", {"count": len(created)})
     return {"created": len(created), "bills": created}
 
 @router.get("/lookup")
@@ -2471,6 +2493,7 @@ async def refund(bill_id: str, body: dict = Body(...), current_user: dict = Depe
     merged["notes"] = (merged.get("notes") or "") + f"\n[REFUND] Rs. {amt:,.2f}"; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_REFUND", "shop_bill", bill_id, {"amount": amt})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.post("/{bill_id}/credit-note")
@@ -2479,6 +2502,7 @@ async def credit_note(bill_id: str, body: dict = Body(...), current_user: dict =
     doc = {"laundry_id": src.get("laundry_id") or resolve_laundry_id(current_user), "bill_number": bn, "client_name": src["client_name"], "quotation_id": None, "items": [], "total_quantity": 0, "total_amount": -amt, "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": -amt, "status": "COMPLETED", "payment_status": "PAID", "paid_amount": -amt, "outstanding_amount": 0, "notes": f"Credit note for {src.get('bill_number')}: {body.get(chr(114)+chr(101)+chr(97)+chr(115)+chr(111)+chr(110), '')}", "notes_history": [], "delivery_date": None, "tags": ["credit-note"], "locked": True, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": src["id"], "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_CREDIT_NOTE", "shop_bill", doc["id"], {"source_bill_id": src["id"], "amount": amt})
     return _dec(doc)
 
 @router.patch("/{bill_id}/items/bulk-update")
@@ -2497,6 +2521,7 @@ async def bulk_items(bill_id: str, body: dict = Body(...), current_user: dict = 
     merged["items"] = items; merged.update(totals); merged["outstanding_amount"] = round(totals["grand_total"] - doc.get("paid_amount", 0), 2); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_ITEMS_BULK_UPDATE", "shop_bill", bill_id, {"count": len(body.get("items", []))})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 @router.get("/export/summary")
@@ -2662,6 +2687,7 @@ async def archive_bill(bill_id: str, current_user: dict = Depends(require_capabi
     merged["archived"] = True; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_ARCHIVE", "shop_bill", bill_id)
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 
@@ -2672,6 +2698,7 @@ async def restore_bill(bill_id: str, current_user: dict = Depends(require_capabi
     merged["archived"] = False; merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_RESTORE", "shop_bill", bill_id)
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 
@@ -2887,6 +2914,7 @@ async def update_discount(bill_id: str, body: dict = Body(...), current_user: di
     merged["outstanding_amount"] = round(totals["grand_total"] - doc.get("paid_amount", 0), 2); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_DISCOUNT", "shop_bill", bill_id, {"discount": new_discount})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 
@@ -2897,6 +2925,7 @@ async def change_delivery_date(bill_id: str, body: dict = Body(...), current_use
     merged["delivery_date"] = body.get("delivery_date"); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_DELIVERY_DATE", "shop_bill", bill_id, {"delivery_date": body.get("delivery_date")})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 
@@ -2910,6 +2939,7 @@ async def transfer_client(bill_id: str, body: dict = Body(...), current_user: di
     merged["client_name"] = new_name; merged["client_name_search"] = _get_search_token(new_name); merged["updated_at"] = now
     await shop_bills_collection.update_one({"_id": raw["_id"]}, {"$set": _enc(merged)})
     v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
+    await log_audit(current_user.get("auth_id", "system"), "BILL_TRANSFER_CLIENT", "shop_bill", bill_id, {"new_client_name": new_name})
     return _dec(await shop_bills_collection.find_one({"_id": raw["_id"]}))
 
 
@@ -2944,6 +2974,7 @@ async def expire_old(
             await shop_bills_collection.update_one(owned_filter(raw["_id"], laundry_id), {"$set": _enc(merged)})
             v = await bump_version("shop_bill", raw["_id"]); await enqueue_sync("shop_bill", raw["_id"], v)
             expired += 1
+    await log_audit(current_user.get("auth_id", "system"), "BILL_EXPIRE_OLD", "shop_bill", "batch", {"expired": expired, "max_days": max_days})
     return {"expired": expired}
 
 

@@ -142,18 +142,9 @@ async def log_audit(
     details: dict = None,
     laundry_id: str | None = None,
 ):
-    doc = {
-        "user_id": user_id,
-        "action": action,
-        "entity": entity,
-        "entity_id": entity_id,
-        "timestamp": datetime.now(timezone.utc),
-    }
-    if details:
-        doc["details"] = details
-    if laundry_id:
-        doc["laundry_id"] = laundry_id
-    await audit_collection.insert_one(doc)
+    # One writer, one schema — see router_utils.log_audit.
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, details, None, laundry_id)
 
 
 def _recompute_discrepancy(item: dict) -> float:

@@ -94,16 +94,9 @@ async def log_audit(
     entity_id: str,
     laundry_id: str | None = None,
 ):
-    await audit_collection.insert_one(
-        {
-            "user_id": user_id,
-            "action": action,
-            "entity": entity,
-            "entity_id": entity_id,
-            "timestamp": datetime.now(timezone.utc),
-            **({"laundry_id": laundry_id} if laundry_id else {}),
-        }
-    )
+    # One writer, one schema — see router_utils.log_audit.
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, None, None, laundry_id)
 
 
 @router.post(
@@ -771,6 +764,14 @@ async def reopen_all_legacy_gate_passes(
             reopened.append(result)
         else:
             skipped.append(result)
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "GATEPASS_REOPEN_LEGACY",
+        "gatepass",
+        "batch-reopen-legacy",
+        {"reopened": len(reopened), "skipped": len(skipped)},
+        laundry_id=laundry_id,
+    )
     return {"reopened": reopened, "skipped": skipped}
 
 

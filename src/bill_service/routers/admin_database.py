@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends
 
 from ..auth_helper import require_role
 from ..database.connection_manager import ping
+from ..router_utils import log_audit
 from ..services import local_sync_service, synchronization_service
 
 router = APIRouter(prefix="/admin/database", tags=["admin-database"])
@@ -74,6 +75,13 @@ async def database_status(_user: dict = admin_only):
 async def sync_local(_user: dict = admin_only):
     """Run the admin-triggered incremental MAIN -> LOCAL synchronization."""
     report = await local_sync_service.sync_local_database()
+    await log_audit(
+        _user.get("auth_id", "system"),
+        "ADMIN_SYNC_LOCAL",
+        "admin_database",
+        "sync-local",
+        {"status": report.get("status") if isinstance(report, dict) else None},
+    )
     return report
 
 
@@ -81,6 +89,13 @@ async def sync_local(_user: dict = admin_only):
 async def sync_secondary(_user: dict = admin_only):
     """Manually drain the pending MAIN -> SECONDARY sync queue."""
     processed = await synchronization_service.drain_due_jobs(limit=200)
+    await log_audit(
+        _user.get("auth_id", "system"),
+        "ADMIN_SYNC_SECONDARY",
+        "admin_database",
+        "sync-secondary",
+        {"jobs_processed": processed},
+    )
     return {
         "message": "Secondary synchronization triggered",
         "jobs_processed": processed,

@@ -21,7 +21,7 @@ from ..database.main_db import (
     returns_collection,
 )
 from ..models import GatePassAdjustmentRequest
-from ..router_utils import parse_object_id
+from ..router_utils import parse_object_id, log_audit
 from ..services import balance_engine as be
 from ..services.bill_sync import sync_bills_to_gate_pass
 from ..services.transaction_events import (
@@ -105,6 +105,22 @@ async def create_adjustment_request(
             build_item_delta(payload.item_name, payload.specification, original_qty, payload.corrected_qty)
         ],
         meta={"status": "REQUESTED"},
+        laundry_id=laundry_id,
+    )
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "ADJUSTMENT_REQUESTED",
+        "adjustment",
+        adj_doc["id"],
+        {
+            "gate_pass_id": str(gp_oid),
+            "item_name": payload.item_name,
+            "specification": payload.specification or "",
+            "original_qty": original_qty,
+            "corrected_qty": payload.corrected_qty,
+            "reason": payload.reason,
+        },
         laundry_id=laundry_id,
     )
     return adj_doc
@@ -307,6 +323,23 @@ async def approve_adjustment(
         meta={"approved_by": current_user.get("user_name", "")},
     )
 
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "ADJUSTMENT_APPROVED",
+        "adjustment",
+        str(oid),
+        {
+            "gate_pass_id": str(gp_oid),
+            "item_name": adj_doc["item_name"],
+            "specification": adj_doc.get("specification") or "",
+            "original_qty": original_qty,
+            "corrected_qty": adj_doc.get("corrected_qty"),
+            "reason": adj_doc.get("reason"),
+            "approved_by": current_user.get("user_name", ""),
+        },
+        laundry_id=laundry_id,
+    )
+
     return {"id": str(oid), "status": "APPROVED", "gate_pass_id": str(gp_oid)}
 
 
@@ -349,5 +382,20 @@ async def reject_adjustment(
         user_name=current_user.get("user_name"),
         reason=adj_doc.get("reason"),
         meta={"rejected_by": current_user.get("user_name", "")},
+    )
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "ADJUSTMENT_REJECTED",
+        "adjustment",
+        str(oid),
+        {
+            "gate_pass_id": adj_doc.get("gate_pass_id"),
+            "item_name": adj_doc.get("item_name"),
+            "specification": adj_doc.get("specification") or "",
+            "reason": adj_doc.get("reason"),
+            "rejected_by": current_user.get("user_name", ""),
+        },
+        laundry_id=laundry_id,
     )
     return {"id": str(oid), "status": "REJECTED", "gate_pass_id": adj_doc.get("gate_pass_id")}

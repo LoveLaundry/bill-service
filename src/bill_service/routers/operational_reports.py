@@ -20,6 +20,7 @@ from ..database.main_db import (
     linen_category_mappings_collection,
 )
 from ..services.hotel_code import format_bill_number
+from ..router_utils import log_audit
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
 
@@ -660,14 +661,13 @@ async def upsert_linen_category_mapping(
         {"$set": document, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
-    await audit_collection.insert_one({
-        "user_id": current_user.get("auth_id", ""),
-        "action": "LINEN_CATEGORY_MAPPING_UPSERT",
-        "entity": "linen_category_mapping",
-        "entity_id": document["normalized_item"],
-        "details": {"item_name": item_name, "category": category},
-        "timestamp": now,
-    })
+    await log_audit(
+        current_user.get("auth_id", ""),
+        "LINEN_CATEGORY_MAPPING_UPSERT",
+        "linen_category_mapping",
+        document["normalized_item"],
+        {"item_name": item_name, "category": category},
+    )
     return document
 
 
@@ -680,13 +680,12 @@ async def delete_linen_category_mapping(
     result = await linen_category_mappings_collection.delete_one({"normalized_item": normalized_item})
     if not result.deleted_count:
         raise HTTPException(status_code=404, detail="Category mapping not found.")
-    await audit_collection.insert_one({
-        "user_id": current_user.get("auth_id", ""),
-        "action": "LINEN_CATEGORY_MAPPING_DELETE",
-        "entity": "linen_category_mapping",
-        "entity_id": normalized_item,
-        "timestamp": datetime.now(timezone.utc),
-    })
+    await log_audit(
+        current_user.get("auth_id", ""),
+        "LINEN_CATEGORY_MAPPING_DELETE",
+        "linen_category_mapping",
+        normalized_item,
+    )
     return {"deleted": True, "item_name": item_name}
 
 

@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from ..app_time import day_end, parse_day, today
 from ..auth_helper import require_capability
 from ..database.main_db import linen_events_collection
+from ..router_utils import log_audit
 from ..services.transaction_events import EVENT_DAY_CLOSED, record_event
 from ..tenancy import resolve_laundry_id, scoped_query
 
@@ -123,4 +124,12 @@ async def close_day(
     doc = await linen_events_collection.find_one({"_id": event_id})
     if doc:
         doc["id"] = str(doc.pop("_id"))
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "DAY_CLOSED",
+        "day",
+        payload.date,
+        {"note": payload.note, "closed_at": now.isoformat()},
+        laundry_id=laundry_id,
+    )
     return doc

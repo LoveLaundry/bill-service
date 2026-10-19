@@ -57,7 +57,13 @@ def require_role(allowed_roles: list):
     def dependency(current_user: dict = Security(get_current_user)):
         role = str(current_user.get("role") or "").upper()
         allowed_upper = [r.upper() for r in allowed_roles]
-        if role not in allowed_upper:
+        # A platform administrator is a super-account (support sessions): user-service
+        # already treats PLATFORM_ADMIN as satisfying ADMIN, so we must agree here or
+        # every ADMIN-only platform route 403s while the same token holds every
+        # capability via require_capability. Only ADMIN-shaped checks inherit this;
+        # a narrower list such as ["STAFF"] stays exact.
+        is_platform_admin = role == "PLATFORM_ADMIN" and "ADMIN" in allowed_upper
+        if role not in allowed_upper and not is_platform_admin:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Role '{role}' is not authorized to access this resource",

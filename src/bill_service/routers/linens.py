@@ -85,11 +85,10 @@ async def _owned_linen(oid, current_user: dict, label: str = "Linen not found"):
     return laundry_id, doc
 
 
-async def _log_audit(user_id: str, action: str, entity: str, entity_id: str):
-    await audit_collection.insert_one({
-        "user_id": user_id, "action": action, "entity": entity,
-        "entity_id": entity_id, "timestamp": datetime.now(timezone.utc),
-    })
+async def _log_audit(user_id: str, action: str, entity: str, entity_id: str, laundry_id: str | None = None):
+    # One writer, one schema — see router_utils.log_audit.
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, None, None, laundry_id)
 
 
 # ============================================================
@@ -303,6 +302,13 @@ async def update_linen(
         raise HTTPException(status_code=404, detail="Linen not found")
 
     doc = await linens_collection.find_one({"_id": oid})
+    await _log_audit(
+        current_user.get("user_id") or current_user.get("auth_id", ""),
+        "update",
+        "linen",
+        doc_id,
+        laundry_id,
+    )
     return _serialize(doc)
 
 
@@ -326,7 +332,13 @@ async def delete_linen(
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Linen not found")
     await enqueue_delete("linen", oid, new_version)
-    await _log_audit(current_user.get("user_id", ""), "delete", "linen", doc_id)
+    await _log_audit(
+        current_user.get("user_id") or current_user.get("auth_id", ""),
+        "delete",
+        "linen",
+        doc_id,
+        laundry_id,
+    )
 
 
 # ============================================================

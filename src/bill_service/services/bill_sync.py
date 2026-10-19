@@ -84,16 +84,9 @@ async def _write_audit(
     entity_id: str,
     details: Optional[dict] = None,
 ):
-    audit_doc: dict = {
-        "user_id": user_id,
-        "action": action,
-        "entity": entity,
-        "entity_id": entity_id,
-        "timestamp": datetime.now(timezone.utc),
-    }
-    if details:
-        audit_doc["details"] = details
-    await audit_collection.insert_one(audit_doc)
+    # One writer, one schema — see router_utils.log_audit.
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, details)
 
 
 def _recompute_totals(dec: dict, new_items: list[dict]) -> tuple[float, float, float]:

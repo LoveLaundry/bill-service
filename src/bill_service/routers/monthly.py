@@ -43,6 +43,7 @@ from ..services import idempotency
 from ..services import manual_references
 from ..services import balance_engine as be
 from ..services import operations_context as ops_ctx
+from ..router_utils import log_audit
 from ..services.gate_pass_records import create_gate_pass_record, next_receiving_number
 from ..services.hotel_code import format_bill_number, prefix_bill_number
 from ..services.transaction_events import (
@@ -663,6 +664,14 @@ async def update_day_quantities(
         )
 
     updated = await monthly_entries_collection.find_one({"_id": doc["_id"]})
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "MONTHLY_DAY_QUANTITIES_UPDATE",
+        "monthly",
+        str(doc["_id"]),
+        {"kind": kind, "year": year, "month": month, "day": day, "quantities": sanitized},
+        laundry_id=laundry_id,
+    )
     return _serialize_month(updated)
 
 
@@ -993,14 +1002,12 @@ async def confirm_monthly_day(
                 new_status="DRAFT",
                 meta={"origin": "monthly", "year": year, "month": month, "day": day, "draft": True},
             )
-            await audit_collection.insert_one(
-                {
-                    "user_id": auth_id,
-                    "action": "MONTHLY_DELIVERY_DAY_CONFIRM",
-                    "entity": "delivery",
-                    "entity_id": dl_id,
-                    "timestamp": now,
-                }
+            await log_audit(
+                auth_id,
+                "MONTHLY_DELIVERY_DAY_CONFIRM",
+                "delivery",
+                dl_id,
+                laundry_id=laundry_id,
             )
             delivery_ids.append(dl_id)
         refs = {"delivery_ids": delivery_ids}
@@ -1059,15 +1066,7 @@ async def confirm_monthly_day(
             meta={"origin": "monthly", "year": year, "month": month, "day": day,
                   "chargeable": chargeable, "rewash_number": rewash_number},
         )
-        await audit_collection.insert_one(
-            {
-                "user_id": auth_id,
-                "action": "REWASH_RECORD",
-                "entity": "rewash",
-                "entity_id": rw_id,
-                "timestamp": now,
-            }
-        )
+        await log_audit(auth_id, "REWASH_RECORD", "rewash", rw_id, laundry_id=laundry_id)
         refs = {"rewash_ids": [rw_id]}
 
     # Mark the day CONFIRMED, snapshotting refs to the created records.
@@ -1102,15 +1101,7 @@ async def confirm_monthly_day(
               "total_qty": total_qty, "refs": refs, "date": date_str},
     )
 
-    await audit_collection.insert_one(
-        {
-            "user_id": auth_id,
-            "action": "MONTHLY_DAY_CONFIRM",
-            "entity": "monthly",
-            "entity_id": str(month_oid),
-            "timestamp": now,
-        }
-    )
+    await log_audit(auth_id, "MONTHLY_DAY_CONFIRM", "monthly", str(month_oid), laundry_id=laundry_id)
 
     updated_month = await monthly_entries_collection.find_one({"_id": month_oid})
     await idempotency.record_created(request, auth_id, "monthly", str(month_oid))
@@ -1168,6 +1159,14 @@ async def cancel_monthly_day(
         laundry_id=laundry_id,
     )
     updated = await monthly_entries_collection.find_one({"_id": month_doc["_id"]})
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "MONTHLY_DAY_CANCEL",
+        "monthly",
+        str(month_doc["_id"]),
+        {"kind": kind, "year": year, "month": month, "day": day},
+        laundry_id=laundry_id,
+    )
     return _serialize_month(updated)
 
 

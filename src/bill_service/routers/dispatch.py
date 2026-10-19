@@ -63,16 +63,9 @@ async def log_audit(
     entity_id: str,
     laundry_id: str | None = None,
 ):
-    await audit_collection.insert_one(
-        {
-            "user_id": user_id,
-            "action": action,
-            "entity": entity,
-            "entity_id": entity_id,
-            "timestamp": datetime.now(timezone.utc),
-            **({"laundry_id": laundry_id} if laundry_id else {}),
-        }
-    )
+    # One writer, one schema — see router_utils.log_audit.
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, None, None, laundry_id)
 
 
 @router.post("", response_model=DispatchModel, status_code=status.HTTP_201_CREATED)
@@ -251,6 +244,14 @@ async def delete_dispatch_job(
             status_code=status.HTTP_404_NOT_FOUND, detail="Dispatch job not found"
         )
     await enqueue_delete("dispatch", oid, new_version)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "DISPATCH_DELETE",
+        "dispatch",
+        str(oid),
+        laundry_id=laundry_id,
+    )
 
 
 def _haversine(a: tuple[float, float], b: tuple[float, float]) -> float:

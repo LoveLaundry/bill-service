@@ -1,5 +1,6 @@
 """Shared router utilities — deduplicates _serialize, _parse_object_id, log_audit across routers."""
 
+import logging
 from datetime import datetime, timezone
 from typing import Optional
 from bson import ObjectId
@@ -38,20 +39,39 @@ async def log_audit(
     details: Optional[dict] = None,
     audit_collection=None,
     laundry_id: Optional[str] = None,
-):
-    """Write an audit log entry."""
+) -> bool:
+    """Write an audit log entry (the single schema for this service).
+
+    Document keys are canonical (`auth_id` / `entity_type`), plus the legacy
+    aliases `user_id` / `entity` that the report UI and older readers still
+    render. Writing both keeps one writer while every consumer keeps working.
+    Returns False if the write failed — audit loss must be observable.
+    """
     if audit_collection is None:
         from .database.main_db import audit_collection as ac
         audit_collection = ac
 
+    _now = datetime.now(timezone.utc)
     log_entry = {
         "auth_id": auth_id,
+        "user_id": auth_id,
         "action": action,
         "entity_type": entity_type,
+        "entity": entity_type,
         "entity_id": entity_id,
         "details": details or {},
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": _now,
+        # Legacy alias for readers still keying on created_at.
+        "created_at": _now,
     }
     if laundry_id:
         log_entry["laundry_id"] = laundry_id
-    await audit_collection.insert_one(log_entry)
+    try:
+        await audit_collection.insert_one(log_entry)
+        return True
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "audit write failed action=%s entity_type=%s entity_id=%s",
+            action, entity_type, entity_id,
+        )
+        return False

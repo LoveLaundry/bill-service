@@ -145,18 +145,10 @@ async def log_audit(
     details: dict = None,
     laundry_id: str | None = None,
 ):
-    audit_doc = {
-        "user_id": user_id,
-        "action": action,
-        "entity": entity,
-        "entity_id": entity_id,
-        "timestamp": datetime.now(timezone.utc),
-    }
-    if details:
-        audit_doc["details"] = details
-    if laundry_id:
-        audit_doc["laundry_id"] = laundry_id
-    await audit_collection.insert_one(audit_doc)
+    # One writer, one schema — see router_utils.log_audit (canonical keys plus
+    # the legacy aliases the report UI renders).
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, details, None, laundry_id)
 
 
 async def get_quotation_prices(quotation_id: str, laundry_id: str) -> tuple:

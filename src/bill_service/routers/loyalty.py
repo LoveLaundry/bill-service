@@ -7,6 +7,7 @@ from ..tenancy import assert_same_laundry, owned_filter, resolve_laundry_id, sco
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import loyalty_collection
 from ..models import LoyaltyAccount, LoyaltyAdjust, loyalty_tier
+from ..router_utils import log_audit
 
 router = APIRouter(prefix="/loyalty", tags=["loyalty"])
 
@@ -87,6 +88,14 @@ async def adjust_loyalty(
             },
         )
         updated = await loyalty_collection.find_one({"_id": existing["_id"]})
+        await log_audit(
+            current_user.get("auth_id", "system"),
+            "LOYALTY_ADJUST",
+            "loyalty",
+            str(existing["_id"]),
+            {"client_name": payload.client_name, "delta_points": payload.delta_points, "new_points": new_points},
+            laundry_id=laundry_id,
+        )
         return _serialize(updated)
 
     points = max(0, payload.delta_points)
@@ -103,4 +112,12 @@ async def adjust_loyalty(
     encrypted = encrypt_dict(doc, SENSITIVE_FIELDS)
     result = await loyalty_collection.insert_one(encrypted)
     created = await loyalty_collection.find_one({"_id": result.inserted_id})
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "LOYALTY_CREATE",
+        "loyalty",
+        str(result.inserted_id),
+        {"client_name": payload.client_name, "delta_points": payload.delta_points, "new_points": points},
+        laundry_id=laundry_id,
+    )
     return _serialize(created)
