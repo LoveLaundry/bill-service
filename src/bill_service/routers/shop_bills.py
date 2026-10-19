@@ -62,11 +62,16 @@ def _enc(doc: dict) -> dict:
 
 
 def _dec(doc: dict) -> dict:
-    """Decrypt a single shop bill document and normalize _id."""
+    """Decrypt a single shop bill document and normalize _id.
+
+    Plaintext (pre-encryption legacy) documents are returned as-is, mirroring
+    returns.py: freshly-created documents are serialized from the plaintext
+    ``doc`` before it ever carries encryption metadata.
+    """
     try:
         decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to decrypt document: {e}")
+    except (ValueError, KeyError):
+        decrypted = {k: v for k, v in doc.items() if k != "encryption_metadata" and not k.endswith("_search")}
     if "_id" in decrypted:
         decrypted["id"] = str(decrypted["_id"])
         del decrypted["_id"]
@@ -82,8 +87,8 @@ def _dec_template(doc: dict) -> dict:
     """Decrypt a bill template document and normalize _id."""
     try:
         decrypted = decrypt_dict(doc, TEMPLATE_SENSITIVE_FIELDS)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to decrypt template: {e}")
+    except (ValueError, KeyError):
+        decrypted = {k: v for k, v in doc.items() if k != "encryption_metadata" and not k.endswith("_search")}
     if "_id" in decrypted:
         decrypted["id"] = str(decrypted["_id"])
         del decrypted["_id"]
@@ -282,8 +287,8 @@ def _dec_legacy(doc: dict) -> dict:
     """Decrypt a legacy invoice document and normalize _id."""
     try:
         decrypted = decrypt_dict(doc, LEGACY_SENSITIVE_FIELDS)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to decrypt legacy invoice: {e}")
+    except (ValueError, KeyError):
+        decrypted = {k: v for k, v in doc.items() if k != "encryption_metadata" and not k.endswith("_search")}
     if "_id" in decrypted:
         decrypted["id"] = str(decrypted["_id"])
         del decrypted["_id"]
@@ -1938,8 +1943,9 @@ async def dashboard_summary(
     week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     period_start = now - timedelta(days=days)
+    laundry_id = resolve_laundry_id(current_user)
 
-    total_bills = await shop_bills_collection.count_documents({})
+    total_bills = await shop_bills_collection.count_documents(scoped_query({}, laundry_id))
 
     total_revenue = 0.0
     period_count = 0
@@ -1947,7 +1953,7 @@ async def dashboard_summary(
     today_count = today_revenue = 0.0
     week_count = week_revenue = 0.0
     month_count = month_revenue = 0.0
-    async for doc in shop_bills_collection.find(scoped_query({}, resolve_laundry_id(current_user))):
+    async for doc in shop_bills_collection.find(scoped_query({}, laundry_id)):
         d = _dec(doc)
         gt = d.get("grand_total", 0) or 0
         total_revenue += gt
@@ -1972,7 +1978,9 @@ async def dashboard_summary(
     outstanding = 0.0
     overdue_count = 0
     overdue_amount = 0.0
-    async for doc in shop_bills_collection.find({"outstanding_amount": {"$gt": 0}, "status": {"$ne": "CANCELLED"}}):
+    async for doc in shop_bills_collection.find(scoped_query(
+        {"outstanding_amount": {"$gt": 0}, "status": {"$ne": "CANCELLED"}}, laundry_id
+    )):
         d = _dec(doc)
         out = d.get("outstanding_amount", 0) or 0
         outstanding += out
@@ -2143,18 +2151,32 @@ async def note_cat(bill_id: str, body: dict = Body(...), current_user: dict = De
 
 @router.post("/from-quotation/{quotation_id}", status_code=201)
 async def from_quotation(quotation_id: str, current_user: dict = Depends(require_capability("bill:write"))):
-    from ..database.main_db import quotations_collection
+    from ..database.connection_manager import get_client
     from ..crypto_helper import decrypt_dict as _dd
-    q_raw = await quotations_collection.find_one({"_id": parse_object_id(quotation_id, "Quotation ID")})
+    laundry_id = resolve_laundry_id(current_user)
+    q_oid = parse_object_id(quotation_id, "Quotation ID")
+    # Quotations live in quotation-service's MAIN collections, whose database
+    # name differs by deployment; mirror the lookup used elsewhere in this
+    # service. The tenant predicate is applied in the query itself so a
+    # foreign quotation id reads as 404 rather than leaking another tenant's
+    # client/items into the new bill.
+    q_raw = None
+    for db_name in ("quotations_db", "quotations", "laundry_db"):
+        try:
+            q_raw = await get_client("MAIN")[db_name]["quotations"].find_one(
+                scoped_query({"_id": q_oid}, laundry_id)
+            )
+        except Exception:
+            continue
+        if q_raw:
+            break
     if not q_raw: raise HTTPException(status_code=404, detail="Quotation not found")
     try: q_doc = _dd(q_raw, ["client_name", "items", "notes"])
     except Exception: q_doc = q_raw
     now = datetime.now(timezone.utc)
     items_data = [{"item_name": qi.get("item_name", ""), "specification": qi.get("specification"), "category": qi.get("category"), "unit_price": qi.get("unit_price", 0), "quantity": qi.get("quantity", 1), "discount": 0, "discount_type": "FIXED"} for qi in q_doc.get("items", [])]
     _prepare_items(items_data); totals = _calc_totals(items_data); bn = await _generate_bill_number()
-    # Quotation ownership itself is verified once quotation-service is migrated;
-    # until then the bill is stamped with the creator's laundry (fail-closed reads apply).
-    doc = {"laundry_id": resolve_laundry_id(current_user), "bill_number": bn, "client_name": q_doc.get("client_name", ""), "quotation_id": quotation_id, "items": items_data, "total_quantity": totals["total_quantity"], "total_amount": totals["total_amount"], "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": totals["grand_total"], "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": totals["grand_total"], "notes": q_doc.get("notes"), "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": None, "created_at": now, "updated_at": now}
+    doc = {"laundry_id": laundry_id, "bill_number": bn, "client_name": q_doc.get("client_name", ""), "quotation_id": quotation_id, "items": items_data, "total_quantity": totals["total_quantity"], "total_amount": totals["total_amount"], "discounts": 0, "transport_fee": 0, "taxes": 0, "grand_total": totals["grand_total"], "status": "PENDING", "payment_status": "DRAFT", "paid_amount": 0, "outstanding_amount": totals["grand_total"], "notes": q_doc.get("notes"), "notes_history": [], "delivery_date": None, "tags": [], "locked": False, "is_recurring": False, "recurring_interval": None, "recurring_end_date": None, "parent_bill_id": None, "created_at": now, "updated_at": now}
     result = await shop_bills_collection.insert_one(_enc(doc)); doc["id"] = str(result.inserted_id)
     v = await bump_version("shop_bill", result.inserted_id); await enqueue_sync("shop_bill", result.inserted_id, v)
     return _dec(doc)

@@ -103,7 +103,7 @@ async def _find_gate_pass(gp_id: str) -> Optional[dict]:
     return decrypt_dict(doc, GATEPASS_SENSITIVE_FIELDS)
 
 
-async def _find_quotation(quotation_id: Optional[str]) -> Optional[dict]:
+async def _find_quotation(quotation_id: Optional[str], laundry_id: str) -> Optional[dict]:
     """Read a quotation from the MAIN cluster (mirrors bills.py)."""
     from ..database.connection_manager import get_client
 
@@ -117,7 +117,7 @@ async def _find_quotation(quotation_id: Optional[str]) -> Optional[dict]:
     for db_name in ("quotations_db", "quotations", "laundry_db"):
         try:
             coll = motor_client[db_name]["quotations"]
-            qu = await coll.find_one({"_id": q_oid})
+            qu = await coll.find_one(scoped_query({"_id": q_oid}, laundry_id))
             if qu:
                 return decrypt_dict(qu, QUOTATION_SENSITIVE_FIELDS)
         except Exception:
@@ -164,7 +164,7 @@ async def _find_month_doc(
         "month": month,
     }
     if laundry_id:
-        query["laundry_id"] = laundry_id
+        return await monthly_entries_collection.find_one(scoped_query(query, laundry_id))
     return await monthly_entries_collection.find_one(query)
 
 
@@ -206,7 +206,7 @@ async def _build_rows(
 ) -> List[dict]:
     """Rows = quotation line items (expanded by specification) + historical
     extras, ordered by usage desc, priced first, then name."""
-    quotation = await _find_quotation(quotation_id)
+    quotation = await _find_quotation(quotation_id, laundry_id) if laundry_id else None
     row_map: Dict[str, dict] = {}
 
     if quotation:
@@ -1409,10 +1409,11 @@ async def trigger_sync_all(
 ):
     """Trigger sync for ALL hotels in a given month."""
     _parse_month_numbers(payload.year, payload.month)
+    laundry_id = resolve_laundry_id(current_user)
 
-    cursor = monthly_entries_collection.find({
+    cursor = monthly_entries_collection.find(scoped_query({
         "year": payload.year, "month": payload.month,
-    })
+    }, laundry_id))
     hotel_names: set = set()
     async for raw in cursor:
         try:
@@ -1426,7 +1427,7 @@ async def trigger_sync_all(
     all_results = []
     for name in sorted(hotel_names, key=str.casefold):
         for kind in MONTHLY_KINDS:
-            doc = await _find_month_doc(name, kind, payload.year, payload.month)
+            doc = await _find_month_doc(name, kind, payload.year, payload.month, laundry_id)
             if not doc:
                 continue
             days_dict = doc.get("days") or {}

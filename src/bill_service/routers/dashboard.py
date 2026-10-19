@@ -731,7 +731,9 @@ async def get_client_wise_report(current_user: dict = Depends(require_capability
         except Exception:
             continue
 
-    bill_fut = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}}).to_list(length=None)
+    bill_fut = bills_collection.find(
+        scoped_query({"payment_status": {"$ne": "CANCELLED"}}, laundry_id)
+    ).to_list(length=None)
     bill_docs = await bill_fut
     for doc in bill_docs:
         try:
@@ -1476,6 +1478,7 @@ async def today_deliveries(
     """Today's delivery breakdown by client with pending items from ALL open gate passes."""
     from datetime import timedelta as td
 
+    laundry_id = resolve_laundry_id(current_user)
     today_start, today_end = day_bounds(today())
 
     # Step 1: Get today's deliveries grouped by client
@@ -1484,7 +1487,7 @@ async def today_deliveries(
     del_cursor = deliveries_collection.find(scoped_query({
         "created_at": {"$gte": today_start, "$lt": today_end},
         "status": {"$ne": "CANCELLED"},
-    }, resolve_laundry_id(current_user)))
+    }, laundry_id))
     async for doc in del_cursor:
         try:
             dl = _decrypt_del(doc)
@@ -1523,7 +1526,9 @@ async def today_deliveries(
             return False
         return today_start <= lkt(cand) < today_end
 
-    md_cursor = gatepasses_collection.find({"marked_delivered": {"$exists": True}})
+    md_cursor = gatepasses_collection.find(
+        scoped_query({"marked_delivered": {"$exists": True}}, laundry_id)
+    )
     async for doc in md_cursor:
         md = doc.get("marked_delivered") or {}
         if not (_md_in_window(md.get("at")) or _md_in_window(md.get("delivered_date"))):
@@ -1566,10 +1571,10 @@ async def today_deliveries(
     for client, data in client_map.items():
         # Get ALL open gate passes for this client (not just today's)
         received_map: Dict[str, dict] = {}
-        gp_cursor = gatepasses_collection.find({
+        gp_cursor = gatepasses_collection.find(scoped_query({
             "client_name_search": get_search_token(client),
             "status": {"$ne": "CANCELLED"},
-        })
+        }, laundry_id))
         async for doc in gp_cursor:
             try:
                 gp = _decrypt_gp(doc)
@@ -1586,10 +1591,10 @@ async def today_deliveries(
 
         # Get ALL delivered qty for this client across ALL gate passes
         delivered_map: Dict[str, float] = {}
-        del_cursor2 = deliveries_collection.find({
+        del_cursor2 = deliveries_collection.find(scoped_query({
             "client_name_search": get_search_token(client),
             "status": {"$ne": "CANCELLED"},
-        })
+        }, laundry_id))
         client_deliveries = []
         async for doc in del_cursor2:
             try:
@@ -1615,10 +1620,10 @@ async def today_deliveries(
         # Only add the un-recorded remainder per gate pass so a marked pass that
         # shares an item name with other passes of the same client is not under
         # or over counted.
-        md_cursor2 = gatepasses_collection.find({
+        md_cursor2 = gatepasses_collection.find(scoped_query({
             "client_name_search": get_search_token(client),
             "marked_delivered": {"$exists": True},
-        })
+        }, laundry_id))
         async for doc in md_cursor2:
             try:
                 gp = _decrypt_gp(doc)
@@ -1639,9 +1644,9 @@ async def today_deliveries(
         # Calculate pending = total received (all open GPs) - total delivered (all time)
         # Returned items with action RECEIVE_BACK/RE_WASH need to be re-sent, so they count as pending
         returned_map: Dict[str, float] = {}
-        ret_cursor = returns_collection.find({
+        ret_cursor = returns_collection.find(scoped_query({
             "client_name_search": get_search_token(client),
-        })
+        }, laundry_id))
         async for ret_doc in ret_cursor:
             try:
                 try:

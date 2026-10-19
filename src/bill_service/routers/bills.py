@@ -159,7 +159,7 @@ async def log_audit(
     await audit_collection.insert_one(audit_doc)
 
 
-async def get_quotation_prices(quotation_id: str) -> tuple:
+async def get_quotation_prices(quotation_id: str, laundry_id: str) -> tuple:
     """Fetch quotation pricing (the agreed price list) for a client.
 
     A quotation is a PRICE LIST, not a transaction: this function reads only
@@ -192,7 +192,7 @@ async def get_quotation_prices(quotation_id: str) -> tuple:
     for db_name in db_names:
         try:
             coll = motor_client[db_name]["quotations"]
-            quotation_doc = await coll.find_one({"_id": q_oid})
+            quotation_doc = await coll.find_one(scoped_query({"_id": q_oid}, laundry_id))
             if quotation_doc:
                 break
         except Exception:
@@ -357,7 +357,7 @@ async def create_bill(
     gp_quotation_id = payload.quotation_id or (
         gp_dec.get("quotation_id") if gp_doc else None
     )
-    price_map, quotation_client = await get_quotation_prices(gp_quotation_id) if gp_quotation_id else ({}, None)
+    price_map, quotation_client = await get_quotation_prices(gp_quotation_id, laundry_id) if gp_quotation_id else ({}, None)
     if quotation_client and not be.same_client(payload.client_name, quotation_client):
         raise HTTPException(
             status_code=400,

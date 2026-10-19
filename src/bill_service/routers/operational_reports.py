@@ -102,7 +102,7 @@ def _quotation_price_map(line_items: list) -> dict:
     return prices
 
 
-async def _quotation_prices(quotation_id: Optional[str]) -> dict:
+async def _quotation_prices(quotation_id: Optional[str], laundry_id: str) -> dict:
     if not quotation_id:
         return {}
     if not ObjectId.is_valid(quotation_id):
@@ -112,7 +112,9 @@ async def _quotation_prices(quotation_id: Optional[str]) -> dict:
     quotation = None
     for db_name in ("quotations_db", "quotations", "laundry_db"):
         try:
-            quotation = await client[db_name]["quotations"].find_one({"_id": ObjectId(quotation_id)})
+            quotation = await client[db_name]["quotations"].find_one(
+                scoped_query({"_id": ObjectId(quotation_id)}, laundry_id)
+            )
         except Exception:
             continue
         if quotation:
@@ -759,7 +761,7 @@ async def monthly_operations_report(
     quote_ids.update(str(gp.get("quotation_id")) for gp in gate_passes if gp.get("quotation_id"))
     selected_prices = {}
     for quotation_id in quote_ids:
-        selected_prices[quotation_id] = await _quotation_prices(quotation_id)
+        selected_prices[quotation_id] = await _quotation_prices(quotation_id, laundry_id)
         snapshot = payload.quotation_snapshots.get(str(quotation_id))
         if not selected_prices[quotation_id] and snapshot and str(snapshot.get("id")) == str(quotation_id):
             selected_prices[quotation_id] = _quotation_price_map(snapshot.get("line_items", []))

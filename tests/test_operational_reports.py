@@ -79,7 +79,7 @@ async def test_report_defaults_to_latest_hotel_quotation(mocked_db, monkeypatch)
         current_user={"role": "MANAGER", "laundry_id": "lovelaundry", "laundries": [{"id": "lovelaundry", "role": "MANAGER", "status": "ACTIVE"}]},
     )
 
-    assert ("new-quote",) in [call.args for call in quote_prices.await_args_list]
+    assert ("new-quote", "lovelaundry") in [call.args for call in quote_prices.await_args_list]
     assert report["selected_quotations"]["Sunrise Hotel"] == "new-quote"
     assert report["total_income"] == 90.0
 

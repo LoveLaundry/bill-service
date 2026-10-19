@@ -31,7 +31,7 @@ SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 ALLOWED_STATUSES = ("RECEIVED", "DRAFT")
 
 
-async def _quotation_price_snapshot(quotation_id: Optional[str]) -> dict:
+async def _quotation_price_snapshot(quotation_id: Optional[str], laundry_id: str) -> dict:
     if not quotation_id:
         return {}
     try:
@@ -41,11 +41,15 @@ async def _quotation_price_snapshot(quotation_id: Optional[str]) -> dict:
 
     from ..database.connection_manager import get_client
 
+    from ..tenancy import scoped_query
+
     client = get_client("MAIN")
     quotation = None
     for database_name in ("quotations_db", "quotations", "laundry_db"):
         try:
-            quotation = await client[database_name]["quotations"].find_one({"_id": quotation_oid})
+            quotation = await client[database_name]["quotations"].find_one(
+                scoped_query({"_id": quotation_oid}, laundry_id)
+            )
         except Exception:
             continue
         if quotation:
@@ -151,7 +155,7 @@ async def create_gate_pass_record(
         )
 
     now = datetime.now(timezone.utc)
-    price_snapshot = await _quotation_price_snapshot(payload.quotation_id)
+    price_snapshot = await _quotation_price_snapshot(payload.quotation_id, laundry_id)
     doc = {
         "laundry_id": laundry_id,
         "gate_pass_number": payload.gate_pass_number,
