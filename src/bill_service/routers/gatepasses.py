@@ -112,7 +112,9 @@ async def create_gate_pass(
 
     # Idempotent create: a retry with the same X-Idempotency-Key returns the
     # previously created gate pass instead of duplicating it.
-    existing_created = await idempotency.find_previous(request, auth_id, gatepasses_collection)
+    existing_created = await idempotency.find_previous(
+        request, auth_id, laundry_id, "gatepass", gatepasses_collection
+    )
     if existing_created:
         return _serialize(existing_created)
 
@@ -166,7 +168,9 @@ async def create_gate_pass(
         serialized["id"],
         laundry_id=laundry_id,
     )
-    await idempotency.record_created(request, auth_id, "gatepass", serialized["id"])
+    await idempotency.record_created(
+        request, auth_id, "gatepass", serialized["id"], laundry_id
+    )
 
     # ── Back-sync to monthly operations (manual gate passes only).
     # Monthly-generated passes already carry origin.kind=="monthly" and are

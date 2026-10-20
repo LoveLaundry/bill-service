@@ -310,7 +310,9 @@ async def create_bill(
     laundry_id = resolve_laundry_id(current_user)
 
     # Idempotent create: retried requests reuse the previously created bill.
-    existing_created = await idempotency.find_previous(request, auth_id, bills_collection)
+    existing_created = await idempotency.find_previous(
+        request, auth_id, laundry_id, "bill", bills_collection
+    )
     if existing_created:
         return await attach_verification_to(
             "bill", existing_created["_id"], _serialize(existing_created)
@@ -749,7 +751,9 @@ async def create_bill(
         serialized["id"],
         laundry_id=laundry_id,
     )
-    await idempotency.record_created(request, auth_id, "bill", serialized["id"])
+    await idempotency.record_created(
+        request, auth_id, "bill", serialized["id"], laundry_id
+    )
     return serialized
 
 
@@ -1467,13 +1471,15 @@ async def create_payment(
     request: Request = None,
 ):
     auth_id = current_user.get("auth_id", "system")
+    laundry_id, oid, _verified_bill = await _owned_bill(bill_id, current_user)
 
     # Idempotent create: retried payment posts reuse the previous payment.
-    existing_created = await idempotency.find_previous(request, auth_id, payments_collection)
+    existing_created = await idempotency.find_previous(
+        request, auth_id, laundry_id, "payment", payments_collection
+    )
     if existing_created:
         return _serialize_payment(existing_created)
 
-    laundry_id, oid, _verified_bill = await _owned_bill(bill_id, current_user)
     now = datetime.now(timezone.utc)
     dec_bill, _ = await _reserve_bill_payment(oid, payload.amount, now)
     assert_same_laundry(dec_bill, laundry_id, "Bill")
@@ -1551,7 +1557,9 @@ async def create_payment(
         serialized_pay["id"],
         laundry_id=laundry_id,
     )
-    await idempotency.record_created(request, auth_id, "payment", serialized_pay["id"])
+    await idempotency.record_created(
+        request, auth_id, "payment", serialized_pay["id"], laundry_id
+    )
     return serialized_pay
 
 
