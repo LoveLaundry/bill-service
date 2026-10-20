@@ -743,7 +743,9 @@ async def confirm_monthly_day(
 
     auth_id = current_user.get("auth_id", "system")
     laundry_id = resolve_laundry_id(current_user)
-    existing_created = await idempotency.find_previous(request, auth_id, monthly_entries_collection)
+    existing_created = await idempotency.find_previous(
+        request, auth_id, laundry_id, "monthly", monthly_entries_collection
+    )
     if existing_created:
         return _serialize_month(existing_created)
 
@@ -1104,7 +1106,9 @@ async def confirm_monthly_day(
     await log_audit(auth_id, "MONTHLY_DAY_CONFIRM", "monthly", str(month_oid), laundry_id=laundry_id)
 
     updated_month = await monthly_entries_collection.find_one({"_id": month_oid})
-    await idempotency.record_created(request, auth_id, "monthly", str(month_oid))
+    await idempotency.record_created(
+        request, auth_id, "monthly", str(month_oid), laundry_id
+    )
     return _serialize_month(updated_month)
 
 

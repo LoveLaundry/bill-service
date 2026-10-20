@@ -172,10 +172,13 @@ async def create_delivery(
     request: Request = None,
 ):
     auth_id = current_user.get("auth_id", "system")
+    laundry_id = resolve_laundry_id(current_user)
 
     # Idempotent create: a retry with the same X-Idempotency-Key returns the
     # previously created delivery instead of duplicating it.
-    existing_created = await idempotency.find_previous(request, auth_id, deliveries_collection)
+    existing_created = await idempotency.find_previous(
+        request, auth_id, laundry_id, "delivery", deliveries_collection
+    )
     if existing_created:
         return _serialize(existing_created)
 
@@ -223,7 +226,6 @@ async def create_delivery(
     if not be.same_client(payload.client_name, canonical_client):
         raise _client_mismatch_error(payload.client_name, canonical_client)
 
-    laundry_id = resolve_laundry_id(current_user)
     for gp_id in gp_ids:
         assert_same_laundry(gate_passes.get(gp_id), laundry_id, "Gate pass")
 
@@ -310,7 +312,7 @@ async def create_delivery(
     )
     if violations:
         await deliveries_collection.delete_one({"_id": result.inserted_id})
-        await idempotency.clear(request, auth_id)
+        await idempotency.clear(request, auth_id, laundry_id, "delivery")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -386,7 +388,9 @@ async def create_delivery(
         {"source_gate_pass_ids": source_ids, "client_name": canonical_client},
         laundry_id=laundry_id,
     )
-    await idempotency.record_created(request, auth_id, "delivery", delivery_id)
+    await idempotency.record_created(
+        request, auth_id, "delivery", delivery_id, laundry_id
+    )
     return serialized
 
 
