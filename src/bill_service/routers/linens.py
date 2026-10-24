@@ -505,6 +505,7 @@ async def get_linen_events(
     limit: int = Query(50, ge=1, le=500),
     current_user: dict = Depends(require_capability("linen:read")),
 ):
+    oid = _parse_object_id(doc_id)
     _, doc = await _owned_linen(oid, current_user)
 
     query = {"linen_id": doc["linen_id"]}

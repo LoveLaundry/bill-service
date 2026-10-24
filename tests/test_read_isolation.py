@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from bill_service.crypto_helper import encrypt_dict
 from bill_service.routers.bills import SENSITIVE_FIELDS as BILL_SENSITIVE
-from bill_service.models import DispatchCreate, LinenCreate, LoyaltyAdjust
+from bill_service.models import DispatchCreate, LinenCreate, LinenScanAction, LoyaltyAdjust
 from bill_service.routers import (
     dashboard,
     day_close,
@@ -192,6 +192,20 @@ async def test_linen_crud_is_tenant_scoped(mocked_db):
     assert {i.linen_id for i in listed_b.items} == {made_b["linen_id"]}
     with pytest.raises(HTTPException):
         await linens.get_linen(made_a["id"], ub())
+
+
+async def test_linen_event_history_is_returned(mocked_db):
+    """The profile's Movement History must load the scans for that linen."""
+    made = await linens.create_linen(
+        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X"), ua()
+    )
+    await linens.scan_linen(made["id"], LinenScanAction(action="collect"), ua())
+
+    history = await linens.get_linen_events(made["id"], skip=0, limit=50, current_user=ua())
+
+    assert history.total == 1
+    assert history.items[0].linen_id == made["linen_id"]
+    assert history.items[0].to_status == "COLLECTED"
 
 
 async def test_loyalty_is_per_laundry(mocked_db):
