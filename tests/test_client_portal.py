@@ -1,4 +1,4 @@
-﻿"""Hotel client portal: isolation, money arithmetic, and the negative contract.
+"""Hotel client portal: isolation, money arithmetic, and the negative contract.
 
 The portal is the only surface an external hotel can reach. These tests assert
 that it shows exactly one hotel's records, that money comes from stored values
@@ -138,7 +138,7 @@ async def seed_delivery(mocked_db, *, hotel, laundry=LAUNDRY, status="DELIVERED"
 
 def test_client_scope_is_extracted():
     scope = resolve_client_scope(current_user=client_session())
-    assert scope == {"laundry_id": LAUNDRY, "client_name": HOTEL_A}
+    assert scope == {"laundry_id": LAUNDRY, "client_name": HOTEL_A, "client_type": "HOTEL"}
 
 
 def test_scope_normalises_the_laundry_id():
