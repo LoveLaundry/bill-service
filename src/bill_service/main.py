@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import traceback
 
 from fastapi import FastAPI, HTTPException, Request
@@ -11,6 +11,7 @@ from .routers.admin_database import router as admin_database_router
 from .routers.adjustments import router as adjustments_router
 from .routers.bills import router as bills_router
 from .routers.client_portal import router as client_portal_router
+from .routers.client_shop_orders import router as client_shop_orders_router
 from .routers.deliveries import router as deliveries_router
 from .routers.events import router as events_router
 from .routers.dispatch import router as dispatch_router
@@ -120,6 +121,7 @@ app.include_router(notifications_router)
 app.include_router(operational_reports_router)
 app.include_router(shop_bills_router)
 app.include_router(client_portal_router)
+app.include_router(client_shop_orders_router)
 app.include_router(admin_database_router)
 
 # Background sync worker: MAIN -> SECONDARY replication with retry/backoff.

@@ -1,4 +1,4 @@
-﻿"""Shared harness for DB-backed business-logic tests.
+"""Shared harness for DB-backed business-logic tests.
 
 No real MongoDB instance is required. A ``mongomock-motor`` database stands
 in for every MAIN / SECONDARY / LOCAL collection, patched onto the database
@@ -75,6 +75,7 @@ DEPENDENT_MODULES = [
     "bill_service.services.local_sync_service",
     "bill_service.routers.bills",
     "bill_service.routers.client_portal",
+    "bill_service.routers.client_shop_orders",
     "bill_service.routers.gatepasses",
     "bill_service.routers.shop_bills",
     "bill_service.routers.deliveries",
