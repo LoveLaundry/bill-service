@@ -149,6 +149,7 @@ async def ensure_indexes():
     # Adjustments indexes
     await adjustments_collection.create_index("gate_pass_id")
     await adjustments_collection.create_index("status")
+    await adjustments_collection.create_index("laundry_id")
     await adjustments_collection.create_index("created_at")
 
     # Idempotency keys (unique per user:key)
@@ -175,6 +176,7 @@ async def ensure_indexes():
     # Bill Templates indexes
     await bill_templates_collection.create_index("name")
     await bill_templates_collection.create_index("client_name_search")
+    await bill_templates_collection.create_index("laundry_id")
 
     # Legacy invoices indexes
     await legacy_invoices_collection.create_index("invoice_number", unique=True)
