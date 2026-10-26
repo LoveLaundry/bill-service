@@ -393,8 +393,11 @@ async def _live_operations_summary(
         )
     }
     month_start, month_end = month_bounds(year, month)
+    _delivery_query: dict = {"delivery_date": {"$gte": month_start, "$lt": month_end}}
+    if laundry_id:
+        _delivery_query = scoped_query(_delivery_query, laundry_id)
     async for delivery_doc in deliveries_collection.find(
-        {"delivery_date": {"$gte": month_start, "$lt": month_end}}
+        _delivery_query
     ):
         delivery = decrypt_dict(delivery_doc, DELIVERY_SENSITIVE_FIELDS)
         if (delivery.get("client_name") or "").strip().casefold() != client_name.strip().casefold():

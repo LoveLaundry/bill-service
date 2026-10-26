@@ -20,6 +20,7 @@ loyalty_collection: AsyncIOMotorCollection = _db.get_collection("loyalty_account
 audit_collection: AsyncIOMotorCollection = _db.get_collection("audit_logs")
 linens_collection: AsyncIOMotorCollection = _db.get_collection("linens")
 linen_events_collection: AsyncIOMotorCollection = _db.get_collection("linen_events")
+live_clocks_collection: AsyncIOMotorCollection = _db.get_collection("live_clocks")
 returns_collection: AsyncIOMotorCollection = _db.get_collection("returns")
 adjustments_collection: AsyncIOMotorCollection = _db.get_collection("adjustments")
 idempotency_collection: AsyncIOMotorCollection = _db.get_collection("idempotency_keys")
@@ -125,6 +126,8 @@ async def ensure_indexes():
     await linens_collection.create_index("condition")
     await linens_collection.create_index("created_at")
     await linens_collection.create_index("last_scanned_date")
+
+    await live_clocks_collection.create_index("laundry_id", unique=True)
 
     # Linen events indexes
     await linen_events_collection.create_index("linen_id")

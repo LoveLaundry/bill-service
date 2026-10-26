@@ -21,6 +21,7 @@ from ..database.main_db import (
     audit_collection,
     bills_collection,
 )
+from ..live_clock import bump_live_clock, read_live_clock
 from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..models import (
     LinenCreate,
@@ -85,6 +86,11 @@ async def _owned_linen(oid, current_user: dict, label: str = "Linen not found"):
     return laundry_id, doc
 
 
+async def _note_change(laundry_id: str, reason: str) -> None:
+    """Advance the live clock so other sessions refetch this laundry's linen."""
+    await bump_live_clock(laundry_id, reason)
+
+
 async def _log_audit(user_id: str, action: str, entity: str, entity_id: str, laundry_id: str | None = None):
     # One writer, one schema — see router_utils.log_audit.
     from ..router_utils import log_audit as canonical_log_audit
@@ -137,6 +143,7 @@ async def create_linen(
     doc["_id"] = result.inserted_id
 
     await _log_audit(current_user.get("user_id", ""), "create", "linen", str(result.inserted_id))
+    await _note_change(laundry_id, "create")
 
     return _serialize(doc)
 
@@ -192,8 +199,20 @@ async def create_linen_bulk(
         created.append(_serialize(doc))
 
     await _log_audit(current_user.get("user_id", ""), "bulk_create", "linen", f"count={len(created)}")
+    await _note_change(laundry_id, "bulk_create")
 
     return {"items": created, "count": len(created)}
+
+
+# ============================================================
+#  LIVE CLOCK — other sessions poll this to refetch instantly
+# ============================================================
+@router.get("/live-clock")
+async def get_live_clock(
+    current_user: dict = Depends(require_capability("linen:read")),
+):
+    laundry_id = resolve_laundry_id(current_user)
+    return {"clock": await read_live_clock(laundry_id)}
 
 
 # ============================================================
@@ -277,6 +296,7 @@ async def get_linen_by_code(
         {"$set": {"last_scanned_date": now, "updated_at": now}},
     )
     doc["last_scanned_date"] = now
+    await _note_change(laundry_id, "lookup")
     return _serialize(doc)
 
 
@@ -309,6 +329,7 @@ async def update_linen(
         doc_id,
         laundry_id,
     )
+    await _note_change(laundry_id, "update")
     return _serialize(doc)
 
 
@@ -339,6 +360,7 @@ async def delete_linen(
         doc_id,
         laundry_id,
     )
+    await _note_change(laundry_id, "delete")
 
 
 # ============================================================
@@ -412,6 +434,7 @@ async def scan_linen(
     await linen_events_collection.insert_one(event_doc)
 
     await _log_audit(current_user.get("user_id", ""), f"scan:{action}", "linen", doc_id)
+    await _note_change(laundry_id, f"scan:{action}")
 
     # Return updated linen
     updated_doc = await linens_collection.find_one({"_id": oid})
@@ -491,6 +514,8 @@ async def bulk_scan_linens(
         results.append({"linen_id": code, "from_status": from_status, "to_status": to_status})
 
     await _log_audit(current_user.get("user_id", ""), f"bulk_scan:{action}", "linen", f"count={len(results)}")
+    if results:
+        await _note_change(laundry_id, f"bulk_scan:{action}")
 
     return {"processed": results, "errors": errors, "total_processed": len(results), "total_errors": len(errors)}
 
@@ -621,5 +646,6 @@ async def generate_linen_tags(
         created.append(_serialize(doc))
 
     await _log_audit(current_user.get("user_id", ""), "generate_tags", "linen", f"count={len(created)}")
+    await _note_change(laundry_id, "generate_tags")
 
     return {"items": created, "count": len(created)}

@@ -234,6 +234,67 @@ async def test_day_close_is_per_laundry(mocked_db):
     assert seen_a is not None
 
 
+async def test_shop_bill_stats_overview_is_tenant_scoped(mocked_db):
+    """Both aggregate stages of the overview (totals and per-status counts)."""
+    from bill_service.routers import shop_bills
+
+    async def seed(laundry_id, status, grand_total, paid):
+        await mocked_db["shop_bills_collection"].insert_one(encrypt_dict({
+            "laundry_id": laundry_id,
+            "client_name": "Hotel X",
+            "status": status,
+            "grand_total": grand_total,
+            "paid_amount": paid,
+            "outstanding_amount": grand_total - paid,
+            "created_at": _now(),
+        }, shop_bills.SENSITIVE_FIELDS))
+
+    await seed(LAUNDRY_A, "COMPLETED", 100.0, 40.0)
+    await seed(LAUNDRY_A, "PENDING", 60.0, 0.0)
+    await seed(LAUNDRY_B, "COMPLETED", 900.0, 900.0)
+
+    overview_a = await shop_bills.stats_overview(ua())
+    overview_b = await shop_bills.stats_overview(ub())
+
+    assert overview_a["total_bills"] == 2
+    assert overview_a["total_revenue"] == 160.0
+    assert overview_a["total_paid"] == 40.0
+    assert overview_a["total_outstanding"] == 120.0
+    assert overview_a["status_counts"] == {"COMPLETED": 1, "PENDING": 1}
+
+    assert overview_b["total_bills"] == 1
+    assert overview_b["total_revenue"] == 900.0
+    assert overview_b["status_counts"] == {"COMPLETED": 1}
+
+
+async def test_monthly_operations_summary_is_tenant_scoped(mocked_db):
+    """The month delivery scan counts only the caller's laundry."""
+    from bill_service import app_time
+    from bill_service.routers import monthly as m
+
+    day = app_time.today()
+    year, month = day.year, day.month
+    delivery_date = app_time.day_start(day)
+
+    async def seed(laundry_id, qty):
+        await mocked_db["deliveries_collection"].insert_one(encrypt_dict({
+            "laundry_id": laundry_id,
+            "client_name": "Hotel X",
+            "status": "COMPLETED",
+            "delivery_date": delivery_date,
+            "items": [{"item_name": "Towel", "quantity": qty}],
+        }, m.DELIVERY_SENSITIVE_FIELDS))
+
+    await seed(LAUNDRY_A, 7)
+    await seed(LAUNDRY_B, 500)
+
+    summary_a = await m._live_operations_summary("Hotel X", year, month, LAUNDRY_A)
+    summary_b = await m._live_operations_summary("Hotel X", year, month, LAUNDRY_B)
+
+    assert summary_a["totals"]["delivered_qty"]["pcs"] == 7
+    assert summary_b["totals"]["delivered_qty"]["pcs"] == 500
+
+
 async def test_events_timeline_is_tenant_scoped(mocked_db):
     from bill_service.services.transaction_events import record_event
 
