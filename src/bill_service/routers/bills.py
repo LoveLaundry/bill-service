@@ -1611,3 +1611,124 @@ async def print_bill_data(
         serialized.get("alrs_number"), include_prefix
     )
     return serialized
+
+
+class PaymentReverse(BaseModel):
+    """Payload for reversing a recorded payment."""
+
+    reason: Optional[str] = None
+
+
+@router.post("/payments/{payment_id}/reverse", response_model=dict)
+async def reverse_payment(
+    payment_id: str,
+    payload: PaymentReverse,
+    current_user: dict = Depends(require_capability("payment:write")),
+):
+    """Undo a payment and restore the bill's balance.
+
+    Order matters: the payment row is claimed first with a conditional update,
+    so two simultaneous reversals cannot both subtract the amount. The bill is
+    only unwound after that claim succeeds, and the claim is released again if
+    the bill update fails — otherwise a crash midway would leave money removed
+    from the balance with nothing recording why.
+    """
+    try:
+        pid = ObjectId(payment_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    stored = await payments_collection.find_one({"_id": pid})
+    if not stored:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    payment = _serialize_payment(stored)
+    laundry_id, oid, bill = await _owned_bill(str(payment["bill_id"]), current_user)
+    assert_same_laundry(payment, laundry_id, "Payment")
+
+    if payment.get("reversed_at"):
+        raise HTTPException(status_code=409, detail="This payment has already been reversed")
+    if str(bill.get("status") or "").upper() in {"CANCELLED", "VOID"}:
+        raise HTTPException(
+            status_code=409,
+            detail="A cancelled bill cannot have its payments reversed",
+        )
+
+    now = datetime.now(timezone.utc)
+    claim = await payments_collection.update_one(
+        {"_id": pid, "reversed_at": {"$exists": False}},
+        {
+            "$set": {
+                "reversed_at": now,
+                "reversed_by": current_user.get("auth_id", "system"),
+                "reversal_reason": payload.reason,
+            }
+        },
+    )
+    if claim.modified_count == 0:
+        raise HTTPException(status_code=409, detail="This payment has already been reversed")
+
+    amount = round(float(payment["amount"]), 2)
+    try:
+        restored = None
+        for _ in range(20):
+            current = await bills_collection.find_one({"_id": oid})
+            if not current:
+                raise RuntimeError("Bill disappeared while reversing a payment")
+
+            bill_now = _serialize(current)
+            paid = round(float(bill_now.get("paid_amount") or 0), 2)
+            new_paid = max(0.0, round(paid - amount, 2))
+            total = round(float(bill_now["grand_total"]), 2)
+            outstanding = round(total - new_paid, 2)
+            if outstanding < 0.01:
+                outstanding = 0.0
+            if outstanding == 0.0:
+                status = "PAID"
+            elif new_paid > 0:
+                status = "PARTIALLY_PAID"
+            else:
+                status = "PENDING"
+
+            # Conditional on the balance that was read: a concurrent payment
+            # must not be overwritten by this reversal.
+            written = await bills_collection.update_one(
+                {"_id": oid, "paid_amount": bill_now.get("paid_amount")},
+                {
+                    "$set": {
+                        "paid_amount": new_paid,
+                        "outstanding_amount": outstanding,
+                        "payment_status": status,
+                    }
+                },
+            )
+            if written.modified_count:
+                restored = {
+                    "paid_amount": new_paid,
+                    "outstanding_amount": outstanding,
+                    "payment_status": status,
+                }
+                break
+    except Exception:
+        await payments_collection.update_one(
+            {"_id": pid},
+            {"$unset": {"reversed_at": "", "reversed_by": "", "reversal_reason": ""}},
+        )
+        raise
+
+    if restored is None:
+        await payments_collection.update_one(
+            {"_id": pid},
+            {"$unset": {"reversed_at": "", "reversed_by": "", "reversal_reason": ""}},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="The bill changed while reversing; nothing was altered. Try again.",
+        )
+
+    return {
+        "reversed": True,
+        "amount": amount,
+        "payment_id": str(pid),
+        "bill": restored,
+    }
