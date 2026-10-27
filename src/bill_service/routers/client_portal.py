@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, Security
 from bson import ObjectId
 
-from ..app_time import month_bounds
+from ..app_time import month_bounds, today as business_today
 from ..auth_helper import get_current_user
 from ..crypto_helper import decrypt_dict, get_search_token
 from ..database.main_db import (
@@ -398,6 +398,10 @@ async def shop_summary(scope: Dict[str, str] = Security(resolve_shop_scope)) -> 
     outstanding = 0.0
     invoiced_month = 0.0
     scanned = 0
+    # One fixed business-month window for the whole summary. Deriving bounds
+    # from each record makes every historical bill fall inside its own month.
+    current_day = business_today()
+    month_start, month_end = month_bounds(current_day.year, current_day.month)
     async for doc in shop_bills_collection.find(query, SHOP_BILL_PROJECTION).limit(5000):
         scanned += 1
         status = str(doc.get("payment_status") or "").upper()
@@ -406,10 +410,12 @@ async def shop_summary(scope: Dict[str, str] = Security(resolve_shop_scope)) -> 
         if status in OUTSTANDING_STATUSES:
             outstanding += _money(doc.get("outstanding_amount"))
         created = doc.get("created_at")
-        if isinstance(created, date):
-            start, end = month_bounds(created.year, created.month)
-            if start <= created < end and status != "CANCELLED":
-                invoiced_month += _money(doc.get("grand_total"))
+        if (
+            isinstance(created, date)
+            and month_start <= created < month_end
+            and status != "CANCELLED"
+        ):
+            invoiced_month += _money(doc.get("grand_total"))
 
     return {
         "shop": scope["client_name"],
