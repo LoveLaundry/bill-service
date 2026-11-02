@@ -24,6 +24,7 @@ from ..database.main_db import (
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..services import balance_engine as be
+from ..services.operations_context import source_filter
 from ..services.hotel_code import format_bill_number
 from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
@@ -514,8 +515,6 @@ async def create_bill(
         # Derive billable items from the gate pass RECEIVED quantities,
         # minus whatever has already been billed for the pass (GP-leg bills
         # reference gate_pass_id; delivery-leg bills reference its deliveries).
-        from ..services.operations_context import source_filter
-
         gp_del_ids = []
         gp_del_cursor = deliveries_collection.find(
             {**source_filter(payload.gate_pass_id), "status": {"$ne": "CANCELLED"}}

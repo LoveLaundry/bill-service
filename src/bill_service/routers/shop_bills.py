@@ -1765,10 +1765,6 @@ async def bulk_delete(
         if not raw:
             continue
         try:
-            assert_same_laundry(raw, _bulk_laundry, "Shop bill")
-        except HTTPException:
-            continue
-        try:
             assert_same_laundry(raw, laundry_id, "Shop bill")
         except HTTPException:
             continue

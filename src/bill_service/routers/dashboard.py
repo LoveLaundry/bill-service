@@ -1858,17 +1858,19 @@ async def export_deliveries_csv(
 HEADER_FONT = None
 HEADER_FILL = None
 HEADER_ALIGN = None
+BODY_ALIGN = None
 THIN_BORDER = None
 
 
 def _init_openpyxl():
-    global HEADER_FONT, HEADER_FILL, HEADER_ALIGN, THIN_BORDER
+    global HEADER_FONT, HEADER_FILL, HEADER_ALIGN, THIN_BORDER, BODY_ALIGN
     if HEADER_FONT is not None:
         return
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
     HEADER_FILL = PatternFill(start_color="DC2626", end_color="DC2626", fill_type="solid")
     HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    BODY_ALIGN = Alignment(vertical="center")
     THIN_BORDER = Border(
         left=Side(style="thin"),
         right=Side(style="thin"),
@@ -1889,7 +1891,7 @@ def _style_sheet(ws, headers, rows):
         for col_idx, val in enumerate(row_data, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.border = THIN_BORDER
-            cell.alignment = Alignment(vertical="center")
+            cell.alignment = BODY_ALIGN
     for col_idx, h in enumerate(headers, 1):
         max_len = max(len(str(h)), *(len(str(r[col_idx - 1])) for r in rows) if rows else [0])
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 4, 40)
