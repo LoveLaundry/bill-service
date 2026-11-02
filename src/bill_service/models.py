@@ -586,6 +586,34 @@ class LinenStats(BaseModel):
     recently_scanned: int = 0
 
 
+class LinenTransition(BaseModel):
+    """One scan action the operator can perform, as the server defines it.
+
+    Clients render their state pickers from this instead of keeping their own
+    copy of the status vocabulary — the vocabulary lives in `LINEN_STATUSES`
+    and the mapping lives in the router that performs the transition.
+    """
+
+    action: str
+    label: str
+    to_status: str
+    to_status_label: str
+    custody: str  # hotel | laundry | exception
+    terminal: bool = False
+
+
+class LinenTransitionGroup(BaseModel):
+    custody: str
+    label: str
+    description: str
+    transitions: List[LinenTransition]
+
+
+class LinenTransitionList(BaseModel):
+    groups: List[LinenTransitionGroup]
+    statuses: List[str]
+
+
 class LinenTagGenerate(BaseModel):
     category: str
     item_type: str

@@ -34,6 +34,9 @@ from ..models import (
     LinenEventListResponse,
     LinenStats,
     LinenTagGenerate,
+    LinenTransition,
+    LinenTransitionGroup,
+    LinenTransitionList,
     LINEN_STATUSES,
 )
 
@@ -95,6 +98,102 @@ async def _log_audit(user_id: str, action: str, entity: str, entity_id: str, lau
     # One writer, one schema — see router_utils.log_audit.
     from ..router_utils import log_audit as canonical_log_audit
     return await canonical_log_audit(user_id, action, entity, entity_id, None, None, laundry_id)
+
+
+# --- Scan action contract ---
+# The single definition of what a scan action does. It used to be re-typed
+# inline inside `scan_linen` and `bulk_scan_linens`, where the two copies could
+# drift apart without anything noticing. `GET /linens/transitions` publishes it
+# so no client has to keep a third copy.
+ACTION_STATUS_MAP: dict = {
+    "collect": "COLLECTED",
+    "receive": "AT_LAUNDRY",
+    "start_wash": "WASHING",
+    "complete_wash": "DRYING",
+    "press": "PRESSING",
+    "ready": "READY",
+    "deliver": "DELIVERED",
+    "mark_missing": "MISSING",
+    "mark_damaged": "DAMAGED",
+    "retire": "RETIRED",
+}
+
+# Which side of the HOTEL -> LAUNDRY -> HOTEL cycle performs each action.
+# Derived from the operational meaning of the existing statuses; it adds no
+# state and renames nothing. Exceptions are grouped apart because they are not
+# a step in the cycle — see docs/linen-lifecycle-investigation.md §3.
+ACTION_CUSTODY: dict = {
+    "collect": "hotel",
+    "receive": "laundry",
+    "start_wash": "laundry",
+    "complete_wash": "laundry",
+    "press": "laundry",
+    "ready": "laundry",
+    "deliver": "laundry",
+    "retire": "laundry",
+    "mark_missing": "exception",
+    "mark_damaged": "exception",
+}
+
+CUSTODY_GROUPS: list = [
+    {
+        "custody": "hotel",
+        "label": "Hotel Hands",
+        "description": "Linens leaving a hotel for the laundry",
+    },
+    {
+        "custody": "laundry",
+        "label": "Laundry Hands",
+        "description": "Processing at the laundry and return to the hotel",
+    },
+    {
+        "custody": "exception",
+        "label": "Exceptions",
+        "description": "Handover discrepancies, recorded without a cycle step",
+    },
+]
+
+# A retired linen has no further lifecycle; a missing/damaged one does.
+TERMINAL_ACTIONS = {"retire"}
+
+# Action labels are UI text but belong next to the action they describe.
+ACTION_LABELS: dict = {
+    "collect": "Collect",
+    "receive": "Receive",
+    "start_wash": "Start Wash",
+    "complete_wash": "Complete Wash",
+    "press": "Press",
+    "ready": "Ready",
+    "deliver": "Deliver",
+    "mark_missing": "Mark Missing",
+    "mark_damaged": "Mark Damaged",
+    "retire": "Retire",
+}
+
+
+def _status_label(status_value: str) -> str:
+    """`AT_LAUNDRY` -> `At Laundry`. Humanising here keeps the vocabulary and
+    its display name in the same place."""
+    return status_value.replace("_", " ").title()
+
+
+def _transition_catalogue() -> list:
+    by_custody: dict = {g["custody"]: [] for g in CUSTODY_GROUPS}
+    for action, to_status in ACTION_STATUS_MAP.items():
+        by_custody[ACTION_CUSTODY[action]].append(
+            LinenTransition(
+                action=action,
+                label=ACTION_LABELS[action],
+                to_status=to_status,
+                to_status_label=_status_label(to_status),
+                custody=ACTION_CUSTODY[action],
+                terminal=action in TERMINAL_ACTIONS,
+            )
+        )
+    return [
+        LinenTransitionGroup(**group, transitions=by_custody[group["custody"]])
+        for group in CUSTODY_GROUPS
+    ]
 
 
 # ============================================================
@@ -213,6 +312,23 @@ async def get_live_clock(
 ):
     laundry_id = resolve_laundry_id(current_user)
     return {"clock": await read_live_clock(laundry_id)}
+
+
+# Declared before `/{doc_id}` on purpose: a single-segment path added after it
+# would be captured by the document-id route and answered 400 "Invalid linen
+# document ID". Same reason `/live-clock` sits up here.
+@router.get("/transitions", response_model=LinenTransitionList)
+async def list_transitions(
+    current_user: dict = Depends(require_capability("linen:read")),
+):
+    """The scan actions the server accepts, grouped by which side performs them.
+
+    Read-only and identical for every laundry — it describes the state machine,
+    not the tenant's data. Clients build their state pickers from this so the
+    status vocabulary has exactly one owner. Transition *legality* is not
+    expressed here because the server does not enforce any yet.
+    """
+    return LinenTransitionList(groups=_transition_catalogue(), statuses=list(LINEN_STATUSES))
 
 
 # ============================================================
@@ -379,20 +495,6 @@ async def scan_linen(
     now = datetime.now(timezone.utc)
     from_status = doc.get("status", "IN_STOCK")
 
-    # Map action to new status
-    ACTION_STATUS_MAP = {
-        "collect": "COLLECTED",
-        "receive": "AT_LAUNDRY",
-        "start_wash": "WASHING",
-        "complete_wash": "DRYING",
-        "press": "PRESSING",
-        "ready": "READY",
-        "deliver": "DELIVERED",
-        "mark_missing": "MISSING",
-        "mark_damaged": "DAMAGED",
-        "retire": "RETIRED",
-    }
-
     to_status = ACTION_STATUS_MAP.get(action)
     if not to_status:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
@@ -453,18 +555,6 @@ async def bulk_scan_linens(
     current_user: dict = Depends(require_capability("linen:scan")),
 ):
     action_lower = action.lower()
-    ACTION_STATUS_MAP = {
-        "collect": "COLLECTED",
-        "receive": "AT_LAUNDRY",
-        "start_wash": "WASHING",
-        "complete_wash": "DRYING",
-        "press": "PRESSING",
-        "ready": "READY",
-        "deliver": "DELIVERED",
-        "mark_missing": "MISSING",
-        "mark_damaged": "DAMAGED",
-        "retire": "RETIRED",
-    }
     to_status = ACTION_STATUS_MAP.get(action_lower)
     if not to_status:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
