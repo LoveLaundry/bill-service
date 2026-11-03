@@ -9,11 +9,13 @@ Three current defects are pinned as *behaviour*, each with a note saying which
 phase must change it. Freezing a bug on purpose is the point: it makes the fix
 a visible, deliberate edit rather than an undocumented side effect.
 
-* A lookup by code is a write (`investigation D28`).
+* A lookup by code still stamps `last_scanned_date`, which clients read as
+  "last seen", but it no longer advances the live clock: a read must not wake
+  every other screen into refetching (D28, clock half fixed).
 * `POST`/`GET`/`PATCH`/`scan` return raw documents, so they expose internal
-  fields that the two response-modelled endpoints filter out (D30).
-* Bulk scan aborts the whole request on the first unknown code instead of
-  reporting it per line (D31).
+  fields that the two response-modelled endpoints filter out (D30). Still open.
+* Bulk scan now reports an unknown code per line instead of aborting the batch
+  (D31, fixed).
 
 Transition legality is deliberately NOT asserted: there is none today, so every
 action succeeds from every status. The phase that introduces a `TRANSITIONS`
@@ -126,20 +128,22 @@ async def test_by_code_is_case_insensitive(mocked_db):
     assert looked["linen_id"] == made["linen_id"]
 
 
-async def test_lookup_is_a_write_and_journals_nothing(mocked_db):
-    """D28, pinned: a lookup stamps state and bumps the live clock.
+async def test_lookup_stamps_last_seen_without_advancing_the_clock(mocked_db):
+    """D28, updated: the read still stamps `last_scanned_date` but is silent.
 
-    `GET /linens/by-code/{code}` updates `last_scanned_date`/`updated_at` and
-    calls `_note_change(..., "lookup")` while creating no event. Clients read
-    `last_scanned_date` as "last seen", so the phase that makes this an honest
-    read must move the stamping into the scan path and update this test.
+    The stamp is kept because the inventory screens read it as "last seen".
+    What changed is the live clock: advancing it here made every lookup force a
+    refetch on every other screen although no tracked field had moved, which is
+    what made the linen room's live update feel broken.
     """
     made = await _make()
     clock_before = (await linens.get_live_clock(ua()))["clock"]
 
     looked = await linens.get_linen_by_code(made["linen_id"], ua())
     assert looked["last_scanned_date"] is not None
-    assert (await linens.get_live_clock(ua()))["clock"] > clock_before
+    assert (await linens.get_live_clock(ua()))["clock"] == clock_before, (
+        "a lookup must not wake other screens: it changes no tracked field"
+    )
 
     events = await linens.get_linen_events(made["id"], skip=0, limit=50, current_user=ua())
     assert [e.action for e in events.items] == [], "a lookup must not journal a scan"
@@ -211,26 +215,27 @@ async def test_bulk_scan_response_shape(mocked_db):
     assert set(result["processed"][0]) == {"linen_id", "from_status", "to_status"}
 
 
-async def test_bulk_scan_aborts_on_the_first_unknown_code(mocked_db):
-    """D31, pinned: the per-line `Not found` branch is unreachable.
+async def test_bulk_scan_reports_unknown_codes_per_line(mocked_db):
+    """D31, updated: one bad code no longer discards the rest of the batch.
 
-    `bulk_scan_linens` looks the code up unscoped, then calls
-    `assert_same_laundry(doc, …)`, which raises 404 for a missing document
-    before `if not doc:` can append to `errors`. So one damaged or unregistered
-    barcode kills the whole batch — after earlier lines are already committed —
-    and the operator gets an opaque 404 instead of a per-line result. Phase 2
-    must report it per line, keep the 404 only for a genuinely foreign code,
-    and update this test.
+    The batch used to call `assert_same_laundry` before checking existence, so a
+    single damaged barcode raised 404 for the whole request — after earlier lines
+    were already committed, and without telling the operator which code failed.
+
+    A foreign code and an unregistered code now look identical: both come back as
+    a per-line "Not found". Distinguishing them would confirm that an identifier
+    exists in another laundry, which is the oracle the isolation rule forbids.
     """
     made = await _make()
-    try:
-        await linens.bulk_scan_linens([made["linen_id"], "LL-NOPE12"], "receive", None, None, ua())
-    except HTTPException as exc:
-        assert exc.status_code == 404
-    else:
-        raise AssertionError("today a bulk scan raises; the fix turns this into a per-line error")
 
-    # The line that got through first is already committed — no rollback.
+    result = await linens.bulk_scan_linens(
+        [made["linen_id"], "LL-NOPE12"], "receive", None, None, ua()
+    )
+
+    assert result["total_processed"] == 1
+    assert result["total_errors"] == 1
+    assert result["errors"][0]["linen_id"] == "LL-NOPE12"
+
     after = await linens.get_linen(made["id"], ua())
     assert after["status"] == "AT_LAUNDRY"
 
@@ -247,7 +252,6 @@ async def test_cross_tenant_reads_are_indistinguishable_from_absent(mocked_db):
         linens.get_linen_by_code(made["linen_id"], ub()),
         linens.scan_linen(made["id"], LinenScanAction(action="collect"), ub()),
         linens.update_linen(made["id"], LinenUpdate(location="elsewhere"), ub()),
-        linens.bulk_scan_linens([made["linen_id"]], "receive", None, None, ub()),
     ):
         try:
             await call
@@ -255,6 +259,12 @@ async def test_cross_tenant_reads_are_indistinguishable_from_absent(mocked_db):
             assert exc.status_code == 404, "cross-tenant access must answer 404"
         else:
             raise AssertionError("another tenant reached this linen")
+
+    # Bulk scan answers per line rather than raising, so the isolation check is
+    # that the line is refused — not that the request explodes.
+    bulk = await linens.bulk_scan_linens([made["linen_id"]], "receive", None, None, ub())
+    assert bulk["total_processed"] == 0, "another tenant reached this linen"
+    assert bulk["total_errors"] == 1
 
     assert (await _list(ub())).items == []
     assert (await _list(ub())).total == 0
@@ -270,6 +280,11 @@ async def test_events_are_newest_first(mocked_db):
         await linens.scan_linen(made["id"], LinenScanAction(action=action), ua())
 
     events = await linens.get_linen_events(made["id"], skip=0, limit=50, current_user=ua())
-    assert [e.action for e in events.items] == ["start_wash", "receive", "collect"]
+    # Three scans can land inside one clock tick, so equal timestamps make the
+    # tie order undefined. Assert the set and that the sequence is newest-first,
+    # rather than a specific permutation.
+    assert sorted(e.action for e in events.items) == ["collect", "receive", "start_wash"]
+    stamps = [e.timestamp for e in events.items]
+    assert stamps == sorted(stamps, reverse=True), "events must read newest first"
     assert events.total == 3
     assert all(isinstance(e, LinenEventModel) for e in events.items)
