@@ -401,10 +401,20 @@ async def get_linen_by_code(
     current_user: dict = Depends(require_capability("linen:read")),
 ):
     laundry_id = resolve_laundry_id(current_user)
-    doc = await linens_collection.find_one({"linen_id": linen_code.upper()})
-    assert_same_laundry(doc, laundry_id, "Linen")
+    code = str(linen_code or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="A tag code is required")
+
+    # Scoped in the query, not filtered afterwards. An unscoped lookup reads
+    # whichever document Mongo returns first, so a code that also exists in
+    # another laundry could shadow this laundry's own tag and 404 it.
+    doc = await linens_collection.find_one(
+        scoped_query({"linen_id": code}, laundry_id)
+    )
     if not doc:
         raise HTTPException(status_code=404, detail="Linen not found")
+    assert_same_laundry(doc, laundry_id, "Linen")
+
     # Update last_scanned_date
     now = datetime.now(timezone.utc)
     await linens_collection.update_one(
@@ -412,7 +422,8 @@ async def get_linen_by_code(
         {"$set": {"last_scanned_date": now, "updated_at": now}},
     )
     doc["last_scanned_date"] = now
-    await _note_change(laundry_id, "lookup")
+    # No clock bump: a lookup changes no tracked field. Bumping here made every
+    # scan force a refetch on every screen in the laundry for no state change.
     return _serialize(doc)
 
 
@@ -565,9 +576,16 @@ async def bulk_scan_linens(
     errors = []
 
     for code in linen_codes:
-        code = code.strip().upper()
-        doc = await linens_collection.find_one({"linen_id": code})
-        assert_same_laundry(doc, laundry_id, "Linen")
+        code = str(code or "").strip().upper()
+        if not code:
+            continue
+        # Scoped query, same reasoning as the single-tag lookup above. A foreign
+        # or missing code resolves to None and is reported per item; calling
+        # assert_same_laundry before the existence check raised 404 for the whole
+        # batch and lost every valid code alongside the bad one.
+        doc = await linens_collection.find_one(
+            scoped_query({"linen_id": code}, laundry_id)
+        )
         if not doc:
             errors.append({"linen_id": code, "error": "Not found"})
             continue
