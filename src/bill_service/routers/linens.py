@@ -22,6 +22,7 @@ from ..database.main_db import (
     bills_collection,
 )
 from ..live_clock import bump_live_clock, read_live_clock
+from ..realtime import actor_of, linen_snapshot, publish_linen_event
 from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
 from ..models import (
     LinenCreate,
@@ -89,9 +90,38 @@ async def _owned_linen(oid, current_user: dict, label: str = "Linen not found"):
     return laundry_id, doc
 
 
-async def _note_change(laundry_id: str, reason: str) -> None:
-    """Advance the live clock so other sessions refetch this laundry's linen."""
-    await bump_live_clock(laundry_id, reason)
+async def _note_change(
+    laundry_id: str,
+    reason: str,
+    *,
+    event: str,
+    linen: dict | None = None,
+    action: str | None = None,
+    actor: dict | None = None,
+    count: int | None = None,
+    linen_ids: list | None = None,
+    at: datetime | None = None,
+) -> int:
+    """Advance the live clock and push the change to every open screen.
+
+    The clock is what a client that fell behind compares against after a
+    reconnect; the socket event is what keeps a client that is already
+    connected current. Both are bumped in the same place so no mutation can do
+    one without the other.
+    """
+    clock = await bump_live_clock(laundry_id, reason)
+    publish_linen_event(
+        event=event,
+        laundry_id=laundry_id,
+        clock=clock,
+        linen=linen,
+        action=action,
+        actor=actor,
+        count=count,
+        linen_ids=linen_ids,
+        at=at,
+    )
+    return clock
 
 
 async def _log_audit(user_id: str, action: str, entity: str, entity_id: str, laundry_id: str | None = None):
@@ -242,7 +272,14 @@ async def create_linen(
     doc["_id"] = result.inserted_id
 
     await _log_audit(current_user.get("user_id", ""), "create", "linen", str(result.inserted_id))
-    await _note_change(laundry_id, "create")
+    await _note_change(
+        laundry_id,
+        "create",
+        event="create",
+        linen=linen_snapshot(doc),
+        actor=actor_of(current_user),
+        at=now,
+    )
 
     return _serialize(doc)
 
@@ -298,7 +335,17 @@ async def create_linen_bulk(
         created.append(_serialize(doc))
 
     await _log_audit(current_user.get("user_id", ""), "bulk_create", "linen", f"count={len(created)}")
-    await _note_change(laundry_id, "bulk_create")
+    await _note_change(
+        laundry_id,
+        "bulk_create",
+        event="create_bulk",
+        actor=actor_of(current_user),
+        count=len(created),
+        # Codes only: a screen showing the list needs to know the totals moved,
+        # no open screen follows a tag that did not exist a moment ago.
+        linen_ids=[item["linen_id"] for item in created],
+        at=now,
+    )
 
     return {"items": created, "count": len(created)}
 
@@ -443,7 +490,10 @@ async def update_linen(
     updates["updated_at"] = datetime.now(timezone.utc)
 
     laundry_id = resolve_laundry_id(current_user)
-    await _owned_linen(oid, current_user)
+    # The pre-edit document is the only way to tell a screen *what changed*:
+    # `LinenUpdate` can move `status` directly, so an edit is as much a status
+    # change as a scan is.
+    _, before = await _owned_linen(oid, current_user)
     result = await linens_collection.update_one(owned_filter(oid, laundry_id), {"$set": updates})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Linen not found")
@@ -456,7 +506,14 @@ async def update_linen(
         doc_id,
         laundry_id,
     )
-    await _note_change(laundry_id, "update")
+    await _note_change(
+        laundry_id,
+        "update",
+        event="update",
+        linen=linen_snapshot(doc, extra={"previous_status": before.get("status")}),
+        actor=actor_of(current_user),
+        at=updates["updated_at"],
+    )
     return _serialize(doc)
 
 
@@ -469,7 +526,7 @@ async def delete_linen(
     current_user: dict = Depends(require_capability("linen:write")),
 ):
     oid = _parse_object_id(doc_id)
-    laundry_id, _ = await _owned_linen(oid, current_user)
+    laundry_id, doomed = await _owned_linen(oid, current_user)
     # Bump the version while the document still exists, then remove it and
     # enqueue a DELETE so the SECONDARY replica drops the record too.
     try:
@@ -487,7 +544,13 @@ async def delete_linen(
         doc_id,
         laundry_id,
     )
-    await _note_change(laundry_id, "delete")
+    await _note_change(
+        laundry_id,
+        "delete",
+        event="delete",
+        linen=linen_snapshot(doomed),
+        actor=actor_of(current_user),
+    )
 
 
 # ============================================================
@@ -547,10 +610,21 @@ async def scan_linen(
     await linen_events_collection.insert_one(event_doc)
 
     await _log_audit(current_user.get("user_id", ""), f"scan:{action}", "linen", doc_id)
-    await _note_change(laundry_id, f"scan:{action}")
 
     # Return updated linen
     updated_doc = await linens_collection.find_one({"_id": oid})
+
+    # Publish after the read so the event carries the authoritative post-scan
+    # row: every other screen patches its cache from this and never refetches.
+    await _note_change(
+        laundry_id,
+        f"scan:{action}",
+        event="scan",
+        action=action,
+        linen=linen_snapshot(updated_doc, extra={"previous_status": from_status}),
+        actor=actor_of(current_user),
+        at=now,
+    )
     return _serialize(updated_doc)
 
 
@@ -574,6 +648,7 @@ async def bulk_scan_linens(
     laundry_id = resolve_laundry_id(current_user)
     results = []
     errors = []
+    pushed: list = []
 
     for code in linen_codes:
         code = str(code or "").strip().upper()
@@ -620,10 +695,35 @@ async def bulk_scan_linens(
         }
         await linen_events_collection.insert_one(event_doc)
         results.append({"linen_id": code, "from_status": from_status, "to_status": to_status})
+        # Captured now, published after the single clock bump below, so every
+        # item event of the batch carries the same clock value.
+        pushed.append(
+            linen_snapshot({**doc, **update_fields}, extra={"previous_status": from_status})
+        )
 
     await _log_audit(current_user.get("user_id", ""), f"bulk_scan:{action}", "linen", f"count={len(results)}")
     if results:
-        await _note_change(laundry_id, f"bulk_scan:{action}")
+        actor = actor_of(current_user)
+        clock = await _note_change(
+            laundry_id,
+            f"bulk_scan:{action_lower}",
+            event="bulk_scan",
+            action=action_lower,
+            actor=actor,
+            count=len(results),
+            linen_ids=[row["linen_id"] for row in results],
+            at=now,
+        )
+        for snapshot in pushed:
+            publish_linen_event(
+                event="scan",
+                laundry_id=laundry_id,
+                clock=clock,
+                action=action_lower,
+                linen=snapshot,
+                actor=actor,
+                at=now,
+            )
 
     return {"processed": results, "errors": errors, "total_processed": len(results), "total_errors": len(errors)}
 
@@ -754,6 +854,14 @@ async def generate_linen_tags(
         created.append(_serialize(doc))
 
     await _log_audit(current_user.get("user_id", ""), "generate_tags", "linen", f"count={len(created)}")
-    await _note_change(laundry_id, "generate_tags")
+    await _note_change(
+        laundry_id,
+        "generate_tags",
+        event="generate_tags",
+        actor=actor_of(current_user),
+        count=len(created),
+        linen_ids=[item["linen_id"] for item in created],
+        at=now,
+    )
 
     return {"items": created, "count": len(created)}
