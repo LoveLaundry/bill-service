@@ -10,7 +10,7 @@ Deliveries may name a source ``gate_pass_id`` per line; lines without one are
 assigned FIFO (oldest receiving pass with availability first), splitting a
 line across passes when one pass cannot cover the quantity.
 """
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -29,7 +29,7 @@ from ..services import operations_context as ctx
 from ..services.gate_pass_records import create_gate_pass_record, next_receiving_number
 from ..services.monthly_sync import sync_gate_pass_to_monthly
 from ..router_utils import log_audit
-from ..tenancy import resolve_laundry_id
+from ..tenancy import LOVE_LAUNDRY_ID, resolve_laundry_id
 from .deliveries import create_delivery
 
 router = APIRouter(prefix="/today-sheet", tags=["today-sheet"])
@@ -83,7 +83,11 @@ async def _monthly_clients(year: int, month: int, laundry_id: str) -> List[str]:
 
     names: List[str] = []
     cursor = monthly_entries_collection.find(
-        {"year": year, "month": month, "laundry_id": laundry_id}
+        {
+            "year": year,
+            "month": month,
+            "$or": [{"laundry_id": laundry_id}, {"laundry_id": {"$exists": False}}],
+        }
     )
     async for doc in cursor:
         try:
@@ -111,7 +115,7 @@ async def today_sheet(
     gate_passes = [
         gp
         for gp in await ctx.load_gate_passes()
-        if (gp.get("laundry_id") or "") in ("", laundry_id)
+        if (gp.get("laundry_id") or LOVE_LAUNDRY_ID) == laundry_id
     ]
     gp_ids = [str(gp["gate_pass_id"]) for gp in gate_passes]
     deliveries, returns = await ctx.load_movements(gp_ids)
@@ -224,7 +228,7 @@ async def _auto_assign_lines(
         gp
         for gp in await ctx.load_gate_passes()
         if be.same_client(gp.get("client_name"), client_name)
-        and (gp.get("laundry_id") or "") in ("", laundry_id)
+        and (gp.get("laundry_id") or LOVE_LAUNDRY_ID) == laundry_id
     ]
     gp_ids = [str(gp["gate_pass_id"]) for gp in gate_passes]
     deliveries, returns = await ctx.load_movements(gp_ids)
