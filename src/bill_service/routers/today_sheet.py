@@ -237,7 +237,15 @@ async def _auto_assign_lines(
         ctx.delivered_by_gate_pass(deliveries),
         ctx.returned_by_gate_pass(returns),
     )
-    rows.sort(key=lambda r: _parse_instant(r.get("receiving_date")) or datetime.min.replace(tzinfo=timezone.utc))
+    def _sort_key(r):
+        instant = _parse_instant(r.get("receiving_date"))
+        if instant is None:
+            return float("inf")
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=timezone.utc)
+        return instant.timestamp()
+
+    rows.sort(key=_sort_key)
 
     # remaining[(pass_id, item_key)] = qty still assignable
     remaining: Dict[tuple, float] = {}
