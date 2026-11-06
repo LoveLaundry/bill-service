@@ -759,6 +759,41 @@ async def get_linen_events(
 # ============================================================
 #  SCAN ACTIVITY REPORT (laundry side of the QR lifecycle)
 # ============================================================
+
+
+# ============================================================
+#  PUBLIC TRACK — what a QR scan on a garment tag resolves to
+# ============================================================
+@router.get("/track/{linen_code}")
+async def public_linen_track(linen_code: str):
+    """Unauthenticated, sanitized status for a scanned tag.
+
+    Deliberately narrow: a guest scanning a tag learns the item and where it
+    is in the wash cycle — never the owning hotel, location notes, or staff.
+    """
+    code = str(linen_code or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="A tag code is required")
+    # Codes are random LL-XXXXXX across the whole deployment; if a collision
+    # ever exists we refuse rather than guess which laundry's garment it is.
+    matches = await linens_collection.find({"linen_id": code}).limit(2).to_list(2)
+    if not matches:
+        raise HTTPException(status_code=404, detail="Tag not found")
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail="Tag code is ambiguous")
+    doc = matches[0]
+    return {
+        "linen_id": doc.get("linen_id"),
+        "category": doc.get("category"),
+        "item_type": doc.get("item_type"),
+        "status": doc.get("status"),
+        "condition": doc.get("condition"),
+        "wash_count": doc.get("wash_count", 0),
+        "last_scanned_date": doc.get("last_scanned_date"),
+        "updated_at": doc.get("updated_at"),
+    }
+
+
 @router.get("/reports/scan-activity")
 async def scan_activity_report(
     date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
