@@ -33,6 +33,8 @@ from ..database.main_db import (
     bills_collection,
     deliveries_collection,
     gatepasses_collection,
+    linens_collection,
+    linen_events_collection,
     shop_bills_collection,
 )
 from ..tenancy import scoped_query
@@ -42,6 +44,7 @@ router = APIRouter(prefix="/client-portal", tags=["client-portal"])
 GP_SENSITIVE = ["client_name", "items", "notes"]
 DELIVERY_SENSITIVE = ["client_name", "items", "notes"]
 BILL_SENSITIVE = ["client_name", "quotation_title", "notes", "items"]
+LINEN_SENSITIVE = ["client_name", "description", "notes", "items"]
 
 # A pass is still "with the laundry" until every piece has come back.
 OPEN_GATEPASS_STATUSES = (
@@ -387,6 +390,72 @@ SHOP_BILL_PROJECTION = {
     "delivery_date": 1,
     "created_at": 1,
 }
+
+
+
+
+@router.get("/linens")
+async def portal_linens(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    limit: int = Query(200, ge=1, le=500),
+    scope: Dict[str, str] = Security(resolve_hotel_scope),
+) -> dict:
+    """The hotel's own linen tags with live status — the client side of the QR lifecycle.
+
+    A scanned tag resolves to this same record, so what the hotel sees here is
+    exactly what a scan of the physical tag reports.
+    """
+    query = _client_query(scope)
+    if status_filter:
+        query["status"] = status_filter
+    total = await linens_collection.count_documents(query)
+    items = []
+    async for doc in linens_collection.find(query).sort("updated_at", -1).limit(limit):
+        try:
+            row = decrypt_dict(doc, LINEN_SENSITIVE)
+        except Exception:
+            row = {k: v for k, v in doc.items() if k != "encryption_metadata"}
+        row["id"] = str(row.pop("_id", doc["_id"]))
+        items.append({
+            "id": row["id"],
+            "linen_id": row.get("linen_id"),
+            "category": row.get("category"),
+            "item_type": row.get("item_type"),
+            "description": row.get("description"),
+            "status": row.get("status"),
+            "condition": row.get("condition"),
+            "wash_count": row.get("wash_count", 0),
+            "last_scanned_date": _stamp(row.get("last_scanned_date")),
+            "updated_at": _stamp(row.get("updated_at") or row.get("created_at")),
+        })
+    return {"items": items, "total": total}
+
+
+@router.get("/linens/{linen_id}/events")
+async def portal_linen_events(
+    linen_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    scope: Dict[str, str] = Security(resolve_hotel_scope),
+) -> dict:
+    """Scan history for one of the hotel's tags (newest first)."""
+    linen = await linens_collection.find_one(
+        {**_client_query(scope), "linen_id": str(linen_id).strip().upper()}
+    )
+    if not linen:
+        raise HTTPException(status_code=404, detail="Linen tag not found")
+    events = []
+    cursor = linen_events_collection.find(
+        {"laundry_id": scope["laundry_id"], "linen_id": linen["linen_id"]}
+    ).sort("timestamp", -1).limit(limit)
+    async for evt in cursor:
+        events.append({
+            "action": evt.get("action"),
+            "from_status": evt.get("from_status"),
+            "to_status": evt.get("to_status"),
+            "user": evt.get("user"),
+            "timestamp": _stamp(evt.get("timestamp")),
+        })
+    return {"linen_id": linen["linen_id"], "events": events}
 
 
 @router.get("/shop/summary")

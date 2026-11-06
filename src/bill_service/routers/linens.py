@@ -754,6 +754,77 @@ async def get_linen_events(
 # ============================================================
 #  STATS — dashboard summary
 # ============================================================
+
+
+# ============================================================
+#  SCAN ACTIVITY REPORT (laundry side of the QR lifecycle)
+# ============================================================
+@router.get("/reports/scan-activity")
+async def scan_activity_report(
+    date_from: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict = Depends(require_capability("linen:read")),
+):
+    """Aggregated QR scan report for the laundry.
+
+    Every physical tag scan lands in ``linen_events``; this rolls them up by
+    action and destination status, per day, plus the most recent scans — the
+    operational counterpart of the hotel portal's per-tag view.
+    """
+    from ..app_time import day_bounds, parse_day
+    from ..database.main_db import linen_events_collection
+
+    laundry_id = resolve_laundry_id(current_user)
+    query: dict = {"laundry_id": laundry_id}
+    if date_from or date_to:
+        try:
+            start = day_bounds(parse_day(date_from))[0] if date_from else None
+            end = day_bounds(parse_day(date_to))[1] if date_to else None
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Dates must be YYYY-MM-DD")
+        rng = {}
+        if start:
+            rng["$gte"] = start
+        if end:
+            rng["$lt"] = end
+        query["timestamp"] = rng
+
+    by_action: Dict[str, int] = {}
+    by_status: Dict[str, int] = {}
+    by_day: Dict[str, int] = {}
+    recent = []
+    total = 0
+    async for evt in linen_events_collection.find(query).sort("timestamp", -1):
+        total += 1
+        action = str(evt.get("action") or "unknown")
+        by_action[action] = by_action.get(action, 0) + 1
+        to_status = str(evt.get("to_status") or "")
+        if to_status:
+            by_status[to_status] = by_status.get(to_status, 0) + 1
+        ts = evt.get("timestamp")
+        if ts is not None:
+            day = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+            by_day[day] = by_day.get(day, 0) + 1
+        if len(recent) < limit:
+            recent.append({
+                "linen_id": evt.get("linen_id"),
+                "action": action,
+                "from_status": evt.get("from_status"),
+                "to_status": evt.get("to_status"),
+                "user": evt.get("user"),
+                "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else ts,
+            })
+
+    return {
+        "total_scans": total,
+        "by_action": by_action,
+        "by_status": by_status,
+        "by_day": dict(sorted(by_day.items())),
+        "recent": recent,
+    }
+
+
 @router.get("/stats/summary", response_model=LinenStats)
 async def get_linen_stats(
     current_user: dict = Depends(require_capability("linen:read")),
