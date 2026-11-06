@@ -47,6 +47,37 @@ async def test_new_invoice_starts_pending(mocked_db):
     assert inv["total_entries"] == 2
 
 
+async def test_discount_is_kept_by_shop_rest_goes_to_laundry(mocked_db):
+    inv = await create_legacy_invoice(
+        LegacyInvoiceCreate(shop_name=SHOP, entries=list(ENTRIES), discount=50.5),
+        current_user=user(),
+    )
+    # grand_total stays the gross paper-bill sum; the shop keeps the discount
+    # and only the remainder belongs to the laundry.
+    assert inv["grand_total"] == 200.5
+    assert inv["discount"] == 50.5
+    assert inv["laundry_amount"] == 150.0
+
+    fetched = await get_legacy_invoice(inv["id"], current_user=user())
+    assert fetched["discount"] == 50.5
+    assert fetched["laundry_amount"] == 150.0
+
+
+async def test_discount_cannot_exceed_total(mocked_db):
+    with pytest.raises(HTTPException) as exc:
+        await create_legacy_invoice(
+            LegacyInvoiceCreate(shop_name=SHOP, entries=list(ENTRIES), discount=500),
+            current_user=user(),
+        )
+    assert exc.value.status_code == 400
+
+
+async def test_invoice_without_discount_defaults_to_full_laundry_amount(mocked_db):
+    inv = await make_invoice(mocked_db)
+    assert inv["discount"] == 0.0
+    assert inv["laundry_amount"] == inv["grand_total"]
+
+
 async def test_update_keeps_number_and_replaces_fields(mocked_db):
     inv = await make_invoice(mocked_db)
     updated = await update_legacy_invoice(

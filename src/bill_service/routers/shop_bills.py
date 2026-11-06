@@ -292,6 +292,14 @@ def _dec_legacy(doc: dict) -> dict:
     if "_id" in decrypted:
         decrypted["id"] = str(decrypted["_id"])
         del decrypted["_id"]
+    # Invoices saved before discounts existed have no split fields; derive them
+    # so readers always see discount=0 and laundry_amount=grand_total.
+    discount = decrypted.get("discount") or 0.0
+    if "laundry_amount" not in decrypted:
+        decrypted["laundry_amount"] = round(
+            (decrypted.get("grand_total") or 0.0) - discount, 2
+        )
+    decrypted.setdefault("discount", discount)
     return decrypted
 
 
@@ -325,16 +333,27 @@ def _calc_legacy_grand_total(entries: list) -> float:
     return round(sum(float(e.get("amount", 0) or 0) for e in entries), 2)
 
 
-def _legacy_entry_stats(entries: list) -> dict:
-    """Validate entries and return the derived totals for a legacy invoice."""
+def _legacy_entry_stats(entries: list, discount: float = 0.0) -> dict:
+    """Validate entries and return the derived totals for a legacy invoice.
+
+    ``grand_total`` is the gross sum of the paper bills. The shop owner keeps
+    ``discount``; whatever remains (``laundry_amount``) belongs to the laundry.
+    """
     for entry in entries:
         if (entry.get("amount", 0) or 0) < 0:
             raise HTTPException(status_code=400, detail="Amount cannot be negative")
     grand_total = _calc_legacy_grand_total(entries)
     if grand_total <= 0:
         raise HTTPException(status_code=400, detail="Invoice total must be greater than zero")
+    discount = round(float(discount or 0), 2)
+    if discount < 0:
+        raise HTTPException(status_code=400, detail="Discount cannot be negative")
+    if discount > grand_total:
+        raise HTTPException(status_code=400, detail="Discount cannot exceed the invoice total")
     return {
         "grand_total": grand_total,
+        "discount": discount,
+        "laundry_amount": round(grand_total - discount, 2),
         "total_entries": len([
             e for e in entries
             if e.get("bill_number") or (e.get("amount", 0) or 0) > 0
@@ -362,7 +381,7 @@ async def create_legacy_invoice(
         raise HTTPException(status_code=400, detail="Shop / Hotel name is required")
 
     entries = [e.model_dump() for e in payload.entries]
-    stats = _legacy_entry_stats(entries)
+    stats = _legacy_entry_stats(entries, payload.discount)
 
     invoice_number = await _generate_legacy_invoice_number(now)
     doc = {
@@ -374,6 +393,8 @@ async def create_legacy_invoice(
         "entries": entries,
         "total_entries": stats["total_entries"],
         "grand_total": stats["grand_total"],
+        "discount": stats["discount"],
+        "laundry_amount": stats["laundry_amount"],
         "payment_status": "PENDING",
         "created_by": current_user.get("auth_id", "system"),
         "created_at": now,
@@ -485,7 +506,7 @@ async def update_legacy_invoice(
         raise HTTPException(status_code=400, detail="Shop / Hotel name is required")
 
     entries = [e.model_dump() for e in payload.entries]
-    stats = _legacy_entry_stats(entries)
+    stats = _legacy_entry_stats(entries, payload.discount)
 
     now = datetime.now(timezone.utc)
     current = decrypt_dict(raw, LEGACY_SENSITIVE_FIELDS)
@@ -499,6 +520,8 @@ async def update_legacy_invoice(
         "entries": entries,
         "total_entries": stats["total_entries"],
         "grand_total": stats["grand_total"],
+        "discount": stats["discount"],
+        "laundry_amount": stats["laundry_amount"],
         "updated_by": current_user.get("auth_id", "system"),
         "updated_at": now,
     }

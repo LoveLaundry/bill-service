@@ -763,6 +763,7 @@ class LegacyInvoiceCreate(BaseModel):
     shop_name: str
     description: Optional[str] = None
     entries: List[LegacyInvoiceEntry] = Field(min_length=1)
+    discount: float = Field(default=0.0, ge=0)
 
 
 class ShopBillModel(BaseModel):
