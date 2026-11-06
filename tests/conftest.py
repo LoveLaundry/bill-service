@@ -94,6 +94,7 @@ DEPENDENT_MODULES = [
     "bill_service.routers.notifications",
     "bill_service.routers.reconciliation",
     "bill_service.routers.operational_reports",
+    "bill_service.routers.today_sheet",
 ]
 
 

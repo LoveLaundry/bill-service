@@ -271,6 +271,43 @@ class DeliveryModel(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+# --- Today sheet (single-screen daily entry) ---
+class TodaySheetReceiveItem(BaseModel):
+    item_name: str
+    specification: Optional[str] = None
+    unit: Optional[str] = None
+    quantity: float = Field(gt=0)
+    piece_count: int = Field(default=0, ge=0)
+
+
+class TodaySheetReceive(BaseModel):
+    """One shop's received quantities for the business day."""
+    client_name: str
+    items: List[TodaySheetReceiveItem] = Field(min_length=1)
+    notes: Optional[str] = None
+
+
+class TodaySheetDeliveryLine(BaseModel):
+    """One delivered line. ``gate_pass_id`` omitted = FIFO auto-assign."""
+    item_name: str
+    specification: Optional[str] = None
+    quantity: float = Field(gt=0)
+    gate_pass_id: Optional[str] = None
+
+
+class TodaySheetDelivery(BaseModel):
+    client_name: str
+    items: List[TodaySheetDeliveryLine] = Field(min_length=1)
+    notes: Optional[str] = None
+    received_by: Optional[str] = None  # client representative signature name
+
+
+class TodaySheetCommit(BaseModel):
+    date: str  # business day YYYY-MM-DD (LKT)
+    receives: List[TodaySheetReceive] = Field(default_factory=list)
+    deliveries: List[TodaySheetDelivery] = Field(default_factory=list)
+
+
 # --- Dispatch (pickup / delivery scheduling) ---
 class DispatchCreate(BaseModel):
     job_type: str = "delivery"  # "pickup" | "delivery"
