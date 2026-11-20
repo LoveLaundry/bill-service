@@ -50,11 +50,25 @@ def _fresh_user(auth_id: str):
             _users_client = MongoClient(
                 settings.resolve_main_uri(), serverSelectionTimeoutMS=1000
             )
-        db_name = USER_SERVICE_DB_NAME or settings.resolve_main_db()
-        return _users_client[db_name]["users"].find_one(
-            {"auth_id": auth_id},
-            {"status": 1, "role_id": 1, "role": 1, "user_name": 1, "platform_admin": 1},
-        )
+        # user-service stores accounts in `users_db`, while older deployments
+        # kept a copy in the main application database. Search both so a valid
+        # session is not rejected just because the two services were configured
+        # with different MONGODB_DB_NAME / MONGODB_MAIN_DB values.
+        db_names = ["users_db"]
+        for name in (USER_SERVICE_DB_NAME, settings.resolve_main_db()):
+            if name and name not in db_names:
+                db_names.append(name)
+        projection = {
+            "status": 1, "role_id": 1, "role": 1,
+            "user_name": 1, "platform_admin": 1,
+        }
+        for db_name in db_names:
+            doc = _users_client[db_name]["users"].find_one(
+                {"auth_id": auth_id}, projection
+            )
+            if doc:
+                return doc
+        return None
     except Exception as exc:
         logger.warning("Could not reload user %r for revocation check: %s", auth_id, exc)
         return None
