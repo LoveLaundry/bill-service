@@ -40,26 +40,35 @@ import sentry_sdk
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Known production frontend origins. Mirrors config.py so a missing or
+# incomplete ALLOWED_ORIGINS env can never lock the live portals out.
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://lovelaundry-manager.vercel.app",
+    "https://hotels-manager.vercel.app",
+    "https://hotels-manager-amber.vercel.app",
+    "https://shops-manager.vercel.app",
+    "https://system-lovelaundry-lk.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:5174",
+    "http://localhost:5175",
+    "http://localhost:5176",
+    "http://localhost:3000",
+]
+
 # CORS configuration
 try:
     ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
-    if ALLOWED_ORIGINS_ENV:
-        ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
-    else:
-        # Production fallback — restrict to known domains
-        ALLOWED_ORIGINS = [
-            "https://lovelaundry-manager.vercel.app",
-
-            "https://system-lovelaundry-lk.vercel.app",
-            "https://public.lovelaundry.lk",
-            "http://localhost:5173",
-            "http://localhost:3000",
-        ]
+    configured = [
+        origin.strip()
+        for origin in ALLOWED_ORIGINS_ENV.split(",")
+        if origin.strip() and origin.strip() != "*"
+    ]
+    ALLOWED_ORIGINS = list(dict.fromkeys(configured + list(DEFAULT_ALLOWED_ORIGINS)))
 
     logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}")
 except Exception as e:
     logger.warning(f"CORS configuration failed, using defaults: {e}")
-    ALLOWED_ORIGINS = ["http://localhost:5173"]
+    ALLOWED_ORIGINS = list(DEFAULT_ALLOWED_ORIGINS)
 
 # Vercel sets VERCEL=1; background workers are unreliable in serverless.
 ON_VERCEL = os.getenv("VERCEL") == "1"
@@ -83,7 +92,7 @@ apply_security(app, rate_limit=300, origins=origins)
 async def global_exception_handler(request: Request, exc: Exception):
     origin = request.headers.get("origin", "")
     cors_headers = {}
-    if origin in ALLOWED_ORIGINS:
+    if origin in set(ALLOWED_ORIGINS) | set(settings.cors_origins):
         cors_headers = {
             "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Credentials": "true",

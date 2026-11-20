@@ -74,24 +74,32 @@ def resolve_client_scope(current_user: dict = Security(get_current_user)) -> Dic
     if current_user.get("token_kind") != "client":
         raise HTTPException(status_code=403, detail="This endpoint requires a hotel account")
 
-    scope = current_user.get("client_scope")
-    if not isinstance(scope, dict):
+    raw_scope = current_user.get("client_scope")
+    if not isinstance(raw_scope, dict):
         raise HTTPException(status_code=403, detail="Hotel session has no account scope")
 
-    laundry_id = str(scope.get("laundry_id") or "").strip().lower()
-    client_name = str(scope.get("client_name") or "").strip()
+    laundry_id = str(raw_scope.get("laundry_id") or "").strip().lower()
+    client_name = str(raw_scope.get("client_name") or "").strip()
     if not laundry_id or not client_name:
         raise HTTPException(status_code=403, detail="Hotel session has an incomplete scope")
 
-    client_type = str(scope.get("client_type") or "HOTEL").strip().upper()
+    client_type = str(raw_scope.get("client_type") or "HOTEL").strip().upper()
     if client_type not in ("HOTEL", "SHOP"):
         raise HTTPException(status_code=403, detail="Client session has an unknown account type")
 
-    return {
+    scope = {
         "laundry_id": laundry_id,
         "client_name": client_name,
         "client_type": client_type,
     }
+    # Stable entity ids are carried in the signed scope when the account has
+    # been associated. Only the id matching this side is exposed, so a hotel
+    # token can never contribute a shop id (or the reverse).
+    id_key = "hotel_id" if client_type == "HOTEL" else "shop_id"
+    entity_id = str(raw_scope.get(id_key) or "").strip().lower()
+    if entity_id:
+        scope[id_key] = entity_id
+    return scope
 
 
 def resolve_hotel_scope(current_user: dict = Security(get_current_user)) -> Dict[str, str]:
@@ -122,11 +130,18 @@ def require_side(scope: Dict[str, str], side: str) -> None:
 
 
 def _client_query(scope: Dict[str, str]) -> dict:
-    """Tenant + hotel filter, built in exactly one place."""
-    return scoped_query(
-        {"client_name_search": get_search_token(scope["client_name"])},
-        scope["laundry_id"],
-    )
+    """Tenant + client filter, built in exactly one place.
+
+    A stable entity id is enforced as an equality filter whenever the session
+    carries one. Legacy client accounts have no id yet; for those the encrypted
+    name token and the laundry remain the only available scope.
+    """
+    query = {"client_name_search": get_search_token(scope["client_name"])}
+    if scope.get("client_type") == "HOTEL" and scope.get("hotel_id"):
+        query["hotel_id"] = scope["hotel_id"]
+    if scope.get("client_type") == "SHOP" and scope.get("shop_id"):
+        query["shop_id"] = scope["shop_id"]
+    return scoped_query(query, scope["laundry_id"])
 
 
 def _money(value: Any) -> float:

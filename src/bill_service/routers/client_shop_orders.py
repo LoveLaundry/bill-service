@@ -30,11 +30,33 @@ from .client_portal import BILL_SENSITIVE, GP_SENSITIVE, resolve_client_scope
 router = APIRouter(prefix="/client-portal", tags=["client-portal"])
 
 
+def _scope_of(session: dict) -> Dict[str, str]:
+    """Return the flat scope contract used by the client portal.
+
+    ``resolve_client_scope`` returns ``laundry_id``/``client_name``/
+    ``client_type`` (plus the entity id) at the top level. Older callers hand
+    over the raw JWT with the same values nested under ``client_scope``, so
+    both shapes are accepted here and every handler below reads one contract.
+    """
+    nested = session.get("client_scope")
+    if isinstance(nested, dict):
+        scope = dict(nested)
+        for key in ("auth_id", "user_name", "hotel_id", "shop_id"):
+            if not scope.get(key) and session.get(key):
+                scope[key] = session[key]
+    else:
+        scope = dict(session)
+    scope["client_type"] = str(scope.get("client_type") or "").strip().upper()
+    scope["laundry_id"] = str(scope.get("laundry_id") or "").strip().lower()
+    return scope
+
+
 def resolve_shop_scope(session: dict = Depends(resolve_client_scope)) -> Dict[str, str]:
     """Shop sessions only — a hotel must not raise a laundry order."""
-    if session.get("client_scope", {}).get("client_type") != "SHOP":
+    scope = _scope_of(session)
+    if scope.get("client_type") != "SHOP":
         raise HTTPException(status_code=403, detail="This endpoint is for shop accounts")
-    return session
+    return scope
 
 
 class ShopOrderLine(BaseModel):
@@ -100,7 +122,7 @@ async def create_shop_order(
 ):
     """Submit laundry to the laundry. Lands as a DRAFT gate pass awaiting the
     laundry's receipt confirmation."""
-    scope = session["client_scope"]
+    scope = _scope_of(session)
     laundry_id = scope["laundry_id"]
 
     items = [
@@ -127,8 +149,8 @@ async def create_shop_order(
     )
 
     actor = {
-        "auth_id": session.get("auth_id"),
-        "user_name": session.get("user_name"),
+        "auth_id": scope.get("auth_id") or session.get("auth_id"),
+        "user_name": scope.get("user_name") or session.get("user_name"),
         "role": session.get("role") or "SHOP_ADMIN",
         "laundry_id": laundry_id,
         "client_scope": scope,
@@ -169,7 +191,7 @@ async def list_shop_orders(
     """This shop's orders at the currently selected laundry, newest first."""
     from ..crypto_helper import get_search_token
 
-    scope = session["client_scope"]
+    scope = _scope_of(session)
     query = scoped_query(
         {"client_name_search": get_search_token(scope["client_name"])},
         scope["laundry_id"],
@@ -190,7 +212,7 @@ async def list_shop_orders(
 async def get_shop_order(order_id: str, session: dict = Depends(resolve_shop_scope)):
     from ..crypto_helper import get_search_token
 
-    scope = session["client_scope"]
+    scope = _scope_of(session)
     try:
         oid = ObjectId(order_id)
     except Exception:
@@ -208,21 +230,25 @@ async def get_shop_order(order_id: str, session: dict = Depends(resolve_shop_sco
     return _order_view(doc)
 
 
-@router.get("/shop/bills/{bill_id}")
 async def get_shop_bill(bill_id: str, session: dict = Depends(resolve_shop_scope)):
-    """One bill in full, plus its payments — the shop's own bill only."""
+    """One bill in full, plus its payments — the shop's own bill only.
+
+    Kept as a direct-call helper for the payment-inclusive view. The registered
+    ``/client-portal/shop/bills/{bill_id}`` route is the canonical implementation
+    in ``client_portal.py``; registering this one too would shadow it.
+    """
     from ..crypto_helper import get_search_token
 
-    scope = session["client_scope"]
+    scope = _scope_of(session)
     try:
         oid = ObjectId(bill_id)
     except Exception:
         raise HTTPException(status_code=404, detail="Bill not found")
 
-    query = scoped_query(
-        {"_id": oid, "client_name_search": get_search_token(scope["client_name"])},
-        scope["laundry_id"],
-    )
+    filters = {"_id": oid, "client_name_search": get_search_token(scope["client_name"])}
+    if scope.get("shop_id"):
+        filters["shop_id"] = scope["shop_id"]
+    query = scoped_query(filters, scope["laundry_id"])
     doc = await shop_bills_collection.find_one(query)
     if not doc:
         raise HTTPException(status_code=404, detail="Bill not found")

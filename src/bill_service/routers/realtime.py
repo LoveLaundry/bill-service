@@ -66,8 +66,15 @@ CLOSE_BAD_FRAME = 4400
 
 
 def _allowed_origins() -> list:
+    from ..config import settings
+
     raw = os.getenv("ALLOWED_ORIGINS", "")
-    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+    configured = [
+        origin.strip().rstrip("/")
+        for origin in raw.split(",")
+        if origin.strip() and origin.strip() != "*"
+    ]
+    return list(dict.fromkeys(configured + [o.rstrip("/") for o in settings.cors_origins]))
 
 
 def _origin_allowed(websocket: WebSocket) -> bool:
