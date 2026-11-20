@@ -1,10 +1,18 @@
+import logging
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import Dict, List, Optional
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth_helper import get_current_user, require_capability
+from ..tenancy import (
+    LOVE_LAUNDRY_ID,
+    assert_same_laundry,
+    owned_filter,
+    resolve_laundry_id,
+    scoped_query,
+)
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -16,6 +24,8 @@ from ..database.main_db import (
 from ..repositories.main_repository import bump_version, enqueue_sync
 from ..services import idempotency
 from ..services import balance_engine as be
+from ..services.operations_context import source_filter
+from ..services.hotel_code import format_bill_number
 from ..services.transaction_events import build_item_delta, record_event, EVENT_BILL_CREATED
 from ..services.verification_service import attach_verification_to
 from pydantic import BaseModel
@@ -42,6 +52,7 @@ PAYMENT_SENSITIVE_FIELDS = ["client_name", "notes"]
 DELIVERY_SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 GATEPASS_SENSITIVE_FIELDS = ["client_name", "items", "notes"]
 QUOTATION_SENSITIVE_FIELDS = ["client_name", "quotation_title", "line_items"]
+logger = logging.getLogger(__name__)
 
 
 def _serialize(doc: dict) -> dict:
@@ -57,6 +68,46 @@ def _serialize(doc: dict) -> dict:
     return decrypted
 
 
+async def _attach_receiving_date(bill_doc: dict, serialized: dict) -> dict:
+    """Expose the linked gate pass's received date on bills for invoice rows."""
+    gate_pass = None
+    gate_pass_id = bill_doc.get("gate_pass_id")
+    if gate_pass_id and ObjectId.is_valid(str(gate_pass_id)):
+        gate_pass = await gatepasses_collection.find_one(
+            {"_id": ObjectId(str(gate_pass_id))}
+        )
+
+    if gate_pass is None:
+        for delivery_id in bill_doc.get("delivery_ids") or []:
+            if not ObjectId.is_valid(str(delivery_id)):
+                continue
+            delivery = await deliveries_collection.find_one(
+                {"_id": ObjectId(str(delivery_id))}
+            )
+            if not delivery:
+                continue
+            source_ids = delivery.get("source_gate_pass_ids") or [
+                delivery.get("gate_pass_id")
+            ]
+            for source_id in source_ids:
+                if source_id and ObjectId.is_valid(str(source_id)):
+                    gate_pass = await gatepasses_collection.find_one(
+                        {"_id": ObjectId(str(source_id))}
+                    )
+                    if gate_pass:
+                        break
+            if gate_pass:
+                break
+
+    if gate_pass:
+        serialized["receiving_date"] = gate_pass.get("receiving_date")
+    return serialized
+
+
+def _item_unit(item_name: str, unit: Optional[str] = None) -> str:
+    return unit or ("kg" if "curtain" in item_name.casefold() else "pcs")
+
+
 def _serialize_payment(doc: dict) -> dict:
     try:
         decrypted = decrypt_dict(doc, PAYMENT_SENSITIVE_FIELDS)
@@ -69,6 +120,15 @@ def _serialize_payment(doc: dict) -> dict:
     return decrypted
 
 
+async def _owned_bill(bill_id: str, current_user: dict):
+    """Fetch a bill iff it belongs to the caller's laundry (404 otherwise)."""
+    laundry_id = resolve_laundry_id(current_user)
+    oid = _parse_object_id(bill_id)
+    doc = await bills_collection.find_one({"_id": oid})
+    assert_same_laundry(doc, laundry_id, "Bill")
+    return laundry_id, oid, doc
+
+
 def _parse_object_id(bill_id: str) -> ObjectId:
     try:
         return ObjectId(bill_id)
@@ -78,20 +138,21 @@ def _parse_object_id(bill_id: str) -> ObjectId:
         )
 
 
-async def log_audit(user_id: str, action: str, entity: str, entity_id: str, details: dict = None):
-    audit_doc = {
-        "user_id": user_id,
-        "action": action,
-        "entity": entity,
-        "entity_id": entity_id,
-        "timestamp": datetime.now(timezone.utc),
-    }
-    if details:
-        audit_doc["details"] = details
-    await audit_collection.insert_one(audit_doc)
+async def log_audit(
+    user_id: str,
+    action: str,
+    entity: str,
+    entity_id: str,
+    details: dict = None,
+    laundry_id: str | None = None,
+):
+    # One writer, one schema — see router_utils.log_audit (canonical keys plus
+    # the legacy aliases the report UI renders).
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, details, None, laundry_id)
 
 
-async def get_quotation_prices(quotation_id: str) -> tuple:
+async def get_quotation_prices(quotation_id: str, laundry_id: str) -> tuple:
     """Fetch quotation pricing (the agreed price list) for a client.
 
     A quotation is a PRICE LIST, not a transaction: this function reads only
@@ -124,7 +185,7 @@ async def get_quotation_prices(quotation_id: str) -> tuple:
     for db_name in db_names:
         try:
             coll = motor_client[db_name]["quotations"]
-            quotation_doc = await coll.find_one({"_id": q_oid})
+            quotation_doc = await coll.find_one(scoped_query({"_id": q_oid}, laundry_id))
             if quotation_doc:
                 break
         except Exception:
@@ -204,7 +265,7 @@ async def _assert_items_within_billable_ceiling(
     all_del_ids = [d["_id"] for d in universe] + [
         ObjectId(d_id) for d_id in (bill_doc.get("delivery_ids") or []) if ObjectId.is_valid(str(d_id))
     ]
-    already_billed: Dict[str, int] = {}
+    already_billed: Dict[str, float] = {}
     or_clauses = []
     if all_del_ids:
         or_clauses.append({"delivery_ids": {"$in": all_del_ids}})
@@ -247,9 +308,12 @@ async def create_bill(
     request: Request = None,
 ):
     auth_id = current_user.get("auth_id", "system")
+    laundry_id = resolve_laundry_id(current_user)
 
     # Idempotent create: retried requests reuse the previously created bill.
-    existing_created = await idempotency.find_previous(request, auth_id, bills_collection)
+    existing_created = await idempotency.find_previous(
+        request, auth_id, laundry_id, "bill", bills_collection
+    )
     if existing_created:
         return await attach_verification_to(
             "bill", existing_created["_id"], _serialize(existing_created)
@@ -266,6 +330,7 @@ async def create_bill(
                 status_code=400, detail="Invalid gate_pass_id format."
             )
         gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
+        assert_same_laundry(gp_doc, laundry_id, "Gate Pass")
         if not gp_doc:
             raise HTTPException(
                 status_code=404, detail="Gate Pass not found."
@@ -287,7 +352,7 @@ async def create_bill(
     gp_quotation_id = payload.quotation_id or (
         gp_dec.get("quotation_id") if gp_doc else None
     )
-    price_map, quotation_client = await get_quotation_prices(gp_quotation_id) if gp_quotation_id else ({}, None)
+    price_map, quotation_client = await get_quotation_prices(gp_quotation_id, laundry_id) if gp_quotation_id else ({}, None)
     if quotation_client and not be.same_client(payload.client_name, quotation_client):
         raise HTTPException(
             status_code=400,
@@ -309,6 +374,7 @@ async def create_bill(
         for d_id in del_ids_to_save:
             d_oid = ObjectId(d_id)
             d_doc = await deliveries_collection.find_one({"_id": d_oid})
+            assert_same_laundry(d_doc, laundry_id, "Delivery")
             if not d_doc:
                 raise HTTPException(
                     status_code=400,
@@ -334,6 +400,7 @@ async def create_bill(
             except InvalidId:
                 continue
             g_doc = await gatepasses_collection.find_one({"_id": g_obj})
+            assert_same_laundry(g_doc, laundry_id, "Gate Pass")
             if not g_doc:
                 continue
             g_dec = decrypt_dict(g_doc, GATEPASS_SENSITIVE_FIELDS)
@@ -448,8 +515,6 @@ async def create_bill(
         # Derive billable items from the gate pass RECEIVED quantities,
         # minus whatever has already been billed for the pass (GP-leg bills
         # reference gate_pass_id; delivery-leg bills reference its deliveries).
-        from ..services.operations_context import source_filter
-
         gp_del_ids = []
         gp_del_cursor = deliveries_collection.find(
             {**source_filter(payload.gate_pass_id), "status": {"$ne": "CANCELLED"}}
@@ -458,6 +523,7 @@ async def create_bill(
             gp_del_ids.append(str(del_doc["_id"]))
 
         already_billed_map = {}
+        already_billed_pieces = {}
         billed_filter: dict = {
             "payment_status": {"$ne": "CANCELLED"},
             "$or": [{"gate_pass_id": payload.gate_pass_id}],
@@ -472,8 +538,31 @@ async def create_bill(
                 already_billed_map[name] = (
                     already_billed_map.get(name, 0) + item["quantity"]
                 )
+                already_billed_pieces[name] = (
+                    already_billed_pieces.get(name, 0) + int(item.get("piece_count", 0) or 0)
+                )
 
         gp_map = be.compute_billable_received_by_name(gp_dec.get("items", []), already_billed_map)
+        received_by_name = {}
+        pieces_by_name = {}
+        unit_by_name = {}
+        for gp_item in gp_dec.get("items", []):
+            if gp_item.get("rewashed"):
+                continue
+            name = gp_item.get("item_name", "")
+            received_by_name[name] = received_by_name.get(name, 0) + float(gp_item.get("received_qty", 0) or 0)
+            pieces_by_name[name] = pieces_by_name.get(name, 0) + int(gp_item.get("piece_count", 0) or 0)
+            unit_by_name[name] = _item_unit(name, gp_item.get("unit"))
+
+        def unbilled_pieces(name: str, unbilled_qty: float) -> int:
+            total_pieces = pieces_by_name.get(name, 0)
+            received_qty = received_by_name.get(name, 0)
+            billed_pieces = already_billed_pieces.get(name, 0)
+            if billed_pieces > 0:
+                return max(0, total_pieces - billed_pieces)
+            if total_pieces <= 0 or received_qty <= 0:
+                return 0
+            return min(total_pieces, round(total_pieces * unbilled_qty / received_qty))
 
         rewashed_names = {
             it.get("item_name")
@@ -515,6 +604,8 @@ async def create_bill(
                         "unit_price": unit_price,
                         "quantity": qty,
                         "line_total": line_total,
+                        "piece_count": input_item.piece_count or unbilled_pieces(name, qty),
+                        "unit": _item_unit(name, input_item.unit or unit_by_name.get(name)),
                     }
                 )
         else:
@@ -539,6 +630,8 @@ async def create_bill(
                         "unit_price": unit_price,
                         "quantity": qty,
                         "line_total": line_total,
+                        "piece_count": unbilled_pieces(name, qty),
+                        "unit": unit_by_name.get(name, _item_unit(name)),
                     }
                 )
 
@@ -563,6 +656,8 @@ async def create_bill(
                     "unit_price": unit_price,
                     "quantity": input_item.quantity,
                     "line_total": line_total,
+                    "piece_count": input_item.piece_count,
+                    "unit": _item_unit(name, input_item.unit),
                 }
             )
 
@@ -592,6 +687,7 @@ async def create_bill(
     paid_amount = grand_total if payload.instant else 0.0
     outstanding_amount = 0.0 if payload.instant else grand_total
     doc = {
+        "laundry_id": laundry_id,
         "quotation_id": payload.quotation_id or "",
         "client_name": payload.client_name,
         "client_name_search": get_search_token(payload.client_name),
@@ -609,6 +705,10 @@ async def create_bill(
         "outstanding_amount": outstanding_amount,
         "delivery_ids": del_ids_to_save,
         "gate_pass_id": payload.gate_pass_id,
+        "receiving_date": gp_dec.get("receiving_date") if gp_dec else None,
+        "manual_bill_number": gp_dec.get("manual_bill_number") if gp_dec else None,
+        "manual_gate_pass_number": gp_dec.get("manual_gate_pass_number") if gp_dec else None,
+        "alrs_number": gp_dec.get("alrs_number") if gp_dec else None,
         "notes": payload.notes,
         "created_at": now,
         "updated_at": now,
@@ -629,6 +729,7 @@ async def create_bill(
         entity_type="bill",
         entity_id=serialized["id"],
         event_type=EVENT_BILL_CREATED,
+        laundry_id=laundry_id,
         gate_pass_id=payload.gate_pass_id,
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -647,9 +748,80 @@ async def create_bill(
         "BILL_CREATE",
         "bill",
         serialized["id"],
+        laundry_id=laundry_id,
     )
-    await idempotency.record_created(request, auth_id, "bill", serialized["id"])
+    await idempotency.record_created(
+        request, auth_id, "bill", serialized["id"], laundry_id
+    )
     return serialized
+
+
+def _gatepass_lookup_stage(laundry_id: str) -> dict:
+    """Join bills to their gate pass for receiving-date filtering.
+
+    ``gate_pass_id`` is a string, ``_id`` an ObjectId. ``$convert`` maps
+    missing/malformed ids (manual bills carry ``gate_pass_id=None``) to null
+    instead of throwing like ``$toObjectId`` did.
+
+    The join is also constrained to the caller's laundry. Matching on ``_id``
+    alone would happily attach another tenant's gate pass if a bill ever held a
+    foreign ``gate_pass_id``; the same transitional rule as
+    :func:`tenancy.laundry_match` keeps legacy (unstamped) gate passes visible to
+    the historical tenant only.
+    """
+    if laundry_id == LOVE_LAUNDRY_ID:
+        tenant_condition = {
+            "$or": [
+                {"$eq": ["$laundry_id", LOVE_LAUNDRY_ID]},
+                {"$eq": [{"$type": "$laundry_id"}, "missing"]},
+                {"$eq": ["$laundry_id", None]},
+            ]
+        }
+    else:
+        tenant_condition = {"$eq": ["$laundry_id", laundry_id]}
+
+    return {
+        "$lookup": {
+            "from": "gatepasses",
+            "let": {"gp_id_str": "$gate_pass_id"},
+            "pipeline": [
+                {
+                    "$match": {
+                        "$expr": {
+                            "$and": [
+                                {
+                                    "$eq": [
+                                        "$_id",
+                                        {
+                                            "$convert": {
+                                                "input": "$$gp_id_str",
+                                                "to": "objectId",
+                                                "onError": None,
+                                                "onNull": None,
+                                            }
+                                        },
+                                    ]
+                                },
+                                tenant_condition,
+                            ]
+                        }
+                    }
+                },
+            ],
+            "as": "gp",
+        }
+    }
+
+
+def _combine_name_filters(*tokens: Optional[str]) -> dict:
+    """Merge client-name search tokens: multiple become an ``$and`` instead of
+    one silently overwriting the other (both resolve to one field)."""
+    clauses = [{"client_name_search": token} for token in tokens if token]
+    if len(clauses) == 1:
+        return clauses[0]
+    if len(clauses) > 1:
+        return {"$and": clauses}
+    return {}
 
 
 @router.get("", response_model=BillListResponse)
@@ -669,10 +841,8 @@ async def list_bills(
     use_pipeline = gate_pass_date_from or gate_pass_date_to
 
     if use_pipeline:
-        # Build aggregation pipeline — filter by gate pass receiving_date
         pipeline: list = []
 
-        # Start with basic bill-level filters (non-date)
         base_match: dict = {}
         if client_name:
             base_match["client_name_search"] = get_search_token(client_name)
@@ -681,24 +851,22 @@ async def list_bills(
         if payment_status:
             base_match["payment_status"] = payment_status
         if search:
-            base_match["client_name_search"] = get_search_token(search)
-        if base_match:
-            pipeline.append({"$match": base_match})
+            base_match.update(
+                _combine_name_filters(
+                    base_match.pop("client_name_search", None),
+                    get_search_token(search),
+                )
+            )
+        laundry_id = resolve_laundry_id(current_user)
+        # The tenant match is unconditional: with only a gate-pass date filter the
+        # pipeline used to start with no $match at all and scanned every tenant's
+        # bills before filtering. scoped_query() handles the empty-filter case.
+        pipeline.append({"$match": scoped_query(base_match, laundry_id)})
 
-        # Join with gatepasses to access receiving_date
-        # gate_pass_id is stored as a string, _id is ObjectId — must convert
-        pipeline.append({
-            "$lookup": {
-                "from": "gatepasses",
-                "let": {"gp_id_str": "$gate_pass_id"},
-                "pipeline": [
-                    {"$match": {"$expr": {"$eq": ["$_id", {"$toObjectId": "$$gp_id_str"}]}}},
-                ],
-                "as": "gp",
-            }
-        })
+        # Join with gatepasses to access receiving_date (same tenant only)
+        pipeline.append(_gatepass_lookup_stage(laundry_id))
 
-        # Filter by gate pass receiving_date (handles null gate_pass_id too)
+        # Filter by gate pass receiving_date
         gp_date_match: dict = {}
         if gate_pass_date_from:
             gp_date_match["$gte"] = day_query(gate_pass_date_from)
@@ -711,10 +879,21 @@ async def list_bills(
             }
         })
 
-        # Drop the gp join field before returning
+        pipeline.append(
+            {
+                "$addFields": {
+                    "receiving_date": {
+                        "$ifNull": [
+                            "$receiving_date",
+                            {"$arrayElemAt": ["$gp.receiving_date", 0]},
+                        ]
+                    }
+                }
+            }
+        )
+        # Drop the gate-pass join field after exposing the date.
         pipeline.append({"$project": {"gp": 0}})
 
-        # Count total before sort/skip/limit
         count_pipeline = pipeline + [{"$count": "total"}]
         count_result = await bills_collection.aggregate(count_pipeline).to_list(1)
         total = count_result[0]["total"] if count_result else 0
@@ -729,17 +908,14 @@ async def list_bills(
         async for doc in cursor:
             try:
                 serialized = _serialize(doc)
+                serialized = await _attach_receiving_date(doc, serialized)
                 docs.append(await attach_verification_to("bill", doc["_id"], serialized))
             except HTTPException:
                 pass
 
         return {"items": docs, "total": total}
 
-    # Original simple query (no gate pass date filter)
     query: dict = {}
-
-    if client_name:
-        query["client_name_search"] = get_search_token(client_name)
 
     if quotation_id:
         query["quotation_id"] = quotation_id
@@ -755,9 +931,15 @@ async def list_bills(
             date_filter["$lte"] = day_query_end(date_to)
         query["created_at"] = date_filter
 
-    if search:
-        query["client_name_search"] = get_search_token(search)
+    if client_name or search:
+        query.update(
+            _combine_name_filters(
+                get_search_token(client_name) if client_name else None,
+                get_search_token(search) if search else None,
+            )
+        )
 
+    query = scoped_query(query, resolve_laundry_id(current_user))
     total = await bills_collection.count_documents(query)
     cursor = (
         bills_collection.find(query)
@@ -770,6 +952,7 @@ async def list_bills(
     async for doc in cursor:
         try:
             serialized = _serialize(doc)
+            serialized = await _attach_receiving_date(doc, serialized)
             docs.append(await attach_verification_to("bill", doc["_id"], serialized))
         except HTTPException:
             pass
@@ -796,7 +979,9 @@ async def get_unbilled_gatepasses(
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 
-    gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
+    gp_cursor = gatepasses_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("receiving_date", -1)
 
     unbilled_gatepasses = []
 
@@ -850,7 +1035,7 @@ async def get_unbilled_gatepasses(
             received_by_name: dict = {}
             for gp_item in gp.get("items", []):
                 if gp_item.get("rewashed"):
-                    received = int(gp_item.get("received_qty", 0) or 0)
+                    received = float(gp_item.get("received_qty", 0) or 0)
                     rewashed_items.append({
                         "item_name": gp_item.get("item_name", ""),
                         "specification": gp_item.get("specification") or "",
@@ -859,7 +1044,7 @@ async def get_unbilled_gatepasses(
                     total_rewashed_qty += received
                     continue  # free re-washes are never billed
                 name = gp_item.get("item_name", "")
-                received_by_name[name] = received_by_name.get(name, 0) + int(
+                received_by_name[name] = received_by_name.get(name, 0) + float(
                     gp_item.get("received_qty", 0) or 0
                 )
 
@@ -905,17 +1090,51 @@ async def get_unbilled_gatepasses(
     return unbilled_gatepasses
 
 
+@router.get("/payments", response_model=list)
+async def list_all_payments(
+    client_name: Optional[str] = Query(None),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1, le=5000),
+    current_user: dict = Depends(require_capability("payment:read")),
+):
+    """All payment receipts in scope, newest first.
+
+    One request replaces N per-bill ``/{bill_id}/payments`` calls for
+    ledger-style screens. Defined before ``/{bill_id}`` so the static path
+    is never swallowed by the wildcard.
+    """
+    query: dict = {}
+    if client_name:
+        query["client_name_search"] = get_search_token(client_name)
+    if date_from or date_to:
+        date_filter: dict = {}
+        if date_from:
+            date_filter["$gte"] = day_query(date_from)
+        if date_to:
+            date_filter["$lte"] = day_query_end(date_to)
+        query["payment_date"] = date_filter
+
+    cursor = payments_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("payment_date", -1).skip(skip).limit(limit)
+    results = []
+    async for doc in cursor:
+        try:
+            serialized = _serialize_payment(doc)
+            results.append(await attach_verification_to("payment", doc["_id"], serialized))
+        except HTTPException:
+            pass
+    return results
+
+
 @router.get("/{bill_id}", response_model=BillModel)
 async def get_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("bill:read")),
 ):
-    oid = _parse_object_id(bill_id)
-    doc = await bills_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
-        )
+    laundry_id, oid, doc = await _owned_bill(bill_id, current_user)
     serialized = _serialize(doc)
     return await attach_verification_to("bill", oid, serialized)
 
@@ -940,15 +1159,10 @@ async def update_bill_status(
             detail=f"Invalid status. Must be one of {valid_statuses}",
         )
 
-    oid = _parse_object_id(bill_id)
-    doc = await bills_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
-        )
+    laundry_id, oid, doc = await _owned_bill(bill_id, current_user)
 
     await bills_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {
             "$set": {
                 "payment_status": status_update,
@@ -969,6 +1183,7 @@ async def update_bill_status(
         "BILL_STATUS_UPDATE",
         "bill",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -992,10 +1207,7 @@ async def edit_bill(
     payload: BillEdit,
     current_user: dict = Depends(require_capability("bill:write")),
 ):
-    oid = _parse_object_id(bill_id)
-    doc = await bills_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Bill not found")
+    laundry_id, oid, doc = await _owned_bill(bill_id, current_user)
 
     dec = decrypt_dict(doc, SENSITIVE_FIELDS)
     if dec.get("payment_status") in ("PAID", "CANCELLED"):
@@ -1073,7 +1285,7 @@ async def edit_bill(
         merged["client_name_search"] = get_search_token(merged["client_name"])
 
     await bills_collection.replace_one(
-        {"_id": oid}, encrypt_dict(merged, SENSITIVE_FIELDS)
+        owned_filter(oid, laundry_id), encrypt_dict(merged, SENSITIVE_FIELDS)
     )
 
     updated_doc = await bills_collection.find_one({"_id": oid})
@@ -1089,6 +1301,7 @@ async def edit_bill(
         "bill",
         serialized["id"],
         details={"edited_fields": list(update_fields.keys())},
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -1098,10 +1311,11 @@ async def delete_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("payment:write")),
 ):
+    laundry_id = resolve_laundry_id(current_user)
     oid = _parse_object_id(bill_id)
     # Prefer Cancellation / status CANCELLED instead of hard delete
     result = await bills_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {
             "$set": {
                 "payment_status": "CANCELLED",
@@ -1118,12 +1332,132 @@ async def delete_bill(
     await enqueue_sync("bill", oid, new_version)
 
     await log_audit(
-        current_user.get("auth_id", "system"), "BILL_CANCEL", "bill", bill_id
+        current_user.get("auth_id", "system"),
+        "BILL_CANCEL",
+        "bill",
+        bill_id,
+        laundry_id=laundry_id,
     )
     return {"message": "Bill cancelled successfully"}
 
 
 # --- Payment APIs ---
+def _payment_bill_cas_filter(doc: dict, oid: ObjectId) -> dict:
+    """Match the money state read by a payment before changing its aggregates."""
+    query = {"_id": oid}
+    for field in ("paid_amount", "grand_total", "outstanding_amount", "payment_status"):
+        if field in doc:
+            query[field] = doc[field]
+        else:
+            query[field] = {"$exists": False}
+    return query
+
+
+async def _reserve_bill_payment(oid: ObjectId, amount: float, now: datetime) -> tuple[dict, dict]:
+    """Atomically reserve amount against the current bill balance using CAS.
+
+    MongoDB updates a single document atomically across processes. Comparing
+    every accounting field read prevents one request from overwriting another
+    request's newer aggregate values.
+    """
+    for _ in range(20):
+        doc = await bills_collection.find_one({"_id": oid})
+        if not doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
+            )
+
+        dec_bill = _serialize(doc)
+        if dec_bill["payment_status"] == "CANCELLED":
+            raise HTTPException(
+                status_code=400, detail="Cannot record payments on a cancelled bill."
+            )
+
+        paid_amount = round(float(dec_bill.get("paid_amount") or 0), 2)
+        grand_total = round(float(dec_bill["grand_total"]), 2)
+        outstanding = round(grand_total - paid_amount, 2)
+        if outstanding < 0:
+            outstanding = 0.0
+        if amount > outstanding + 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Payment amount of {amount} exceeds outstanding block of {outstanding}.",
+            )
+
+        new_paid = round(paid_amount + amount, 2)
+        new_outstanding = round(grand_total - new_paid, 2)
+        if new_outstanding < 0.01:
+            new_outstanding = 0.0
+            new_status = "PAID"
+        else:
+            new_status = "PARTIALLY_PAID"
+
+        result = await bills_collection.update_one(
+            _payment_bill_cas_filter(doc, oid),
+            {
+                "$set": {
+                    "paid_amount": new_paid,
+                    "outstanding_amount": new_outstanding,
+                    "payment_status": new_status,
+                    "updated_at": now,
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return dec_bill, {
+                "paid_amount": new_paid,
+                "outstanding_amount": new_outstanding,
+                "payment_status": new_status,
+            }
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Bill was updated concurrently. Please retry the payment.",
+    )
+
+
+async def _rollback_bill_payment(oid: ObjectId, amount: float, prior_status: str) -> None:
+    """Compensate a successful bill reservation if its payment row cannot save."""
+    for _ in range(20):
+        doc = await bills_collection.find_one({"_id": oid})
+        if not doc:
+            raise RuntimeError("Bill disappeared while restoring its payment balance")
+
+        dec_bill = _serialize(doc)
+        paid_amount = round(float(dec_bill.get("paid_amount") or 0), 2)
+        grand_total = round(float(dec_bill["grand_total"]), 2)
+        restored_paid = max(0.0, round(paid_amount - amount, 2))
+        restored_outstanding = round(grand_total - restored_paid, 2)
+        if restored_outstanding < 0.01:
+            restored_outstanding = 0.0
+            restored_status = "PAID"
+        elif restored_paid > 0:
+            restored_status = "PARTIALLY_PAID"
+        else:
+            restored_status = prior_status
+
+        # A cancellation that happened while the write was in flight remains
+        # authoritative; compensation only restores its monetary aggregates.
+        if dec_bill["payment_status"] == "CANCELLED":
+            restored_status = "CANCELLED"
+
+        result = await bills_collection.update_one(
+            _payment_bill_cas_filter(doc, oid),
+            {
+                "$set": {
+                    "paid_amount": restored_paid,
+                    "outstanding_amount": restored_outstanding,
+                    "payment_status": restored_status,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        if result.modified_count == 1:
+            return
+
+    raise RuntimeError("Bill changed repeatedly while restoring its payment balance")
+
+
 @router.post(
     "/{bill_id}/payments",
     response_model=PaymentModel,
@@ -1136,35 +1470,20 @@ async def create_payment(
     request: Request = None,
 ):
     auth_id = current_user.get("auth_id", "system")
+    laundry_id, oid, _verified_bill = await _owned_bill(bill_id, current_user)
 
     # Idempotent create: retried payment posts reuse the previous payment.
-    existing_created = await idempotency.find_previous(request, auth_id, payments_collection)
+    existing_created = await idempotency.find_previous(
+        request, auth_id, laundry_id, "payment", payments_collection
+    )
     if existing_created:
         return _serialize_payment(existing_created)
 
-    oid = _parse_object_id(bill_id)
-    doc = await bills_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Bill not found"
-        )
-
-    dec_bill = _serialize(doc)
-    if dec_bill["payment_status"] == "CANCELLED":
-        raise HTTPException(
-            status_code=400, detail="Cannot record payments on a cancelled bill."
-        )
-
-    outstanding = dec_bill["outstanding_amount"]
-    if payload.amount > outstanding + 0.01:  # Allow minor tolerance for rounding
-        raise HTTPException(
-            status_code=400,
-            detail=f"Payment amount of {payload.amount} exceeds outstanding block of {outstanding}.",
-        )
-
-    # 1. Create Payment record
     now = datetime.now(timezone.utc)
+    dec_bill, _ = await _reserve_bill_payment(oid, payload.amount, now)
+    assert_same_laundry(dec_bill, laundry_id, "Bill")
     payment_doc = {
+        "laundry_id": laundry_id,
         "bill_id": bill_id,
         "client_name": dec_bill["client_name"],
         "client_name_search": get_search_token(dec_bill["client_name"]),
@@ -1176,49 +1495,70 @@ async def create_payment(
         "created_at": now,
     }
 
-    encrypted_pay = encrypt_dict(payment_doc, PAYMENT_SENSITIVE_FIELDS)
-    pay_result = await payments_collection.insert_one(encrypted_pay)
+    # Without replica-set transactions the two collections cannot commit
+    # together. Reserve the balance first, then compensate the bill if the
+    # payment insert fails. Confirm the pre-generated id after an insert error
+    # because a lost acknowledgement may still mean MongoDB committed it.
+    payment_id = ObjectId()
+    try:
+        encrypted_pay = encrypt_dict(payment_doc, PAYMENT_SENSITIVE_FIELDS)
+        encrypted_pay["_id"] = payment_id
+        await payments_collection.insert_one(encrypted_pay)
+    except Exception as insert_error:
+        try:
+            created_pay = await payments_collection.find_one({"_id": payment_id})
+        except Exception:
+            logger.exception(
+                "Could not determine whether payment %s was persisted",
+                payment_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Payment persistence could not be confirmed; manual reconciliation is required.",
+            ) from insert_error
 
-    payment_version = await bump_version("payment", pay_result.inserted_id)
-    await enqueue_sync("payment", pay_result.inserted_id, payment_version)
+        if created_pay is None:
+            try:
+                await _rollback_bill_payment(
+                    oid, payload.amount, dec_bill.get("payment_status", "PENDING")
+                )
+            except Exception as rollback_error:
+                logger.exception(
+                    "Payment insert failed and bill %s compensation failed",
+                    bill_id,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Payment could not be saved and the bill balance could not be restored; manual reconciliation is required.",
+                ) from rollback_error
 
-    # 2. Update Bill totals
-    new_paid = round(dec_bill["paid_amount"] + payload.amount, 2)
-    new_outstanding = round(dec_bill["grand_total"] - new_paid, 2)
-    if new_outstanding < 0.01:
-        new_outstanding = 0.0
-        new_status = "PAID"
-    else:
-        new_status = "PARTIALLY_PAID"
+            raise HTTPException(
+                status_code=500,
+                detail="Payment could not be saved; the bill balance was restored.",
+            ) from insert_error
 
-    await bills_collection.update_one(
-        {"_id": oid},
-        {
-            "$set": {
-                "paid_amount": new_paid,
-                "outstanding_amount": new_outstanding,
-                "payment_status": new_status,
-                "updated_at": now,
-            }
-        },
-    )
+    payment_version = await bump_version("payment", payment_id)
+    await enqueue_sync("payment", payment_id, payment_version)
 
-    created_pay = await payments_collection.find_one({"_id": pay_result.inserted_id})
+    created_pay = await payments_collection.find_one({"_id": payment_id})
     serialized_pay = _serialize_payment(created_pay)
 
     # The bill changed too -> enqueue its replication as well
     bill_new_version = await bump_version("bill", oid)
     await enqueue_sync("bill", oid, bill_new_version)
 
-    serialized_pay = await attach_verification_to("payment", pay_result.inserted_id, serialized_pay)
+    serialized_pay = await attach_verification_to("payment", payment_id, serialized_pay)
 
     await log_audit(
         current_user.get("auth_id", "system"),
         "PAYMENT_CREATE",
         "payment",
         serialized_pay["id"],
+        laundry_id=laundry_id,
     )
-    await idempotency.record_created(request, auth_id, "payment", serialized_pay["id"])
+    await idempotency.record_created(
+        request, auth_id, "payment", serialized_pay["id"], laundry_id
+    )
     return serialized_pay
 
 
@@ -1227,7 +1567,10 @@ async def list_payments_for_bill(
     bill_id: str,
     current_user: dict = Depends(require_capability("payment:read")),
 ):
-    cursor = payments_collection.find({"bill_id": bill_id}).sort("payment_date", -1)
+    laundry_id, _, _ = await _owned_bill(bill_id, current_user)
+    cursor = payments_collection.find(
+        scoped_query({"bill_id": bill_id}, laundry_id)
+    ).sort("payment_date", -1)
     results = []
     async for doc in cursor:
         try:
@@ -1237,3 +1580,154 @@ async def list_payments_for_bill(
             pass
     return results
 
+
+@router.get("/{bill_id}/print-data")
+async def print_bill_data(
+    bill_id: str,
+    include_prefix: bool = Query(
+        False, description="Include hotel-code prefix in bill / gate-pass numbers"
+    ),
+    current_user: dict = Depends(require_capability("bill:read")),
+):
+    """Return a print-ready projection of a hotel bill.
+
+    When ``include_prefix`` is False (default), the hotel-code prefix is
+    stripped from ``manual_bill_number``, ``manual_gate_pass_number`` and
+    ``alrs_number`` — matching the legacy numbering the hotels are used to
+    seeing on printed invoices.
+    """
+    laundry_id, oid, doc = await _owned_bill(bill_id, current_user)
+    serialized = _serialize(doc)
+    serialized = await _attach_receiving_date(doc, serialized)
+
+    serialized["manual_bill_number"] = format_bill_number(
+        serialized.get("manual_bill_number"), include_prefix
+    )
+    serialized["manual_gate_pass_number"] = format_bill_number(
+        serialized.get("manual_gate_pass_number"), include_prefix
+    )
+    serialized["alrs_number"] = format_bill_number(
+        serialized.get("alrs_number"), include_prefix
+    )
+    return serialized
+
+
+class PaymentReverse(BaseModel):
+    """Payload for reversing a recorded payment."""
+
+    reason: Optional[str] = None
+
+
+@router.post("/payments/{payment_id}/reverse", response_model=dict)
+async def reverse_payment(
+    payment_id: str,
+    payload: PaymentReverse,
+    current_user: dict = Depends(require_capability("payment:write")),
+):
+    """Undo a payment and restore the bill's balance.
+
+    Order matters: the payment row is claimed first with a conditional update,
+    so two simultaneous reversals cannot both subtract the amount. The bill is
+    only unwound after that claim succeeds, and the claim is released again if
+    the bill update fails — otherwise a crash midway would leave money removed
+    from the balance with nothing recording why.
+    """
+    try:
+        pid = ObjectId(payment_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    stored = await payments_collection.find_one({"_id": pid})
+    if not stored:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    payment = _serialize_payment(stored)
+    laundry_id, oid, bill = await _owned_bill(str(payment["bill_id"]), current_user)
+    assert_same_laundry(payment, laundry_id, "Payment")
+
+    if payment.get("reversed_at"):
+        raise HTTPException(status_code=409, detail="This payment has already been reversed")
+    if str(bill.get("status") or "").upper() in {"CANCELLED", "VOID"}:
+        raise HTTPException(
+            status_code=409,
+            detail="A cancelled bill cannot have its payments reversed",
+        )
+
+    now = datetime.now(timezone.utc)
+    claim = await payments_collection.update_one(
+        {"_id": pid, "reversed_at": {"$exists": False}},
+        {
+            "$set": {
+                "reversed_at": now,
+                "reversed_by": current_user.get("auth_id", "system"),
+                "reversal_reason": payload.reason,
+            }
+        },
+    )
+    if claim.modified_count == 0:
+        raise HTTPException(status_code=409, detail="This payment has already been reversed")
+
+    amount = round(float(payment["amount"]), 2)
+    try:
+        restored = None
+        for _ in range(20):
+            current = await bills_collection.find_one({"_id": oid})
+            if not current:
+                raise RuntimeError("Bill disappeared while reversing a payment")
+
+            bill_now = _serialize(current)
+            paid = round(float(bill_now.get("paid_amount") or 0), 2)
+            new_paid = max(0.0, round(paid - amount, 2))
+            total = round(float(bill_now["grand_total"]), 2)
+            outstanding = round(total - new_paid, 2)
+            if outstanding < 0.01:
+                outstanding = 0.0
+            if outstanding == 0.0:
+                status = "PAID"
+            elif new_paid > 0:
+                status = "PARTIALLY_PAID"
+            else:
+                status = "PENDING"
+
+            # Conditional on the balance that was read: a concurrent payment
+            # must not be overwritten by this reversal.
+            written = await bills_collection.update_one(
+                {"_id": oid, "paid_amount": bill_now.get("paid_amount")},
+                {
+                    "$set": {
+                        "paid_amount": new_paid,
+                        "outstanding_amount": outstanding,
+                        "payment_status": status,
+                    }
+                },
+            )
+            if written.modified_count:
+                restored = {
+                    "paid_amount": new_paid,
+                    "outstanding_amount": outstanding,
+                    "payment_status": status,
+                }
+                break
+    except Exception:
+        await payments_collection.update_one(
+            {"_id": pid},
+            {"$unset": {"reversed_at": "", "reversed_by": "", "reversal_reason": ""}},
+        )
+        raise
+
+    if restored is None:
+        await payments_collection.update_one(
+            {"_id": pid},
+            {"$unset": {"reversed_at": "", "reversed_by": "", "reversal_reason": ""}},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="The bill changed while reversing; nothing was altered. Try again.",
+        )
+
+    return {
+        "reversed": True,
+        "amount": amount,
+        "payment_id": str(pid),
+        "bill": restored,
+    }

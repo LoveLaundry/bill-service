@@ -27,11 +27,10 @@ RUN printf '%s\n' \
   'case "$JWT_SECRET" in' \
   '  CHANGE-ME-IN-PRODUCTION-love-laundry-2026|change-me-in-production) echo "FATAL: JWT_SECRET is still the default; set a real value" >&2; exit 1;;' \
   'esac' \
-  'if [ -n "${MASTER_KEY:-}" ]; then' \
-  '  case "$MASTER_KEY" in' \
-  '    CHANGE-ME-IN-PRODUCTION-love-laundry-2026|change-me-in-production) echo "FATAL: MASTER_KEY is still the default; set a real value" >&2; exit 1;;' \
-  '  esac' \
-  'fi' \
+  ': "${MASTER_KEY:?FATAL: MASTER_KEY is required}"' \
+  'case "$MASTER_KEY" in' \
+  '  CHANGE-ME-IN-PRODUCTION-love-laundry-2026|change-me-in-production) echo "FATAL: MASTER_KEY is still the default; set a real value" >&2; exit 1;;' \
+  'esac' \
   'exec "$@"' \
   > /usr/local/bin/run && chmod +x /usr/local/bin/run
 

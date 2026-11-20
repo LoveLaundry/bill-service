@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Query
 
 from ..app_time import day_bounds, day_end, day_start
 from ..auth_helper import require_capability
+from ..tenancy import resolve_laundry_id, scoped_query
 from ..database.main_db import linen_events_collection
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -53,7 +54,9 @@ async def list_events(
         query["occurred_at"] = date_range
 
     cursor = (
-        linen_events_collection.find(query)
+        linen_events_collection.find(
+            scoped_query(query, resolve_laundry_id(current_user))
+        )
         .sort("occurred_at", -1)
         .skip(skip)
         .limit(limit)

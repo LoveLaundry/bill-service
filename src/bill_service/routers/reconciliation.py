@@ -10,6 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 
 from ..auth_helper import require_capability
+from ..tenancy import resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict
 from ..database.main_db import bills_collection, deliveries_collection, gatepasses_collection
 from ..services import balance_engine as be
@@ -32,9 +33,11 @@ async def reconciliation_issues(
     if status:
         query["status"] = status
 
+    laundry_id = resolve_laundry_id(current_user)
+
     # Cache bills per gate pass id (for BILL_EXCEEDS_RECEIVED checks).
     bills_by_gp: dict = {}
-    bills_cursor = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}})
+    bills_cursor = bills_collection.find(scoped_query({"payment_status": {"$ne": "CANCELLED"}}, laundry_id))
     async for bill_doc in bills_cursor:
         try:
             bill = decrypt_dict(bill_doc, BILL_SENSITIVE_FIELDS)
@@ -48,7 +51,7 @@ async def reconciliation_issues(
     issues_out = []
     summary: Counter = Counter()
 
-    gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
+    gp_cursor = gatepasses_collection.find(scoped_query(query, laundry_id)).sort("receiving_date", -1)
     async for gp_doc in gp_cursor:
         if gp_doc.get("status") == "CANCELLED":
             continue

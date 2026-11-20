@@ -4,6 +4,13 @@ from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer
 import jwt
 
+from dotenv import load_dotenv
+
+# Load .env before reading secrets. config.Settings uses pydantic-settings, which
+# parses .env into the model WITHOUT exporting to os.environ — so without this,
+# the service refused to start unless JWT_SECRET was exported by the host shell.
+load_dotenv()
+
 _jwt_secret = os.getenv("JWT_SECRET")
 if not _jwt_secret:
     raise RuntimeError("FATAL: JWT_SECRET environment variable is not set. Refusing to start.")
@@ -50,7 +57,13 @@ def require_role(allowed_roles: list):
     def dependency(current_user: dict = Security(get_current_user)):
         role = str(current_user.get("role") or "").upper()
         allowed_upper = [r.upper() for r in allowed_roles]
-        if role not in allowed_upper:
+        # A platform administrator is a super-account (support sessions): user-service
+        # already treats PLATFORM_ADMIN as satisfying ADMIN, so we must agree here or
+        # every ADMIN-only platform route 403s while the same token holds every
+        # capability via require_capability. Only ADMIN-shaped checks inherit this;
+        # a narrower list such as ["STAFF"] stays exact.
+        is_platform_admin = role == "PLATFORM_ADMIN" and "ADMIN" in allowed_upper
+        if role not in allowed_upper and not is_platform_admin:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Role '{role}' is not authorized to access this resource",
@@ -91,6 +104,10 @@ ROLE_CAPABILITIES = {
         "linen:read", "linen:scan",
     ]
 }
+
+# Platform administrators hold every capability: support-entry sessions must
+# be able to operate inside the entered laundry. Narrower roles are unchanged.
+ROLE_CAPABILITIES["PLATFORM_ADMIN"] = list(ROLE_CAPABILITIES["ADMIN"])
 
 def require_capability(capability: str):
     """FastAPI dependency to validate fine-grained capabilities."""

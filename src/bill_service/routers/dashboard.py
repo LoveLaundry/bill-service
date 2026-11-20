@@ -9,6 +9,7 @@ from fastapi.responses import StreamingResponse
 
 from ..app_time import UTC, add_months, day_bounds, lkt, month_start, today
 from ..auth_helper import get_current_user, require_capability
+from ..tenancy import LOVE_LAUNDRY_ID, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -66,11 +67,74 @@ def _decrypt_shop_bill(doc: dict) -> dict:
     return dec
 
 
+def _tid(current_user: dict) -> str:
+    return resolve_laundry_id(current_user)
+
+
+def _own(doc: dict, laundry_id: str) -> bool:
+    """Transitional ownership test for decrypted aggregate inputs."""
+    return (doc.get("laundry_id") or LOVE_LAUNDRY_ID) == laundry_id
+
+
+_AUDIT_ENTITY_COLLECTIONS = {
+    "bill": "bills_collection",
+    "gatepass": "gatepasses_collection",
+    "gate_pass": "gatepasses_collection",
+    "delivery": "deliveries_collection",
+    "payment": "payments_collection",
+    "shop_bill": "shop_bills_collection",
+    "return": "returns_collection",
+    "adjustment": "adjustments_collection",
+    "linen": "linens_collection",
+    "dispatch": "dispatch_jobs_collection",
+    "loyalty": "loyalty_accounts_collection",
+    "monthly": "monthly_entries_collection",
+    "rewash": "rewashes_collection",
+}
+
+
+async def _entity_laundry(entity_type: str | None, entity_id: str | None) -> str | None:
+    """Owning laundry of a referenced record, or None when unresolvable.
+
+    Unstamped (pre-tenancy) records read as LoveLaundry's — the only tenant
+    that could have created them.
+    """
+    coll_name = _AUDIT_ENTITY_COLLECTIONS.get(str(entity_type or "").lower())
+    collection = globals().get(coll_name or "")
+    if collection is None or not entity_id:
+        return None
+    try:
+        oid = ObjectId(str(entity_id))
+    except Exception:
+        return None
+    doc = await collection.find_one({"_id": oid}, {"laundry_id": 1})
+    if doc is None:
+        return None
+    return doc.get("laundry_id") or LOVE_LAUNDRY_ID
+
+
+async def _audit_visible(doc: dict, laundry_id: str, is_platform: bool) -> bool:
+    """May this audit entry be shown? Stamped entries match exactly; legacy
+    entries resolve through the referenced entity; anything unresolvable is
+    platform-only."""
+    stamped = doc.get("laundry_id")
+    if is_platform:
+        return True
+    if stamped:
+        return stamped == laundry_id
+    owner = await _entity_laundry(
+        doc.get("entity_type") or doc.get("entity"), doc.get("entity_id")
+    )
+    if owner is None:
+        return False
+    return owner == laundry_id
+
+
 def _key(name: str, spec: str = ""):
     return f"{name}||{spec}" if spec else name
 
 
-def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, int]]:
+def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, float]]:
     """``{gate_pass_id: {item_name: qty}}`` from the canonical engine.
 
     The legacy report groupings below are keyed by bare item name (no
@@ -80,7 +144,7 @@ def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, int]]:
     lines to the primary pass. They now all funnel through the engine and differ
     only in how they flatten the key.
     """
-    out: Dict[str, Dict[str, int]] = {}
+    out: Dict[str, Dict[str, float]] = {}
     for gp_id, keyed in be.compute_delivered_by_gate_pass(delivery_docs).items():
         bucket = out.setdefault(gp_id, {})
         for key, qty in keyed.items():
@@ -89,7 +153,7 @@ def _delivered_by_pass_by_name(delivery_docs) -> Dict[str, Dict[str, int]]:
     return out
 
 
-async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
+async def _get_returned_items_by_gate_pass(laundry_id: str | None = None) -> Dict[str, Dict[str, float]]:
     """Fetch all returns and build gate_pass_id → {item_key → returned_qty}.
 
     Only includes items with action RECEIVE_BACK/RE_WASH that haven't been
@@ -98,8 +162,9 @@ async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
     gate_pass_id, so they are attributed to the exact gate pass they were
     raised on — never to another pass of the same client.
     """
-    returned: Dict[str, Dict[str, int]] = {}
-    ret_cursor = returns_collection.find()
+    returned: Dict[str, Dict[str, float]] = {}
+    ret_query: dict = scoped_query({}, laundry_id) if laundry_id else {}
+    ret_cursor = returns_collection.find(ret_query)
     async for ret_doc in ret_cursor:
         try:
             try:
@@ -121,7 +186,7 @@ async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
                 name = item.get("item_name", "")
                 spec = item.get("specification") or ""
                 key = _key(name, spec)
-                qty = int(item.get("returned_qty", 0) or 0)
+                qty = float(item.get("returned_qty", 0) or 0)
                 if qty > 0:
                     returned[gp_id][key] = returned[gp_id].get(key, 0) + qty
         except Exception:
@@ -129,8 +194,8 @@ async def _get_returned_items_by_gate_pass() -> Dict[str, Dict[str, int]]:
     return returned
 
 
-def _flatten_returned_by_name(returned_by_gp: Dict[str, Dict[str, int]]) -> Dict[str, int]:
-    out: Dict[str, int] = {}
+def _flatten_returned_by_name(returned_by_gp: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
     for _, items in returned_by_gp.items():
         for key, qty in items.items():
             name = key.split("||", 1)[0]
@@ -144,6 +209,7 @@ async def get_client_balances(
     include_closed: bool = Query(False),
     current_user: dict = Depends(require_capability("dashboard:read")),
 ):
+    laundry_id = _tid(current_user)
     """Single authoritative source for a client's linen balances.
 
     Computed entirely by the balance engine from the raw gate pass,
@@ -155,7 +221,7 @@ async def get_client_balances(
     query: dict = {"client_name_search": get_search_token(client_name)}
     if not include_closed:
         query["status"] = {"$nin": ["CANCELLED"]}
-    gp_cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
+    gp_cursor = gatepasses_collection.find(scoped_query(query, laundry_id)).sort("receiving_date", -1)
 
     gp_ids: List[str] = []
     gp_docs: List[dict] = []
@@ -221,7 +287,9 @@ async def get_client_balances(
 )
 async def get_linen_flow(
     period: str = Query("all", pattern="^(all|month|quarter|year)$"),
+    current_user: dict = Depends(require_capability("dashboard:read")),
 ):
+    laundry_id = _tid(current_user)
     """Per-hotel linen flow, with every quantity computed by the balance engine.
 
     The hotel linen flow screen used to pull *every* gate pass and *every*
@@ -255,7 +323,7 @@ async def get_linen_flow(
 
     gp_query: dict = {"status": {"$ne": "CANCELLED"}}
     gp_docs: List[dict] = []
-    for gd in await gatepasses_collection.find(gp_query).sort("receiving_date", -1).to_list(
+    for gd in await gatepasses_collection.find(scoped_query(gp_query, laundry_id)).sort("receiving_date", -1).to_list(
         length=None
     ):
         try:
@@ -322,7 +390,7 @@ async def get_linen_flow(
     # surfaced separately rather than silently dropped, because an unlinked
     # delivery is a real discrepancy an operator has to see.
     known = set(gp_ids)
-    for dd in await deliveries_collection.find({"status": {"$ne": "CANCELLED"}}).to_list(length=None):
+    for dd in await deliveries_collection.find(scoped_query({"status": {"$ne": "CANCELLED"}}, laundry_id)).to_list(length=None):
         try:
             decced = _decrypt_del(dd)
         except Exception:
@@ -342,7 +410,7 @@ async def get_linen_flow(
             {
                 "delivery_id": decced["id"],
                 "delivery_date": decced.get("delivery_date"),
-                "pieces": sum(int(i.get("quantity", 0) or 0) for i in decced.get("items", [])),
+                "pieces": sum(float(i.get("quantity", 0) or 0) for i in decced.get("items", [])),
             }
         )
 
@@ -362,14 +430,18 @@ async def get_linen_flow(
     "/dashboard/client-summary",
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
-async def get_client_summary(client_name: str = Query(...)):
+async def get_client_summary(
+    client_name: str = Query(...),
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
     token = get_search_token(client_name)
 
-    gp_cursor = gatepasses_collection.find({"client_name_search": token})
-    del_cursor = deliveries_collection.find({"client_name_search": token})
-    bill_cursor = bills_collection.find({"client_name_search": token})
-    pay_cursor = payments_collection.find({"client_name_search": token})
-    sb_cursor = shop_bills_collection.find({"client_name_search": token})
+    laundry_id = _tid(current_user)
+    gp_cursor = gatepasses_collection.find(scoped_query({"client_name_search": token}, laundry_id))
+    del_cursor = deliveries_collection.find(scoped_query({"client_name_search": token}, laundry_id))
+    bill_cursor = bills_collection.find(scoped_query({"client_name_search": token}, laundry_id))
+    pay_cursor = payments_collection.find(scoped_query({"client_name_search": token}, laundry_id))
+    sb_cursor = shop_bills_collection.find(scoped_query({"client_name_search": token}, laundry_id))
 
     gps = []
     async for d in gp_cursor:
@@ -463,7 +535,7 @@ async def get_client_summary(client_name: str = Query(...)):
         recorded = recorded_by_gp.get(gp["id"], {})
         for item in gp.get("items", []):
             name = item["item_name"]
-            qty = int(item.get("received_qty", 0) or 0)
+            qty = float(item.get("received_qty", 0) or 0)
             extra = max(0, qty - recorded.get(name, 0))
             if extra <= 0:
                 continue
@@ -544,13 +616,14 @@ async def get_client_summary(client_name: str = Query(...)):
     "/reports/client-wise",
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
-async def get_client_wise_report():
+async def get_client_wise_report(current_user: dict = Depends(require_capability("dashboard:read"))):
+    laundry_id = _tid(current_user)
     # Fetch the independent full-collection scans concurrently (they no longer
     # run back-to-back), then process in the same order as before.
-    gp_fut = gatepasses_collection.find().to_list(length=None)
-    del_fut = deliveries_collection.find({"status": {"$ne": "CANCELLED"}}).to_list(length=None)
-    md_fut = gatepasses_collection.find({"marked_delivered": {"$exists": True}}).to_list(length=None)
-    ret_fut = _get_returned_items_by_gate_pass()
+    gp_fut = gatepasses_collection.find(scoped_query({}, laundry_id)).to_list(length=None)
+    del_fut = deliveries_collection.find(scoped_query({"status": {"$ne": "CANCELLED"}}, laundry_id)).to_list(length=None)
+    md_fut = gatepasses_collection.find(scoped_query({"marked_delivered": {"$exists": True}}, laundry_id)).to_list(length=None)
+    ret_fut = _get_returned_items_by_gate_pass(laundry_id)
     gp_docs, del_docs, md_docs, returned_by_gp = await asyncio.gather(
         gp_fut, del_fut, md_fut, ret_fut
     )
@@ -658,7 +731,9 @@ async def get_client_wise_report():
         except Exception:
             continue
 
-    bill_fut = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}}).to_list(length=None)
+    bill_fut = bills_collection.find(
+        scoped_query({"payment_status": {"$ne": "CANCELLED"}}, laundry_id)
+    ).to_list(length=None)
     bill_docs = await bill_fut
     for doc in bill_docs:
         try:
@@ -673,7 +748,7 @@ async def get_client_wise_report():
 
     # Aggregate returned items per client (spec-aware) via each return's own
     # gate pass, so a return never leaks onto another pass of the same client.
-    client_returned: Dict[str, Dict[str, int]] = {}
+    client_returned: Dict[str, Dict[str, float]] = {}
     for gp_id, gp_items_returned in returned_by_gp.items():
         client_label = gp_client_map.get(gp_id)
         if not client_label:
@@ -708,12 +783,13 @@ async def get_client_wise_report():
     "/reports/item-wise",
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
-async def get_item_wise_report():
+async def get_item_wise_report(current_user: dict = Depends(require_capability("dashboard:read"))):
+    laundry_id = _tid(current_user)
     # Fetch the independent full-collection scans concurrently, then aggregate.
-    gp_fut = gatepasses_collection.find().to_list(length=None)
-    del_fut = deliveries_collection.find({"status": {"$ne": "CANCELLED"}}).to_list(length=None)
-    md_fut = gatepasses_collection.find({"marked_delivered": {"$exists": True}}).to_list(length=None)
-    ret_fut = _get_returned_items_by_gate_pass()
+    gp_fut = gatepasses_collection.find(scoped_query({}, laundry_id)).to_list(length=None)
+    del_fut = deliveries_collection.find(scoped_query({"status": {"$ne": "CANCELLED"}}, laundry_id)).to_list(length=None)
+    md_fut = gatepasses_collection.find(scoped_query({"marked_delivered": {"$exists": True}}, laundry_id)).to_list(length=None)
+    ret_fut = _get_returned_items_by_gate_pass(laundry_id)
     gp_docs, del_docs, md_docs, returned_by_gp = await asyncio.gather(
         gp_fut, del_fut, md_fut, ret_fut
     )
@@ -795,8 +871,11 @@ async def get_item_wise_report():
     "/reports/gatepass-wise",
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
-async def get_gatepass_wise_report():
-    gp_docs = await gatepasses_collection.find().sort("receiving_date", -1).to_list(length=None)
+async def get_gatepass_wise_report(
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
+    laundry_id = _tid(current_user)
+    gp_docs = await gatepasses_collection.find(scoped_query({}, laundry_id)).sort("receiving_date", -1).to_list(length=None)
 
     # Batched delivery lookup: fetch all non-cancelled deliveries for every
     # gate pass in a single query instead of one query per gate pass.
@@ -808,7 +887,7 @@ async def get_gatepass_wise_report():
         except Exception:
             continue
     del_docs = await deliveries_collection.find(
-        {"status": {"$ne": "CANCELLED"}}
+        scoped_query({"status": {"$ne": "CANCELLED"}}, laundry_id)
     ).to_list(length=None) if gp_by_id else []
 
     # A delivery that drew lines from two passes must appear under BOTH, and
@@ -866,8 +945,13 @@ async def get_gatepass_wise_report():
     "/reports/billing",
     dependencies=[Depends(require_capability("dashboard:read"))],
 )
-async def get_billing_report():
-    cursor = bills_collection.find({"payment_status": {"$ne": "CANCELLED"}})
+async def get_billing_report(
+    current_user: dict = Depends(require_capability("dashboard:read")),
+):
+    laundry_id = _tid(current_user)
+    cursor = bills_collection.find(
+        scoped_query({"payment_status": {"$ne": "CANCELLED"}}, laundry_id)
+    )
     total_sales = 0.0
     pending_amount = 0.0
     paid_amount = 0.0
@@ -899,13 +983,20 @@ async def get_billing_report():
 )
 async def get_audit_logs(
     limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(require_capability("dashboard:read")),
 ):
-    cursor = audit_collection.find().sort("timestamp", -1).limit(limit)
+    laundry_id = _tid(current_user)
+    is_platform = bool(current_user.get("platform_admin")) or current_user.get("role") == "PLATFORM_ADMIN"
+    cursor = audit_collection.find().sort("timestamp", -1).limit(limit * 4)
     logs = []
-    async for doc in cursor:
+    for doc in await cursor.to_list(length=None):
+        if not await _audit_visible(doc, laundry_id, is_platform):
+            continue
         doc["id"] = str(doc["_id"])
         del doc["_id"]
         logs.append(doc)
+        if len(logs) >= limit:
+            break
     return logs
 
 from datetime import timedelta
@@ -941,10 +1032,11 @@ def _windows(period: str):
     return cur_start, now, prev_start, prev_end
 
 
-async def _fetch_bills(start: datetime, end: datetime):
+async def _fetch_bills(start: datetime, end: datetime, laundry_id: str | None = None):
     docs = []
+    base: dict = {"created_at": {"$gte": start, "$lte": end}}
     cursor = bills_collection.find(
-        {"created_at": {"$gte": start, "$lte": end}},
+        scoped_query(base, laundry_id) if laundry_id else base,
         {
             "client_name": 1,
             "grand_total": 1,
@@ -975,10 +1067,11 @@ async def _fetch_bills(start: datetime, end: datetime):
     return docs
 
 
-async def _fetch_gate_passes(start: datetime, end: datetime):
+async def _fetch_gate_passes(start: datetime, end: datetime, laundry_id: str | None = None):
     out = []
+    base: dict = {"created_at": {"$gte": start, "$lte": end}}
     cursor = gatepasses_collection.find(
-        {"created_at": {"$gte": start, "$lte": end}},
+        scoped_query(base, laundry_id) if laundry_id else base,
         {"client_name": 1, "items": 1, "gate_pass_number": 1, "created_at": 1, "encryption_metadata": 1, "_id": 1, "status": 1, "marked_delivered": 1},
     )
     async for d in cursor:
@@ -1001,7 +1094,7 @@ async def _fetch_gate_passes(start: datetime, end: datetime):
                     {
                         "item_name": it.get("item_name"),
                         "specification": it.get("specification") or "",
-                        "received_qty": int(it.get("received_qty") or 0),
+                        "received_qty": float(it.get("received_qty") or 0),
                     }
                     for it in items
                 ],
@@ -1051,7 +1144,7 @@ async def _fetch_deliveries(gate_pass_ids: List[str]):
                         "item_name": it.get("item_name"),
                         "specification": it.get("specification") or "",
                         "gate_pass_id": it.get("gate_pass_id") or d.get("gate_pass_id"),
-                        "quantity": int(it.get("quantity") or 0),
+                        "quantity": float(it.get("quantity") or 0),
                     }
                     for it in items
                 ],
@@ -1104,7 +1197,7 @@ def aggregate(bills, gate_passes, deliveries, period, returned_by_gp=None):
 
     # Per-pass attribution from the engine, not a flat sum keyed on the
     # delivery's document-level gate_pass_id.
-    delivered_by_gp: Dict[str, Dict[str, int]] = be.compute_delivered_by_gate_pass(deliveries)
+    delivered_by_gp: Dict[str, Dict[str, float]] = be.compute_delivered_by_gate_pass(deliveries)
 
     balances = []
     items_received = 0
@@ -1225,11 +1318,12 @@ async def get_dashboard_summary(
 ):
     cur_start, cur_end, prev_start, prev_end = _windows(period)
 
-    cur_bills = await _fetch_bills(cur_start, cur_end)
-    prev_bills = await _fetch_bills(prev_start, prev_end)
-    cur_gps = await _fetch_gate_passes(cur_start, cur_end)
+    laundry_id = _tid(current_user)
+    cur_bills = await _fetch_bills(cur_start, cur_end, laundry_id)
+    prev_bills = await _fetch_bills(prev_start, prev_end, laundry_id)
+    cur_gps = await _fetch_gate_passes(cur_start, cur_end, laundry_id)
     cur_dels = await _fetch_deliveries([gp["id"] for gp in cur_gps])
-    prev_gps = await _fetch_gate_passes(prev_start, prev_end)
+    prev_gps = await _fetch_gate_passes(prev_start, prev_end, laundry_id)
     prev_dels = await _fetch_deliveries([gp["id"] for gp in prev_gps])
 
     returned_by_gp = await _get_returned_items_by_gate_pass()
@@ -1258,9 +1352,15 @@ async def recent_activity(
     limit: int = Query(default=10, ge=1, le=50),
     current_user: dict = Depends(require_capability("dashboard:read")),
 ):
-    cursor = audit_collection.find().sort("timestamp", -1).limit(limit)
+    laundry_id = _tid(current_user)
+    is_platform = bool(current_user.get("platform_admin")) or current_user.get("role") == "PLATFORM_ADMIN"
+    cursor = audit_collection.find().sort("timestamp", -1).limit(limit * 4)
     activities = []
     async for doc in cursor:
+        if not await _audit_visible(doc, laundry_id, is_platform):
+            continue
+        if len(activities) >= limit:
+            break
         ts = doc.get("timestamp")
         activities.append({
             "id": str(doc.get("_id", "")),
@@ -1283,9 +1383,10 @@ async def outstanding_aging(
     from datetime import timedelta
     now = datetime.now(timezone.utc)
     buckets = {"current": 0.0, "30_day": 0.0, "60_day": 0.0, "90_day": 0.0, "over_90": 0.0}
+    laundry_id = _tid(current_user)
 
     cursor = bills_collection.find(
-        {"payment_status": {"$in": ["PENDING", "PARTIALLY_PAID", "ISSUED"]}},
+        scoped_query({"payment_status": {"$in": ["PENDING", "PARTIALLY_PAID", "ISSUED"]}}, laundry_id),
         {"outstanding_amount": 1, "created_at": 1, "_id": 0},
     )
     async for doc in cursor:
@@ -1342,9 +1443,10 @@ async def yearly_trend(
         })
 
     month_index = {m["key"]: m for m in months}
+    laundry_id = _tid(current_user)
 
     cursor = bills_collection.find(
-        {"payment_status": {"$ne": "CANCELLED"}},
+        scoped_query({"payment_status": {"$ne": "CANCELLED"}}, laundry_id),
         {"grand_total": 1, "paid_amount": 1, "created_at": 1, "_id": 0},
     )
     async for doc in cursor:
@@ -1376,15 +1478,16 @@ async def today_deliveries(
     """Today's delivery breakdown by client with pending items from ALL open gate passes."""
     from datetime import timedelta as td
 
+    laundry_id = resolve_laundry_id(current_user)
     today_start, today_end = day_bounds(today())
 
     # Step 1: Get today's deliveries grouped by client
     client_map: Dict[str, dict] = {}
 
-    del_cursor = deliveries_collection.find({
+    del_cursor = deliveries_collection.find(scoped_query({
         "created_at": {"$gte": today_start, "$lt": today_end},
         "status": {"$ne": "CANCELLED"},
-    })
+    }, laundry_id))
     async for doc in del_cursor:
         try:
             dl = _decrypt_del(doc)
@@ -1423,7 +1526,9 @@ async def today_deliveries(
             return False
         return today_start <= lkt(cand) < today_end
 
-    md_cursor = gatepasses_collection.find({"marked_delivered": {"$exists": True}})
+    md_cursor = gatepasses_collection.find(
+        scoped_query({"marked_delivered": {"$exists": True}}, laundry_id)
+    )
     async for doc in md_cursor:
         md = doc.get("marked_delivered") or {}
         if not (_md_in_window(md.get("at")) or _md_in_window(md.get("delivered_date"))):
@@ -1451,7 +1556,7 @@ async def today_deliveries(
         for item in gp.get("items", []):
             item_name = item.get("item_name", "")
             spec = item.get("specification") or ""
-            qty = int(item.get("received_qty", 0) or 0)
+            qty = float(item.get("received_qty", 0) or 0)
             detail_key = f"{item_name}||{spec}" if spec else item_name
             if detail_key not in client_map[client]["items"]:
                 client_map[client]["items"][detail_key] = {
@@ -1466,10 +1571,10 @@ async def today_deliveries(
     for client, data in client_map.items():
         # Get ALL open gate passes for this client (not just today's)
         received_map: Dict[str, dict] = {}
-        gp_cursor = gatepasses_collection.find({
+        gp_cursor = gatepasses_collection.find(scoped_query({
             "client_name_search": get_search_token(client),
             "status": {"$ne": "CANCELLED"},
-        })
+        }, laundry_id))
         async for doc in gp_cursor:
             try:
                 gp = _decrypt_gp(doc)
@@ -1485,11 +1590,11 @@ async def today_deliveries(
                 continue
 
         # Get ALL delivered qty for this client across ALL gate passes
-        delivered_map: Dict[str, int] = {}
-        del_cursor2 = deliveries_collection.find({
+        delivered_map: Dict[str, float] = {}
+        del_cursor2 = deliveries_collection.find(scoped_query({
             "client_name_search": get_search_token(client),
             "status": {"$ne": "CANCELLED"},
-        })
+        }, laundry_id))
         client_deliveries = []
         async for doc in del_cursor2:
             try:
@@ -1500,7 +1605,7 @@ async def today_deliveries(
 
         # The client's total delivered quantity, independent of which pass each
         # line came from.
-        delivered_map: Dict[str, int] = {}
+        delivered_map: Dict[str, float] = {}
         for dl in client_deliveries:
             if dl.get("status") == "CANCELLED":
                 continue
@@ -1515,10 +1620,10 @@ async def today_deliveries(
         # Only add the un-recorded remainder per gate pass so a marked pass that
         # shares an item name with other passes of the same client is not under
         # or over counted.
-        md_cursor2 = gatepasses_collection.find({
+        md_cursor2 = gatepasses_collection.find(scoped_query({
             "client_name_search": get_search_token(client),
             "marked_delivered": {"$exists": True},
-        })
+        }, laundry_id))
         async for doc in md_cursor2:
             try:
                 gp = _decrypt_gp(doc)
@@ -1528,7 +1633,7 @@ async def today_deliveries(
                 for item in gp.get("items", []):
                     item_name = item.get("item_name", "")
                     spec = item.get("specification") or ""
-                    qty = int(item.get("received_qty", 0) or 0)
+                    qty = float(item.get("received_qty", 0) or 0)
                     detail_key = f"{item_name}||{spec}" if spec else item_name
                     extra = max(0, qty - recorded.get(detail_key, 0))
                     if extra > 0:
@@ -1538,10 +1643,10 @@ async def today_deliveries(
 
         # Calculate pending = total received (all open GPs) - total delivered (all time)
         # Returned items with action RECEIVE_BACK/RE_WASH need to be re-sent, so they count as pending
-        returned_map: Dict[str, int] = {}
-        ret_cursor = returns_collection.find({
+        returned_map: Dict[str, float] = {}
+        ret_cursor = returns_collection.find(scoped_query({
             "client_name_search": get_search_token(client),
-        })
+        }, laundry_id))
         async for ret_doc in ret_cursor:
             try:
                 try:
@@ -1608,7 +1713,7 @@ async def export_gatepasses_csv(
     if status:
         query["status"] = status
 
-    cursor = gatepasses_collection.find(query).sort("created_at", -1)
+    cursor = gatepasses_collection.find(scoped_query(query, _tid(current_user))).sort("created_at", -1)
     rows = []
     async for doc in cursor:
         dec = _decrypt_gp(doc)
@@ -1657,7 +1762,7 @@ async def export_bills_csv(
     if status:
         query["payment_status"] = status
 
-    cursor = bills_collection.find(query).sort("created_at", -1)
+    cursor = bills_collection.find(scoped_query(query, _tid(current_user))).sort("created_at", -1)
     rows = []
     async for doc in cursor:
         try:
@@ -1709,7 +1814,7 @@ async def export_deliveries_csv(
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 
-    cursor = deliveries_collection.find(query).sort("created_at", -1)
+    cursor = deliveries_collection.find(scoped_query(query, _tid(current_user))).sort("created_at", -1)
     rows = []
     async for doc in cursor:
         try:
@@ -1753,17 +1858,19 @@ async def export_deliveries_csv(
 HEADER_FONT = None
 HEADER_FILL = None
 HEADER_ALIGN = None
+BODY_ALIGN = None
 THIN_BORDER = None
 
 
 def _init_openpyxl():
-    global HEADER_FONT, HEADER_FILL, HEADER_ALIGN, THIN_BORDER
+    global HEADER_FONT, HEADER_FILL, HEADER_ALIGN, THIN_BORDER, BODY_ALIGN
     if HEADER_FONT is not None:
         return
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
     HEADER_FILL = PatternFill(start_color="DC2626", end_color="DC2626", fill_type="solid")
     HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    BODY_ALIGN = Alignment(vertical="center")
     THIN_BORDER = Border(
         left=Side(style="thin"),
         right=Side(style="thin"),
@@ -1784,7 +1891,7 @@ def _style_sheet(ws, headers, rows):
         for col_idx, val in enumerate(row_data, 1):
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.border = THIN_BORDER
-            cell.alignment = Alignment(vertical="center")
+            cell.alignment = BODY_ALIGN
     for col_idx, h in enumerate(headers, 1):
         max_len = max(len(str(h)), *(len(str(r[col_idx - 1])) for r in rows) if rows else [0])
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 4, 40)
@@ -1806,7 +1913,7 @@ async def export_gatepasses_xlsx(
     if status:
         query["status"] = status
 
-    cursor = gatepasses_collection.find(query).sort("created_at", -1)
+    cursor = gatepasses_collection.find(scoped_query(query, _tid(current_user))).sort("created_at", -1)
     rows = []
     async for doc in cursor:
         dec = _decrypt_gp(doc)
@@ -1857,7 +1964,7 @@ async def export_bills_xlsx(
     if status:
         query["payment_status"] = status
 
-    cursor = bills_collection.find(query).sort("created_at", -1)
+    cursor = bills_collection.find(scoped_query(query, _tid(current_user))).sort("created_at", -1)
     rows = []
     async for doc in cursor:
         try:
@@ -1909,7 +2016,7 @@ async def export_deliveries_xlsx(
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 
-    cursor = deliveries_collection.find(query).sort("created_at", -1)
+    cursor = deliveries_collection.find(scoped_query(query, _tid(current_user))).sort("created_at", -1)
     rows = []
     async for doc in cursor:
         try:

@@ -5,6 +5,7 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..auth_helper import get_current_user, require_capability
+from ..tenancy import assert_same_laundry, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -34,6 +35,18 @@ def _serialize(doc: dict) -> dict:
     return decrypted
 
 
+async def _owned_dispatch(job_id: str, current_user: dict):
+    laundry_id = resolve_laundry_id(current_user)
+    oid = _parse_object_id(job_id)
+    doc = await dispatch_jobs_collection.find_one({"_id": oid})
+    assert_same_laundry(doc, laundry_id, "Dispatch job")
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Dispatch job not found"
+        )
+    return laundry_id, oid, doc
+
+
 def _parse_object_id(id_str: str) -> ObjectId:
     try:
         return ObjectId(id_str)
@@ -43,16 +56,16 @@ def _parse_object_id(id_str: str) -> ObjectId:
         )
 
 
-async def log_audit(user_id: str, action: str, entity: str, entity_id: str):
-    await audit_collection.insert_one(
-        {
-            "user_id": user_id,
-            "action": action,
-            "entity": entity,
-            "entity_id": entity_id,
-            "timestamp": datetime.now(timezone.utc),
-        }
-    )
+async def log_audit(
+    user_id: str,
+    action: str,
+    entity: str,
+    entity_id: str,
+    laundry_id: str | None = None,
+):
+    # One writer, one schema — see router_utils.log_audit.
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, None, None, laundry_id)
 
 
 @router.post("", response_model=DispatchModel, status_code=status.HTTP_201_CREATED)
@@ -67,7 +80,9 @@ async def create_dispatch_job(
         )
 
     now = datetime.now(timezone.utc)
+    laundry_id = resolve_laundry_id(current_user)
     doc = {
+        "laundry_id": laundry_id,
         "job_type": payload.job_type,
         "order_id": payload.order_id,
         "client_name": payload.client_name,
@@ -101,6 +116,7 @@ async def create_dispatch_job(
         "DISPATCH_CREATE",
         "dispatch",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -131,7 +147,9 @@ async def list_dispatch_jobs(
         if scheduled_to:
             query["scheduled_at"]["$lte"] = scheduled_to
 
-    cursor = dispatch_jobs_collection.find(query).sort("scheduled_at", 1)
+    cursor = dispatch_jobs_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("scheduled_at", 1)
     results = []
     async for doc in cursor:
         try:
@@ -149,12 +167,7 @@ async def get_dispatch_job(
     job_id: str,
     current_user: dict = Depends(require_capability("dispatch:read")),
 ):
-    oid = _parse_object_id(job_id)
-    doc = await dispatch_jobs_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Dispatch job not found"
-        )
+    _, oid, doc = await _owned_dispatch(job_id, current_user)
     serialized = _serialize(doc)
     return await attach_verification_to("dispatch", oid, serialized)
 
@@ -165,12 +178,7 @@ async def update_dispatch_job(
     payload: DispatchUpdate,
     current_user: dict = Depends(require_capability("dispatch:write")),
 ):
-    oid = _parse_object_id(job_id)
-    doc = await dispatch_jobs_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Dispatch job not found"
-        )
+    laundry_id, oid, doc = await _owned_dispatch(job_id, current_user)
 
     update_data: dict = {}
     if payload.status is not None:
@@ -197,7 +205,7 @@ async def update_dispatch_job(
         )
 
     update_data["updated_at"] = datetime.now(timezone.utc)
-    await dispatch_jobs_collection.update_one({"_id": oid}, {"$set": update_data})
+    await dispatch_jobs_collection.update_one(owned_filter(oid, laundry_id), {"$set": update_data})
 
     new_version = await bump_version("dispatch", oid)
     await enqueue_sync("dispatch", oid, new_version)
@@ -208,9 +216,10 @@ async def update_dispatch_job(
 
     await log_audit(
         current_user.get("auth_id", "system"),
-        "DISPATCH_UPDATE",
-        "dispatch",
+        "DELIVERY_UPDATE",
+        "delivery",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -220,7 +229,7 @@ async def delete_dispatch_job(
     job_id: str,
     current_user: dict = Depends(require_capability("dispatch:write")),
 ):
-    oid = _parse_object_id(job_id)
+    laundry_id, oid, _ = await _owned_dispatch(job_id, current_user)
     # Bump the version while the document still exists, then remove it and
     # enqueue a DELETE so the SECONDARY replica drops the record too.
     try:
@@ -229,12 +238,20 @@ async def delete_dispatch_job(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Dispatch job not found"
         )
-    result = await dispatch_jobs_collection.delete_one({"_id": oid})
+    result = await dispatch_jobs_collection.delete_one(owned_filter(oid, laundry_id))
     if result.deleted_count == 0:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Dispatch job not found"
         )
     await enqueue_delete("dispatch", oid, new_version)
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "DISPATCH_DELETE",
+        "dispatch",
+        str(oid),
+        laundry_id=laundry_id,
+    )
 
 
 def _haversine(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -268,7 +285,9 @@ async def optimize_route(
             "$lt": f"{payload.date}T23:59:59",
         }
 
-    cursor = dispatch_jobs_collection.find(query).sort("scheduled_at", 1)
+    cursor = dispatch_jobs_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("scheduled_at", 1)
     jobs: list[dict] = []
     async for doc in cursor:
         try:

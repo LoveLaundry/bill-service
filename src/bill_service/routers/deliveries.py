@@ -20,6 +20,7 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth_helper import require_capability
+from ..tenancy import LOVE_LAUNDRY_ID, assert_same_laundry, owned_filter, resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, encrypt_dict, get_search_token
 from ..database.main_db import (
     audit_collection,
@@ -34,6 +35,7 @@ from ..services import operations_context as ctx
 from ..services.transaction_events import (
     build_item_delta,
     record_event,
+    EVENT_DELIVERY_ACTIVATED,
     EVENT_DELIVERY_CANCELLED,
     EVENT_DELIVERY_CORRECTED,
     EVENT_DELIVERY_CREATED,
@@ -52,6 +54,19 @@ from ..models import (
 router = APIRouter(prefix="/deliveries", tags=["deliveries"])
 
 SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+
+# Gate-pass documents are encrypted with the same three sensitive fields; the
+# alias keeps the intent explicit where a delivery reads its source pass.
+GATE_PASS_SENSITIVE_FIELDS = SENSITIVE_FIELDS
+
+
+async def _owned_delivery(delivery_id: str, current_user: dict, label: str = "Delivery record not found"):
+    """Fetch a delivery iff it belongs to the caller's laundry (404 otherwise)."""
+    laundry_id = resolve_laundry_id(current_user)
+    oid = _parse_object_id(delivery_id, label)
+    doc = await deliveries_collection.find_one({"_id": oid})
+    assert_same_laundry(doc, laundry_id, "Delivery record")
+    return laundry_id, oid, doc
 
 
 def _parse_object_id(id_str: str, label: str = "Invalid ID format") -> ObjectId:
@@ -119,25 +134,25 @@ def _client_mismatch_error(expected: str, actual: str) -> HTTPException:
     )
 
 
-async def log_audit(user_id: str, action: str, entity: str, entity_id: str, details: dict = None):
-    doc = {
-        "user_id": user_id,
-        "action": action,
-        "entity": entity,
-        "entity_id": entity_id,
-        "timestamp": datetime.now(timezone.utc),
-    }
-    if details:
-        doc["details"] = details
-    await audit_collection.insert_one(doc)
+async def log_audit(
+    user_id: str,
+    action: str,
+    entity: str,
+    entity_id: str,
+    details: dict = None,
+    laundry_id: str | None = None,
+):
+    # One writer, one schema — see router_utils.log_audit.
+    from ..router_utils import log_audit as canonical_log_audit
+    return await canonical_log_audit(user_id, action, entity, entity_id, details, None, laundry_id)
 
 
-def _recompute_discrepancy(item: dict) -> int:
+def _recompute_discrepancy(item: dict) -> float:
     """Server-owned reconciliation between recorded and client-counted qty."""
     counted = item.get("client_counted_qty")
     if counted is None:
         return 0
-    return int(item.get("quantity", 0) or 0) - int(counted or 0)
+    return float(item.get("quantity", 0) or 0) - float(counted or 0)
 
 
 def _source_filter(gate_pass_id: Optional[str]) -> dict:
@@ -157,10 +172,13 @@ async def create_delivery(
     request: Request = None,
 ):
     auth_id = current_user.get("auth_id", "system")
+    laundry_id = resolve_laundry_id(current_user)
 
     # Idempotent create: a retry with the same X-Idempotency-Key returns the
     # previously created delivery instead of duplicating it.
-    existing_created = await idempotency.find_previous(request, auth_id, deliveries_collection)
+    existing_created = await idempotency.find_previous(
+        request, auth_id, laundry_id, "delivery", deliveries_collection
+    )
     if existing_created:
         return _serialize(existing_created)
 
@@ -208,6 +226,9 @@ async def create_delivery(
     if not be.same_client(payload.client_name, canonical_client):
         raise _client_mismatch_error(payload.client_name, canonical_client)
 
+    for gp_id in gp_ids:
+        assert_same_laundry(gate_passes.get(gp_id), laundry_id, "Gate pass")
+
     # ── 3. Validate every line against the pass it came from ─────────────────
     deliveries, returns = await ctx.load_movements(gp_ids)
     available = ctx.availability_maps(
@@ -232,7 +253,7 @@ async def create_delivery(
     for line in planned:
         line["discrepancy"] = _recompute_discrepancy(line)
 
-    # ── 4. Persist ───────────────────────────────────────────────────────────
+# ── 4. Persist ───────────────────────────────────────────────────────────
     now = datetime.now(timezone.utc)
     source_ids = list(dict.fromkeys(str(l["gate_pass_id"]) for l in planned))
     primary_gp_id = payload.gate_pass_id or source_ids[0]
@@ -240,7 +261,12 @@ async def create_delivery(
     if delivery_date.tzinfo is None:
         delivery_date = wall_clock(delivery_date)
 
+    # A DRAFT delivery (monthly grid) is persisted but stays invisible to
+    # availability and does NOT move its source gate pass forward.
+    is_draft = payload.status == "DRAFT"
+
     delivery_doc = {
+        "laundry_id": laundry_id,
         "gate_pass_id": primary_gp_id,
         # Denormalised, non-sensitive index field (see _source_filter).
         "source_gate_pass_ids": source_ids,
@@ -249,10 +275,11 @@ async def create_delivery(
         "delivery_date": delivery_date,
         "delivered_by": payload.delivered_by,
         "received_by": payload.received_by,
-        "items": planned,
-        "status": "DELIVERED",
+"items": planned,
+        "status": payload.status,
         "notes": payload.notes,
         "corrections": [],
+        "origin": payload.origin,
         "created_at": now,
         "updated_at": now,
     }
@@ -272,14 +299,20 @@ async def create_delivery(
     check_deliveries, check_returns = await ctx.load_movements(gp_ids)
     check_delivered = ctx.delivered_by_gate_pass(check_deliveries)
     check_returned = ctx.returned_by_gate_pass(check_returns)
-    violations = be.find_oversell_violations(
-        list(gate_passes.values()),
-        check_delivered,
-        check_returned,
+    # A DRAFT contributes nothing to the movements (drafts are filtered out of
+    # every aggregate), so it can never trip the invariant against itself.
+    violations = (
+        []
+        if is_draft
+        else be.find_oversell_violations(
+            list(gate_passes.values()),
+            check_delivered,
+            check_returned,
+        )
     )
     if violations:
         await deliveries_collection.delete_one({"_id": result.inserted_id})
-        await idempotency.clear(request, auth_id)
+        await idempotency.clear(request, auth_id, laundry_id, "delivery")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -299,8 +332,10 @@ async def create_delivery(
         check_delivered,
         check_returned,
     )
-    await ctx.refresh_gate_pass_statuses(source_ids)
-    await ctx.sync_gate_passes(source_ids)
+    # Drafts must not move any pass forward; activation does that later.
+    if not is_draft:
+        await ctx.refresh_gate_pass_statuses(source_ids)
+        await ctx.sync_gate_passes(source_ids)
 
     new_version = await bump_version("delivery", result.inserted_id)
     await enqueue_sync("delivery", result.inserted_id, new_version)
@@ -309,12 +344,22 @@ async def create_delivery(
     serialized = _serialize(created_doc)
     serialized = await attach_verification_to("delivery", result.inserted_id, serialized)
 
+# Journal one event per source gate pass so each pass's ledger stays
+    # self-describing. A DRAFT records the creation only: no status movement
+    # happens until the delivery is explicitly activated.
     for gp_id in source_ids:
-        balance = balances.get(gp_id, {})
+        gp_status_before = (gate_passes.get(gp_id) or {}).get("status")
+        if is_draft:
+            derived_status = gp_status_before
+        else:
+            derived_status = be.derive_gate_pass_status(
+                balances.get(gp_id, {}), gp_status_before or ""
+            )
         await record_event(
             entity_type="delivery",
             entity_id=delivery_id,
             event_type=EVENT_DELIVERY_CREATED,
+            laundry_id=laundry_id,
             gate_pass_id=gp_id,
             user_id=auth_id,
             user_name=current_user.get("user_name"),
@@ -324,12 +369,14 @@ async def create_delivery(
                 if str(line.get("gate_pass_id")) == gp_id
             ],
             reason=payload.notes,
-            prev_status=gate_passes[gp_id].get("status"),
-            new_status=be.derive_gate_pass_status(balance, gate_passes[gp_id].get("status", "")),
+            prev_status=gp_status_before,
+            new_status=derived_status,
             meta={
                 "delivery_date": delivery_date.isoformat(),
                 "source_gate_pass_ids": source_ids,
                 "client_name": canonical_client,
+                "draft": is_draft,
+                "origin": payload.origin,
             },
         )
 
@@ -339,8 +386,147 @@ async def create_delivery(
         "delivery",
         delivery_id,
         {"source_gate_pass_ids": source_ids, "client_name": canonical_client},
+        laundry_id=laundry_id,
     )
-    await idempotency.record_created(request, auth_id, "delivery", delivery_id)
+    await idempotency.record_created(
+        request, auth_id, "delivery", delivery_id, laundry_id
+    )
+    return serialized
+
+
+@router.post("/{delivery_id}/activate", response_model=DeliveryModel)
+async def activate_delivery(
+    delivery_id: str,
+    current_user: dict = Depends(require_capability("delivery:write")),
+):
+    """Activate a DRAFT delivery created by the monthly flow.
+
+    A DRAFT delivery is a daily-manifest placeholder: balance math, pending
+    lists and the destination gate pass are all unaffected while it stays
+    DRAFT. Activating turns it into a real DELIVERED record, re-validates
+    every line against the LIVE available balance on its source gate pass
+    (received - already delivered by other active deliveries +/- returns),
+    then re-derives the gate pass status from recorded quantities.
+    """
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
+    decrypted = decrypt_dict(doc, SENSITIVE_FIELDS)
+    if decrypted.get("status") != "DRAFT":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Delivery is '{decrypted.get('status')}' and cannot be activated.",
+        )
+
+    gp_id = decrypted.get("gate_pass_id")
+    gp_oid = _parse_object_id(gp_id)
+    gp_doc = await gatepasses_collection.find_one({"_id": gp_oid})
+    assert_same_laundry(gp_doc, laundry_id, "Gate Pass")
+    if not gp_doc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Referenced Gate Pass no longer exists; cannot activate this delivery.",
+        )
+    gp_decrypted = decrypt_dict(gp_doc, GATE_PASS_SENSITIVE_FIELDS)
+
+    received_map: Dict[str, float] = {}
+    for gp_item in gp_decrypted.get("items", []):
+        key = be.item_key(gp_item["item_name"], gp_item.get("specification"))
+        received_map[key] = received_map.get(key, 0) + gp_item["received_qty"]
+
+    # Live availability excludes this DRAFT itself (and other drafts): only
+    # active (DELIVERED) records consume the balance. Attribution is per source
+    # gate pass, so stock delivered from a DIFFERENT pass for the same hotel
+    # cannot shrink this pass's availability.
+    active_deliveries: List[dict] = []
+    prev_cursor = deliveries_collection.find(
+        {"gate_pass_id": gp_id, "status": {"$nin": ["CANCELLED", "DRAFT"]}}
+    )
+    async for prev_doc in prev_cursor:
+        if (prev_doc.get("laundry_id") or LOVE_LAUNDRY_ID) != laundry_id:
+            continue
+        try:
+            active_deliveries.append(decrypt_dict(prev_doc, SENSITIVE_FIELDS))
+        except Exception:
+            continue
+    delivered_map = be.compute_delivered_by_gate_pass(active_deliveries).get(gp_id, {})
+
+    # Re-validate every line at the moment of activation.
+    for item in decrypted.get("items", []):
+        key = be.item_key(item["item_name"], item.get("specification"))
+        received = received_map.get(key, 0)
+        if received <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"'{item['item_name']}' was never received on the source gate pass.",
+            )
+        already = delivered_map.get(key, 0)
+        available = max(0, received - already)
+        if item["quantity"] > available:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Cannot deliver {item['quantity']} of '{item['item_name']}'"
+                    f" (available {available}, received {received}, already "
+                    f"delivered {already}). Activate deliveries in an order that "
+                    "respects the gate pass balance."
+                ),
+            )
+
+    now = datetime.now(timezone.utc)
+    decrypted["status"] = "DELIVERED"
+    decrypted["updated_at"] = now
+    encrypted = encrypt_dict(decrypted, SENSITIVE_FIELDS)
+    await deliveries_collection.replace_one(owned_filter(oid, laundry_id), encrypted)
+
+    new_version = await bump_version("delivery", oid)
+    await enqueue_sync("delivery", oid, new_version)
+    serialized = _serialize(await deliveries_collection.find_one({"_id": oid}))
+    serialized = await attach_verification_to("delivery", oid, serialized)
+
+    # Re-derive the gate pass status from recorded quantities.
+    delivered_map_now = be.compute_delivered_by_gate_pass(
+        active_deliveries + [decrypted]
+    ).get(gp_id, {})
+    returns: List[dict] = []
+    ret_cursor = returns_collection.find({"gate_pass_id": gp_id})
+    async for ret_doc in ret_cursor:
+        if (ret_doc.get("laundry_id") or LOVE_LAUNDRY_ID) != laundry_id:
+            continue
+        try:
+            returns.append(decrypt_dict(ret_doc, ["client_name", "items", "notes"]))
+        except Exception:
+            continue
+    returned_map = be.compute_returned_by_item(returns)
+    balance = be.compute_gate_pass_balance(
+        gp_decrypted.get("items", []), delivered_map_now, returned_map
+    )
+    new_gp_status = be.derive_gate_pass_status(balance, gp_decrypted.get("status", ""))
+    await gatepasses_collection.update_one(
+        owned_filter(gp_oid, laundry_id),
+        {"$set": {"status": new_gp_status, "updated_at": now}},
+    )
+    gp_new_version = await bump_version("gatepass", gp_oid)
+    await enqueue_sync("gatepass", gp_oid, gp_new_version)
+
+    await record_event(
+        entity_type="delivery",
+        entity_id=serialized["id"],
+        event_type=EVENT_DELIVERY_ACTIVATED,
+        laundry_id=laundry_id,
+        gate_pass_id=gp_id,
+        user_id=current_user.get("auth_id", "system"),
+        user_name=current_user.get("user_name"),
+        prev_status="DRAFT",
+        new_status="DELIVERED",
+        meta={"activated": True, "new_gate_pass_status": new_gp_status},
+    )
+
+    await log_audit(
+        current_user.get("auth_id", "system"),
+        "DELIVERY_ACTIVATE",
+        "delivery",
+        serialized["id"],
+        laundry_id=laundry_id,
+    )
     return serialized
 
 
@@ -356,12 +542,7 @@ async def update_delivery_date(
     not a quantity change, so balances are never affected. A reason is kept for
     the audit trail and the change is journaled as DELIVERY_DATE_CHANGED.
     """
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
 
     previous_date = doc.get("delivery_date")
     new_date = payload.delivery_date
@@ -369,7 +550,7 @@ async def update_delivery_date(
         new_date = wall_clock(new_date)
 
     await deliveries_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {
             "$set": {
                 "delivery_date": new_date,
@@ -389,6 +570,7 @@ async def update_delivery_date(
         entity_type="delivery",
         entity_id=serialized["id"],
         event_type=EVENT_DELIVERY_DATE_CHANGED,
+        laundry_id=laundry_id,
         gate_pass_id=serialized.get("gate_pass_id"),
         user_id=current_user.get("auth_id", "system"),
         user_name=current_user.get("user_name"),
@@ -404,6 +586,7 @@ async def update_delivery_date(
         "DELIVERY_DATE_UPDATE",
         "delivery",
         serialized["id"],
+        laundry_id=laundry_id,
     )
     return serialized
 
@@ -427,12 +610,7 @@ async def correct_delivery_items(
       * re-derives every affected gate pass's status, which is what turns
         "23 delivered" into "21 delivered, balance 2" everywhere at once.
     """
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     if doc.get("status") == be.CANCELLED_STATUS:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -492,9 +670,9 @@ async def correct_delivery_items(
                 "gate_pass_id": gp_id,
                 "item_name": original.get("item_name"),
                 "specification": original.get("specification") or "",
-                "original_quantity": int(original.get("quantity", 0) or 0),
-                "corrected_quantity": int(fix.quantity),
-                "delta": int(fix.quantity) - int(original.get("quantity", 0) or 0),
+                "original_quantity": float(original.get("quantity", 0) or 0),
+                "corrected_quantity": float(fix.quantity),
+                "delta": float(fix.quantity) - float(original.get("quantity", 0) or 0),
             }
         )
 
@@ -525,6 +703,8 @@ async def correct_delivery_items(
         )
 
     gate_passes = {str(gp["gate_pass_id"]): gp for gp in await ctx.load_gate_passes(gp_ids)}
+    for gp in gate_passes.values():
+        assert_same_laundry(gp, laundry_id, "Gate pass")
     if not gate_passes:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Source gate pass no longer exists"
@@ -593,7 +773,7 @@ async def correct_delivery_items(
     # discards the first correction along with its audit record. Matching on
     # the timestamp we actually read turns that race into a visible 409.
     expected_updated_at = doc.get("updated_at")
-    write_filter: dict = {"_id": oid}
+    write_filter: dict = owned_filter(oid, laundry_id)
     if expected_updated_at is not None:
         write_filter["updated_at"] = expected_updated_at
     else:
@@ -631,7 +811,7 @@ async def correct_delivery_items(
     if violations:
         # `doc` is the untouched original straight from the database, so
         # writing it back restores the exact prior state — encryption included.
-        await deliveries_collection.replace_one({"_id": oid}, doc)
+        await deliveries_collection.replace_one(owned_filter(oid, laundry_id), doc)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -663,6 +843,7 @@ async def correct_delivery_items(
             entity_type="delivery",
             entity_id=str(current.get("id")),
             event_type=EVENT_DELIVERY_CORRECTED,
+            laundry_id=laundry_id,
             gate_pass_id=gp_id,
             user_id=current_user.get("auth_id", "system"),
             user_name=current_user.get("user_name"),
@@ -688,6 +869,7 @@ async def correct_delivery_items(
         "delivery",
         str(current.get("id")),
         {"reason": payload.reason, "changes": correction_record["changes"]},
+        laundry_id=laundry_id,
     )
 
     updated = _serialize(await deliveries_collection.find_one({"_id": oid}))
@@ -707,12 +889,7 @@ async def cancel_delivery(
     them. The document is kept (status CANCELLED) so the history survives, and
     a reason is mandatory so the void can be explained later.
     """
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     if doc.get("status") == be.CANCELLED_STATUS:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Delivery is already cancelled."
@@ -727,7 +904,7 @@ async def cancel_delivery(
 
     now = datetime.now(timezone.utc)
     await deliveries_collection.update_one(
-        {"_id": oid},
+        owned_filter(oid, laundry_id),
         {"$set": {"status": "CANCELLED", "cancelled_at": now, "updated_at": now,
                   "cancelled_by": current_user.get("user_name", ""),
                   "cancelled_by_id": current_user.get("auth_id", ""),
@@ -744,13 +921,14 @@ async def cancel_delivery(
             entity_type="delivery",
             entity_id=str(current.get("id")),
             event_type=EVENT_DELIVERY_CANCELLED,
+            laundry_id=laundry_id,
             gate_pass_id=gp_id,
             user_id=current_user.get("auth_id", "system"),
             user_name=current_user.get("user_name"),
             reason=payload.reason,
             item_deltas=[
                 build_item_delta(
-                    it.get("item_name", ""), it.get("specification"), int(it.get("quantity", 0) or 0), 0
+                    it.get("item_name", ""), it.get("specification"), float(it.get("quantity", 0) or 0), 0
                 )
                 for it in current.get("items", [])
                 if str(it.get("gate_pass_id") or current.get("gate_pass_id")) == str(gp_id)
@@ -758,7 +936,7 @@ async def cancel_delivery(
             meta={
                 "cancelled_by": current_user.get("user_name", ""),
                 "released_quantity": sum(
-                    int(it.get("quantity", 0) or 0)
+                    float(it.get("quantity", 0) or 0)
                     for it in current.get("items", [])
                     if str(it.get("gate_pass_id") or current.get("gate_pass_id")) == str(gp_id)
                 ),
@@ -771,6 +949,7 @@ async def cancel_delivery(
         "delivery",
         str(current.get("id")),
         {"reason": payload.reason},
+        laundry_id=laundry_id,
     )
     updated = _serialize(await deliveries_collection.find_one({"_id": oid}))
     return await attach_verification_to("delivery", oid, updated)
@@ -790,6 +969,7 @@ async def available_quantities(
     """
     from ..crypto_helper import get_search_token
 
+    laundry_id = resolve_laundry_id(current_user)
     query: dict = {"status": {"$ne": be.CANCELLED_STATUS}}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
@@ -798,7 +978,8 @@ async def available_quantities(
     gate_passes = [
         gp
         for gp in gate_passes
-        if not client_name or be.same_client(gp.get("client_name"), client_name)
+        if (gp.get("laundry_id") or LOVE_LAUNDRY_ID) == laundry_id
+        and (not client_name or be.same_client(gp.get("client_name"), client_name))
     ]
     gp_ids = [str(gp["gate_pass_id"]) for gp in gate_passes]
     deliveries, returns = await ctx.load_movements(gp_ids)
@@ -827,11 +1008,15 @@ async def pending_gatepasses(
     ``/deliveries/available`` so the number a user is allowed to type always
     matches the number they are shown.
     """
+    laundry_id = resolve_laundry_id(current_user)
     gate_passes = await ctx.load_gate_passes()
+    # DRAFT passes are excluded: an unactivated monthly grid is not yet stock
+    # anyone may deliver against. `build_availability` filters them again.
     gate_passes = [
         gp
         for gp in gate_passes
-        if gp.get("status") != be.CANCELLED_STATUS
+        if gp.get("status") not in (be.CANCELLED_STATUS, be.DRAFT_STATUS)
+        and (gp.get("laundry_id") or LOVE_LAUNDRY_ID) == laundry_id
         and (not client_name or be.same_client(gp.get("client_name"), client_name))
     ]
     gp_ids = [str(gp["gate_pass_id"]) for gp in gate_passes]
@@ -884,12 +1069,7 @@ async def delivery_balance(
     what was its original recorded quantity, what was it corrected to, who
     corrected it and why, and what now remains on each source gate pass.
     """
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     current = _serialize(doc)
     gp_ids = [
         str(g)
@@ -897,6 +1077,8 @@ async def delivery_balance(
         if g
     ]
     gate_passes = await ctx.load_gate_passes(gp_ids)
+    for gp in gate_passes:
+        assert_same_laundry(gp, laundry_id, "Gate pass")
     gp_map = {str(gp["gate_pass_id"]): gp for gp in gate_passes}
     deliveries, returns = await ctx.load_movements(gp_ids)
     balances = ctx.balances_for(
@@ -960,7 +1142,9 @@ async def list_deliveries(
             date_query["$lte"] = day_query_end(date_to)
         query["delivery_date"] = date_query
 
-    cursor = deliveries_collection.find(query).sort("delivery_date", -1)
+    cursor = deliveries_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).sort("delivery_date", -1)
     rows: List[dict] = []
     all_source_ids: List[str] = []
     for doc in await cursor.to_list(length=None):
@@ -1014,11 +1198,6 @@ async def get_delivery(
     delivery_id: str,
     current_user: dict = Depends(require_capability("delivery:read")),
 ):
-    oid = _parse_object_id(delivery_id, "Delivery record not found")
-    doc = await deliveries_collection.find_one({"_id": oid})
-    if not doc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Delivery record not found"
-        )
+    laundry_id, oid, doc = await _owned_delivery(delivery_id, current_user)
     serialized = _serialize(doc)
     return await attach_verification_to("delivery", oid, serialized)

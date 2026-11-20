@@ -10,6 +10,8 @@ from .database.main_db import ensure_indexes
 from .routers.admin_database import router as admin_database_router
 from .routers.adjustments import router as adjustments_router
 from .routers.bills import router as bills_router
+from .routers.client_portal import router as client_portal_router
+from .routers.client_shop_orders import router as client_shop_orders_router
 from .routers.deliveries import router as deliveries_router
 from .routers.events import router as events_router
 from .routers.dispatch import router as dispatch_router
@@ -19,10 +21,14 @@ from .routers.day_close import router as day_close_router
 from .routers.day_money import router as day_money_router
 from .routers.gatepasses import router as gatepasses_router
 from .routers.linens import router as linens_router
+from .routers.monthly import router as monthly_router
+from .routers.realtime import router as realtime_router
 from .routers.reconciliation import router as reconciliation_router
 from .routers.notifications import router as notifications_router
+from .routers.operational_reports import router as operational_reports_router
 from .routers.returns import router as returns_router
 from .routers.shop_bills import router as shop_bills_router
+from .routers.today_sheet import router as today_sheet_router
 from .services import synchronization_service
 
 
@@ -43,6 +49,8 @@ try:
         # Production fallback — restrict to known domains
         ALLOWED_ORIGINS = [
             "https://lovelaundry-manager.vercel.app",
+
+            "https://system-lovelaundry-lk.vercel.app",
             "https://public.lovelaundry.lk",
             "http://localhost:5173",
             "http://localhost:3000",
@@ -69,6 +77,7 @@ from .security import apply_security
 
 origins = ALLOWED_ORIGINS if settings.cors_origins == ["*"] or not settings.cors_origins else settings.cors_origins
 apply_security(app, rate_limit=300, origins=origins)
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -107,10 +116,16 @@ app.include_router(dashboard_router)
 app.include_router(day_close_router)
 app.include_router(day_money_router)
 app.include_router(linens_router)
+app.include_router(realtime_router)
+app.include_router(monthly_router)
 app.include_router(returns_router)
 app.include_router(reconciliation_router)
 app.include_router(notifications_router)
+app.include_router(operational_reports_router)
 app.include_router(shop_bills_router)
+app.include_router(today_sheet_router)
+app.include_router(client_portal_router)
+app.include_router(client_shop_orders_router)
 app.include_router(admin_database_router)
 
 # Background sync worker: MAIN -> SECONDARY replication with retry/backoff.

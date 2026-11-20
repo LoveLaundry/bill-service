@@ -29,6 +29,14 @@ EVENT_DELIVERY_CORRECTED = "DELIVERY_CORRECTED"
 # A delivery voided in full. Its quantities return to the source gate passes'
 # balances, which are re-derived rather than decremented by hand.
 EVENT_DELIVERY_CANCELLED = "DELIVERY_CANCELLED"
+# A DRAFT delivery promoted to DELIVERED. Drafts are invisible to balance math
+# until this event, which is why the gate pass status is re-derived here.
+EVENT_DELIVERY_ACTIVATED = "DELIVERY_ACTIVATED"
+# A monthly grid day confirmed, creating its gate pass / delivery / rewash
+# records as DRAFT for later activation.
+EVENT_MONTHLY_DAY_CONFIRMED = "MONTHLY_DAY_CONFIRMED"
+# Rewash quantities recorded for a day. Free unless explicitly chargeable.
+EVENT_REWASH_RECORDED = "REWASH_RECORDED"
 EVENT_RETURN_CREATED = "RETURN_CREATED"
 EVENT_RETURN_UPDATED = "RETURN_UPDATED"
 EVENT_RETURN_RESENT = "RETURN_RESENT"
@@ -59,6 +67,7 @@ async def record_event(
     prev_status: Optional[str] = None,
     new_status: Optional[str] = None,
     occurred_at: Optional[datetime] = None,
+    laundry_id: Optional[str] = None,
 ):
     """Append a journal entry. Never mutates any existing document.
 
@@ -87,6 +96,8 @@ async def record_event(
         event_doc["prev_status"] = prev_status
     if new_status:
         event_doc["new_status"] = new_status
+    if laundry_id:
+        event_doc["laundry_id"] = laundry_id
 
     result = await linen_events_collection.insert_one(event_doc)
     return result.inserted_id
@@ -95,8 +106,8 @@ async def record_event(
 def build_item_delta(
     item_name: str,
     specification: Optional[str],
-    qty_before: int,
-    qty_after: int,
+    qty_before: float,
+    qty_after: float,
 ) -> dict:
     """Build a single item-delta record for a journal entry."""
     return {

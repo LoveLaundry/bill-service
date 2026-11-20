@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..app_time import day_bounds, parse_day
 from ..auth_helper import require_capability
+from ..tenancy import resolve_laundry_id, scoped_query
 from ..database.main_db import bills_collection, payments_collection
 
 router = APIRouter(prefix="/day-money", tags=["day-money"])
@@ -31,12 +32,13 @@ async def day_money(
 ):
     """Snapshot of the money recorded for the given calendar day."""
     start, end = day_bounds(_validate_day(date))
+    laundry_id = resolve_laundry_id(current_user)
 
     bills_created = 0
     billed_amount = 0.0
     billed_paid = 0.0
     bill_cursor = bills_collection.find(
-        {"created_at": {"$gte": start, "$lt": end}, "payment_status": {"$ne": "CANCELLED"}},
+        scoped_query({"created_at": {"$gte": start, "$lt": end}, "payment_status": {"$ne": "CANCELLED"}}, laundry_id),
         {"grand_total": 1, "paid_amount": 1, "payment_status": 1},
     )
     async for bill in bill_cursor:
@@ -47,7 +49,7 @@ async def day_money(
     payments_count = 0
     collected_amount = 0.0
     pay_cursor = payments_collection.find(
-        {"payment_date": {"$gte": start, "$lt": end}},
+        scoped_query({"payment_date": {"$gte": start, "$lt": end}}, laundry_id),
         {"amount": 1, "payment_date": 1},
     )
     async for pay in pay_cursor:
@@ -58,7 +60,7 @@ async def day_money(
     outstanding_amount = 0.0
     agg_cursor = bills_collection.aggregate(
         [
-            {"$match": {"payment_status": {"$in": UNPAID_STATUSES}}},
+            {"$match": scoped_query({"payment_status": {"$in": UNPAID_STATUSES}}, laundry_id)},
             {"$group": {"_id": None, "count": {"$sum": 1}, "total": {"$sum": "$outstanding_amount"}}},
         ]
     )

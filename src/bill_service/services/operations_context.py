@@ -13,6 +13,7 @@ Everything here is a thin, read-only adapter over
 module owns the I/O.
 """
 from datetime import datetime, timezone
+import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from bson import ObjectId
@@ -22,6 +23,18 @@ from ..database.main_db import deliveries_collection, gatepasses_collection, ret
 from . import balance_engine as be
 
 SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+logger = logging.getLogger(__name__)
+
+
+def _decode_record(kind: str, doc: dict, sensitive_fields: Optional[List[str]] = None) -> dict:
+    record_id = str(doc.get("_id", "unknown"))
+    try:
+        return serialize(doc, sensitive_fields)
+    except Exception as exc:
+        logger.exception("Could not decode %s record %s; refusing incomplete balance data", kind, record_id)
+        raise RuntimeError(
+            f"Could not load complete operational data ({kind} record {record_id}); balance calculation aborted."
+        ) from exc
 
 
 def to_object_id(value: str) -> Optional[ObjectId]:
@@ -42,8 +55,16 @@ def serialize(doc: dict, sensitive_fields: Optional[List[str]] = None) -> dict:
 
 
 async def load_gate_passes(gate_pass_ids: Optional[Iterable[str]] = None) -> List[dict]:
-    """Load + decrypt gate passes, optionally restricted to specific ids."""
+    """Load + decrypt gate passes, optionally restricted to specific ids.
+
+    With no ids (the "everything active" feeds such as pending-gatepasses and
+    availability) DRAFT and CANCELLED passes are excluded at the query level so
+    unconfirmed monthly entries never surface and never block the feed. When ids
+    are given (a specific pass being inspected) drafts remain loadable.
+    """
     query: dict = {}
+    if gate_pass_ids is None:
+        query["status"] = {"$nin": [be.DRAFT_STATUS, be.CANCELLED_STATUS]}
     ids = [to_object_id(g) for g in (gate_pass_ids or [])]
     ids = [g for g in ids if g is not None]
     if gate_pass_ids is not None:
@@ -53,10 +74,7 @@ async def load_gate_passes(gate_pass_ids: Optional[Iterable[str]] = None) -> Lis
     cursor = gatepasses_collection.find(query).sort("receiving_date", -1)
     out: List[dict] = []
     async for doc in cursor:
-        try:
-            gp = serialize(doc)
-        except Exception:
-            continue
+        gp = _decode_record("gate pass", doc)
         gp["gate_pass_id"] = gp["id"]
         out.append(gp)
     return out
@@ -70,10 +88,7 @@ async def load_gate_pass(gate_pass_id: str) -> Optional[dict]:
     doc = await gatepasses_collection.find_one({"_id": oid})
     if not doc:
         return None
-    try:
-        gp = serialize(doc)
-    except Exception:
-        return None
+    gp = _decode_record("gate pass", doc)
     gp["gate_pass_id"] = gp["id"]
     return gp
 
@@ -116,29 +131,23 @@ async def load_movements(
 
     deliveries: List[dict] = []
     async for doc in deliveries_collection.find(gp_filter):
-        try:
-            deliveries.append(serialize(doc))
-        except Exception:
-            continue
+        deliveries.append(_decode_record("delivery", doc))
 
     returns: List[dict] = []
     async for doc in returns_collection.find({"gate_pass_id": {"$in": [g for g in (gate_pass_ids or []) if g]}} if gate_pass_ids is not None else {}):
-        try:
-            returns.append(serialize(doc))
-        except Exception:
-            continue
+        returns.append(_decode_record("return", doc))
 
     return deliveries, returns
 
 
-def delivered_by_gate_pass(deliveries: Iterable[dict]) -> Dict[str, Dict[str, int]]:
+def delivered_by_gate_pass(deliveries: Iterable[dict]) -> Dict[str, Dict[str, float]]:
     """Group delivered quantities by the gate pass each line came from."""
     return be.compute_delivered_by_gate_pass(deliveries)
 
 
 async def movement_maps(
     gate_pass_ids: Optional[Iterable[str]] = None,
-) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, int]]]:
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
     """``(delivered_by_gp, returned_by_gp)`` for the given passes.
 
     The single replacement for the load-and-group loop that was copy-pasted
@@ -153,13 +162,13 @@ async def movement_maps(
     )
 
 
-def returned_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, int]]:
+def returned_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, float]]:
     """Group pending return quantities by gate pass."""
     return _returns_by_gate_pass(returns)
 
 
-def _returns_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, int]]:
-    out: Dict[str, Dict[str, int]] = {}
+def _returns_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
     for ret in returns or []:
         gp_id = str(ret.get("gate_pass_id") or "")
         if not gp_id:
@@ -172,12 +181,12 @@ def _returns_by_gate_pass(returns: Iterable[dict]) -> Dict[str, Dict[str, int]]:
 
 def availability_maps(
     gate_passes: List[dict],
-    delivered: Dict[str, Dict[str, int]],
-    returned: Optional[Dict[str, Dict[str, int]]] = None,
-) -> Dict[str, Dict[str, int]]:
+    delivered: Dict[str, Dict[str, float]],
+    returned: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, Dict[str, float]]:
     """{gate_pass_id: {item_key: still-deliverable quantity}}."""
     returned = returned or {}
-    out: Dict[str, Dict[str, int]] = {}
+    out: Dict[str, Dict[str, float]] = {}
     for gp in gate_passes or []:
         gp_id = str(gp.get("gate_pass_id") or gp.get("id") or "")
         if not gp_id:
@@ -192,8 +201,8 @@ def availability_maps(
 
 def balances_for(
     gate_passes: List[dict],
-    delivered: Dict[str, Dict[str, int]],
-    returned: Optional[Dict[str, Dict[str, int]]] = None,
+    delivered: Dict[str, Dict[str, float]],
+    returned: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Dict[str, dict]:
     """{gate_pass_id: canonical balance document}."""
     returned = returned or {}

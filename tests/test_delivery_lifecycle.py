@@ -836,7 +836,7 @@ async def test_linen_flow_attributes_each_pass_its_own_lines(mocked_db):
         )
     )
 
-    flow = await dashboard.get_linen_flow(period="all")
+    flow = await dashboard.get_linen_flow(period="all", current_user=auth_user())
     assert flow["totals"]["received_qty"] == 18
     assert flow["totals"]["delivered_qty"] == 10
     assert flow["totals"]["outstanding_delivery_qty"] == 8
@@ -858,7 +858,7 @@ async def test_linen_flow_outstanding_excludes_delivered_lines(mocked_db):
     gp_id = await seed_gate_pass(mocked_db, items=[_gp_item("Pillow", 5), _gp_item("Towel", 2)])
     await _create(_payload(gp_id, [("Pillow", 5, None), ("Towel", 2, None)]))
 
-    flow = await dashboard.get_linen_flow(period="all")
+    flow = await dashboard.get_linen_flow(period="all", current_user=auth_user())
     gp_row = next(g for g in flow["hotels"][0]["gate_passes"] if g["gate_pass_id"] == gp_id)
     assert gp_row["totals"]["outstanding_delivery_qty"] == 0
     # Previously the "pending" chip listed every line with received_qty > 0,
@@ -888,7 +888,7 @@ async def test_linen_flow_unlinked_deliveries_are_reported(mocked_db):
     )
     assert res.inserted_id
 
-    flow = await dashboard.get_linen_flow(period="all")
+    flow = await dashboard.get_linen_flow(period="all", current_user=auth_user())
     hotel = next(h for h in flow["hotels"] if h["client_name"] == "Seabreeze Resort")
     assert len(hotel["unlinked_deliveries"]) == 1
     assert hotel["unlinked_deliveries"][0]["pieces"] == 3

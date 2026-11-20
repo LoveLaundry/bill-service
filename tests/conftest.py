@@ -7,8 +7,23 @@ bindings (``from ..database.main_db import X``) resolve to the mock.
 
 ``asyncio_mode = auto`` (pytest.ini) lets tests and fixtures be plain
 ``async def`` with no decorators.
+
+The service modules refuse to import without their secrets (deliberate: a
+missing MASTER_KEY must never silently fall back to a hard-coded key in
+production). The platform injects those in a real deployment, so the harness
+supplies deterministic test-only values *before* any bill_service import.
+Real environment variables always win, and nothing here weakens the
+production check.
 """
 import importlib
+import os
+
+# Must run before the bill_service imports below.
+os.environ.setdefault("JWT_SECRET", "test-only-jwt-secret")
+os.environ.setdefault("MASTER_KEY", "test-only-master-key-love-laundry")
+os.environ.setdefault("SECONDARY_MASTER_KEY", "test-only-secondary-master-key")
+os.environ.setdefault("LOCAL_MASTER_KEY", "test-only-local-master-key")
+os.environ.setdefault("ENCRYPTION_MODE", "single")
 
 import pytest
 from mongomock_motor import AsyncMongoMockClient
@@ -27,11 +42,16 @@ COLLECTION_NAMES = [
     "gatepasses_collection",
     "idempotency_collection",
     "legacy_invoices_collection",
+    "manual_references_collection",
     "linen_events_collection",
     "linens_collection",
+    "live_clocks_collection",
     "loyalty_collection",
+    "linen_category_mappings_collection",
+    "monthly_entries_collection",
     "payments_collection",
     "returns_collection",
+    "rewashes_collection",
     "shop_bills_collection",
     "sync_logs_collection",
     "sync_queue_collection",
@@ -47,15 +67,34 @@ DEPENDENT_MODULES = [
     "bill_service.services.verification_service",
     "bill_service.services.synchronization_service",
     "bill_service.services.idempotency",
+    "bill_service.services.manual_references",
     "bill_service.services.bill_sync",
     "bill_service.services.balance_engine",
     "bill_service.services.operations_context",
+    "bill_service.services.gate_pass_records",
+    "bill_service.services.monthly_sync",
+    "bill_service.services.local_sync_service",
     "bill_service.routers.bills",
+    "bill_service.routers.client_portal",
+    "bill_service.routers.client_shop_orders",
     "bill_service.routers.gatepasses",
+    "bill_service.routers.shop_bills",
     "bill_service.routers.deliveries",
     "bill_service.routers.returns",
     "bill_service.routers.adjustments",
     "bill_service.routers.day_close",
+    "bill_service.routers.monthly",
+    "bill_service.routers.dashboard",
+    "bill_service.routers.day_money",
+    "bill_service.routers.dispatch",
+    "bill_service.routers.events",
+    "bill_service.live_clock",
+    "bill_service.routers.linens",
+    "bill_service.routers.loyalty",
+    "bill_service.routers.notifications",
+    "bill_service.routers.reconciliation",
+    "bill_service.routers.operational_reports",
+    "bill_service.routers.today_sheet",
 ]
 
 
@@ -153,6 +192,72 @@ async def clean_db(mocked_db):
     yield
 
 
-def auth_user(name: str = "Alice", role: str = "ADMIN") -> dict:
-    """A realistic current-user dict as FastAPI dependencies receive."""
-    return {"auth_id": f"u-{name}", "user_name": name, "role": role}
+def auth_user(name: str = "Alice", role: str = "ADMIN", laundry_id: str = "lovelaundry") -> dict:
+    """A realistic current-user dict as FastAPI dependencies receive.
+
+    Defaults to the LoveLaundry tenant, exercising the transitional path
+    production takes during migration (mixed stamped/unstamped documents).
+    Strict per-laundry paths are covered by test_tenant_isolation.py and
+    test_list_safety.py with stamped fixtures.
+    """
+    return {
+        "auth_id": f"u-{name}",
+        "user_name": name,
+        "role": role,
+        "laundry_id": laundry_id,
+        "laundries": [{"id": laundry_id, "role": role, "status": "ACTIVE"}],
+    }
+
+# ── Tenant test helpers (single-tenant suites run inside one laundry) ──
+"""Shared fixtures for tenant isolation: every test acts as a laundry member.
+
+Single-tenant suites keep working by operating inside one laundry ("acme");
+cross-tenant suites use a second laundry ("other") to prove denial.
+"""
+from datetime import datetime, timezone
+
+LAUNDRY_A = "acme"
+LAUNDRY_B = "other"
+
+TENANT_COLLECTIONS = (
+    "gatepasses_collection",
+    "deliveries_collection",
+    "bills_collection",
+    "payments_collection",
+    "shop_bills_collection",
+    "returns_collection",
+    "adjustments_collection",
+    "monthly_entries_collection",
+    "rewashes_collection",
+    "linens_collection",
+    "linen_events_collection",
+    "dispatch_jobs_collection",
+    "loyalty_accounts_collection",
+)
+
+
+def tenant_user(auth_id="tester", laundry_id=LAUNDRY_A, role="ADMIN"):
+    """Authenticated session scoped to one ACTIVE laundry."""
+    return {
+        "auth_id": auth_id,
+        "user_name": auth_id,
+        "role": role,
+        "laundry_id": laundry_id,
+        "laundries": [{"id": laundry_id, "role": role, "status": "ACTIVE"}],
+    }
+
+
+async def stamp_laundry(mocked_db, laundry_id=LAUNDRY_A):
+    """Attribute pre-tenancy fixture documents to one laundry (migration)."""
+    for name in TENANT_COLLECTIONS:
+        try:
+            await mocked_db[name].update_many(
+                {"laundry_id": {"$exists": False}},
+                {"$set": {"laundry_id": laundry_id}},
+            )
+        except Exception:
+            pass
+
+
+def now():
+    return datetime.now(timezone.utc)

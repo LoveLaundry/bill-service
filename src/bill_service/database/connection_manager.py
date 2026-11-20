@@ -11,6 +11,7 @@ Roles:
     SECONDARY verification replica (written only by the sync worker)
     LOCAL     admin-triggered replica
 """
+
 from __future__ import annotations
 
 import asyncio

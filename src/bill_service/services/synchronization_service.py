@@ -15,11 +15,17 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from uuid import uuid4
 
+from pymongo import ReturnDocument
 from ..config import settings
 from ..database.main_db import sync_logs_collection, sync_queue_collection
 from ..repositories.entity_registry import effective_version, get_main_collection, to_record_id
-from ..repositories.main_repository import OPERATION_DELETE, OPERATION_UPSERT
+from ..repositories.main_repository import (
+    OPERATION_DELETE,
+    OPERATION_UPSERT,
+    enqueue_sync as enqueue_repository_sync,
+)
 from ..repositories.secondary_repository import delete_document, upsert_document
 from . import verification_service
 
@@ -27,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 SYNC_OPERATION = "MAIN_TO_SECONDARY"
 MAX_ATTEMPTS = 5
+SYNC_CLAIM_LEASE_SECONDS = 300
 
 # Returned by process_one for a propagated deletion. There is no replica
 # document left to version-compare, so it is terminal rather than PENDING.
@@ -35,24 +42,7 @@ STATUS_DELETED = "DELETED"
 
 async def enqueue(entity: str, record_id: Any, version: int) -> None:
     """Durable enqueue - upserts a PENDING job in MAIN.sync_queue."""
-    now = datetime.now(timezone.utc)
-    await sync_queue_collection.update_one(
-        {"entity": entity, "record_id": str(record_id)},
-        {
-            "$set": {
-                "entity": entity,
-                "record_id": str(record_id),
-                "version": version,
-                "operation": OPERATION_UPSERT,
-                "status": "PENDING",
-                "attempts": 0,
-                "next_attempt_at": now,
-                "updated_at": now,
-            },
-            "$setOnInsert": {"created_at": now},
-        },
-        upsert=True,
-    )
+    await enqueue_repository_sync(entity, record_id, version)
 
 
 async def write_sync_log(
@@ -115,79 +105,187 @@ async def process_one(job: dict) -> str:
     )
 
 
+def _claim_filter(job: dict) -> dict:
+    """Match only the exact queued version/operation owned by this claim."""
+    query = {
+        "_id": job["_id"],
+        "status": "SYNCING",
+        "claim_token": job["claim_token"],
+        "version": job.get("version"),
+    }
+    operation = job.get("operation")
+    if operation is None:
+        query["$or"] = [
+            {"operation": {"$exists": False}},
+            {"operation": None},
+        ]
+    else:
+        query["operation"] = operation
+    return query
+
+
+def _claim_owner_filter(job: dict) -> dict:
+    """Match a live lease without restricting it to the claimed data version."""
+    return {
+        "_id": job["_id"],
+        "status": "SYNCING",
+        "claim_token": job["claim_token"],
+    }
+
+
+async def _release_claim(job: dict) -> None:
+    """Make a superseded job available again without overwriting its payload."""
+    await sync_queue_collection.update_one(
+        _claim_owner_filter(job),
+        {
+            "$set": {"status": "PENDING", "updated_at": datetime.now(timezone.utc)},
+            "$unset": {"claim_token": "", "lease_until": ""},
+        },
+    )
+
+
+async def _renew_claim(job: dict) -> None:
+    """Keep long-running async copies from expiring their exclusive claim."""
+    while True:
+        await asyncio.sleep(SYNC_CLAIM_LEASE_SECONDS / 3)
+        result = await sync_queue_collection.update_one(
+            _claim_owner_filter(job),
+            {
+                "$set": {
+                    "lease_until": datetime.now(timezone.utc)
+                    + timedelta(seconds=SYNC_CLAIM_LEASE_SECONDS),
+                }
+            },
+        )
+        if not result.matched_count:
+            return
+
+
 async def attempt_job(job: dict) -> None:
     """Run/retry one job with backoff. Marks FAILED when attempts run out."""
-    job_id = job.get("_id")
     entity = job["entity"]
     record_id = job["record_id"]
     attempts = int(job.get("attempts") or 0) + 1
     started_at = datetime.now(timezone.utc)
 
-    await verification_service.mark_syncing(entity, record_id, job.get("version") or 0)
-
+    heartbeat = asyncio.create_task(_renew_claim(job))
     try:
+        await verification_service.mark_syncing(entity, record_id, job.get("version") or 0)
         result_status = await process_one(job)
-
-        await sync_queue_collection.delete_one({"_id": job_id})
+        acknowledged = await sync_queue_collection.delete_one(_claim_filter(job))
+        if not acknowledged.deleted_count:
+            # An enqueue replaced this version/operation during processing.
+            # Retain that newer work instead of deleting it with this ack.
+            await _release_claim(job)
         await write_sync_log(
             operation=SYNC_OPERATION,
             entity=entity,
             record_id=record_id,
-            status="SUCCESS",
+            status="SUCCESS" if acknowledged.deleted_count else "SUPERSEDED",
             started_at=started_at,
             completed_at=datetime.now(timezone.utc),
             error=None if result_status == "VERIFIED" else "Verified with version mismatch",
-            extra={"result_status": result_status},
+            extra={
+                "result_status": result_status,
+                "superseded": not bool(acknowledged.deleted_count),
+            },
         )
     except Exception as exc:
         logger.warning("Sync failed for %s/%s (attempt %d): %s", entity, record_id, attempts, exc)
 
+        retry_at = datetime.now(timezone.utc)
         if attempts >= MAX_ATTEMPTS:
-            await sync_queue_collection.update_one(
-                {"_id": job_id},
-                {"$set": {"status": "FAILED", "attempts": attempts, "updated_at": datetime.now(timezone.utc)}},
-            )
-            await verification_service.mark_failed(
-                entity, record_id, job.get("version") or 0, str(exc)
-            )
+            status = "FAILED"
+        else:
+            backoff_seconds = settings.sync_retry_base_delay_seconds * (2 ** (attempts - 1))
+            retry_at += timedelta(seconds=backoff_seconds)
+            status = "PENDING"
+
+        updated = await sync_queue_collection.update_one(
+            _claim_filter(job),
+            {
+                "$set": {
+                    "status": status,
+                    "attempts": attempts,
+                    "next_attempt_at": retry_at,
+                    "error": str(exc),
+                    "updated_at": datetime.now(timezone.utc),
+                },
+                "$unset": {"claim_token": "", "lease_until": ""},
+            },
+        )
+        if updated.matched_count:
+            if status == "FAILED":
+                await verification_service.mark_failed(
+                    entity, record_id, job.get("version") or 0, str(exc)
+                )
             await write_sync_log(
                 operation=SYNC_OPERATION,
                 entity=entity,
                 record_id=record_id,
-                status="FAILED",
+                status=status,
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
                 error=str(exc),
                 extra={"attempts": attempts},
             )
         else:
-            backoff_seconds = settings.sync_retry_base_delay_seconds * (2 ** (attempts - 1))
-            await sync_queue_collection.update_one(
-                {"_id": job_id},
-                {
-                    "$set": {
-                        "status": "PENDING",
-                        "attempts": attempts,
-                        "next_attempt_at": datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds),
-                        "error": str(exc),
-                        "updated_at": datetime.now(timezone.utc),
-                    }
-                },
+            # A newer enqueue changed the version/operation. Do not carry the
+            # stale attempt count onto that new work.
+            await _release_claim(job)
+            await write_sync_log(
+                operation=SYNC_OPERATION,
+                entity=entity,
+                record_id=record_id,
+                status="SUPERSEDED",
+                started_at=started_at,
+                completed_at=datetime.now(timezone.utc),
+                error=str(exc),
+                extra={"attempts": attempts},
             )
+    finally:
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
 
 
 async def drain_due_jobs(limit: int = 50) -> int:
-    """Process all jobs whose next_attempt_at has passed. Returns count processed."""
-    cursor = (
-        sync_queue_collection.find(
-            {"status": "PENDING", "next_attempt_at": {"$lte": datetime.now(timezone.utc)}}
-        )
-        .sort("next_attempt_at", 1)
-        .limit(limit)
-    )
-
+    """Process due queue rows once per drain. Returns the number of attempts."""
     processed = 0
-    async for job in cursor:
+    processed_ids: set[Any] = set()
+    for _ in range(max(0, limit)):
+        now = datetime.now(timezone.utc)
+        claim_token = str(uuid4())
+        job = await sync_queue_collection.find_one_and_update(
+            {
+                "_id": {"$nin": list(processed_ids)},
+                "$or": [
+                    {
+                        "status": "PENDING",
+                        "next_attempt_at": {"$lte": now},
+                    },
+                    {
+                        "status": "SYNCING",
+                        "lease_until": {"$lte": now},
+                    },
+                ]
+            },
+            {
+                "$set": {
+                    "status": "SYNCING",
+                    "claim_token": claim_token,
+                    "lease_until": now + timedelta(seconds=SYNC_CLAIM_LEASE_SECONDS),
+                    "updated_at": now,
+                }
+            },
+            sort=[("next_attempt_at", 1)],
+            return_document=ReturnDocument.AFTER,
+        )
+        if job is None:
+            break
+        processed_ids.add(job["_id"])
         await attempt_job(job)
         processed += 1
     return processed

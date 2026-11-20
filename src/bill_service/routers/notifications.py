@@ -15,12 +15,13 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Query
 
 from ..auth_helper import require_capability
+from ..tenancy import resolve_laundry_id, scoped_query
 from ..crypto_helper import decrypt_dict, get_search_token
 from ..database.main_db import gatepasses_collection
 from ..services import balance_engine as be
 from ..services import operations_context as ctx
 
-router = APIRouter(tags=["notifications"])
+router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 SENSITIVE_FIELDS_GP = ["client_name", "items", "notes"]
 
@@ -42,11 +43,16 @@ async def gatepass_pending(
     ``received`` / ``delivered`` / ``pending`` are server-computed, so the badge
     count, the notification dialog and the delivery form can never drift apart.
     """
-    query: dict = {"status": {"$ne": "CANCELLED"}}
+    # Drafts are excluded too: an unconfirmed monthly entry has nothing pending
+    # to deliver and must not appear in the bell feed. (CANCELLED has always
+    # been excluded.)
+    query: dict = {"status": {"$nin": [be.DRAFT_STATUS, be.CANCELLED_STATUS]}}
     if client_name:
         query["client_name_search"] = get_search_token(client_name)
 
-    docs = await gatepasses_collection.find(query).to_list(length=None)
+    docs = await gatepasses_collection.find(
+        scoped_query(query, resolve_laundry_id(current_user))
+    ).to_list(length=None)
     if not docs:
         return []
 
