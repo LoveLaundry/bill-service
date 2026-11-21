@@ -22,13 +22,11 @@ from .routers.day_money import router as day_money_router
 from .routers.gatepasses import router as gatepasses_router
 from .routers.linens import router as linens_router
 from .routers.monthly import router as monthly_router
-from .routers.realtime import router as realtime_router
 from .routers.reconciliation import router as reconciliation_router
 from .routers.notifications import router as notifications_router
 from .routers.operational_reports import router as operational_reports_router
 from .routers.returns import router as returns_router
 from .routers.shop_bills import router as shop_bills_router
-from .routers.today_sheet import router as today_sheet_router
 from .services import synchronization_service
 
 
@@ -40,42 +38,56 @@ import sentry_sdk
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Known production frontend origins. Mirrors config.py so a missing or
-# incomplete ALLOWED_ORIGINS env can never lock the live portals out.
-DEFAULT_ALLOWED_ORIGINS = [
-    "https://lovelaundry-manager.vercel.app",
-    "https://hotels-manager.vercel.app",
-    "https://hotels-manager-amber.vercel.app",
-    "https://shops-manager.vercel.app",
-    "https://system-lovelaundry-lk.vercel.app",
-    "http://localhost:5173",
-    "http://localhost:5174",
-    "http://localhost:5175",
-    "http://localhost:5176",
-    "http://localhost:3000",
-    "https://lovelaundry-shop-app.vercel.app",
-    "http://localhost",
-    "http://127.0.0.1:5173",
-    "http://localhost:8101",
-    "http://127.0.0.1:8101",
-    "http://localhost:8820",
-    "http://127.0.0.1:8820",
-]
-
 # CORS configuration
 try:
     ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
-    configured = [
-        origin.strip()
-        for origin in ALLOWED_ORIGINS_ENV.split(",")
-        if origin.strip() and origin.strip() != "*"
-    ]
-    ALLOWED_ORIGINS = list(dict.fromkeys(configured + list(DEFAULT_ALLOWED_ORIGINS)))
+    if ALLOWED_ORIGINS_ENV:
+        ALLOWED_ORIGINS = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",") if origin.strip()]
+    else:
+        # Production fallback — restrict to known domains
+        ALLOWED_ORIGINS = [
+            "https://lovelaundry-manager.vercel.app",
+            "https://system-lovelaundry-lk.vercel.app",
+            "https://lovelaundry-shop-app.vercel.app",
+            "https://hotels-manager-amber.vercel.app",
+            "https://hotels-manager.vercel.app",
+            "https://shops-manager.vercel.app",
+            "http://localhost",
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://localhost:5174",
+            "http://localhost:5175",
+            "http://localhost:5176",
+            "http://127.0.0.1:5173",
+            "http://localhost:8101",
+            "http://127.0.0.1:8101",
+            "http://localhost:8820",
+            "http://127.0.0.1:8820",
+
+            "https://system-lovelaundry-lk.vercel.app",
+            "https://public.lovelaundry.lk",
+            "http://localhost:5173",
+            "http://localhost:3000",
+            "https://lovelaundry-manager.vercel.app",
+            "https://lovelaundry-shop-app.vercel.app",
+            "https://hotels-manager-amber.vercel.app",
+            "https://hotels-manager.vercel.app",
+            "https://shops-manager.vercel.app",
+            "http://localhost",
+            "http://localhost:5174",
+            "http://localhost:5175",
+            "http://localhost:5176",
+            "http://127.0.0.1:5173",
+            "http://localhost:8101",
+            "http://127.0.0.1:8101",
+            "http://localhost:8820",
+            "http://127.0.0.1:8820",
+        ]
 
     logger.info(f"CORS configured with origins: {ALLOWED_ORIGINS}")
 except Exception as e:
     logger.warning(f"CORS configuration failed, using defaults: {e}")
-    ALLOWED_ORIGINS = list(DEFAULT_ALLOWED_ORIGINS)
+    ALLOWED_ORIGINS = ["http://localhost:5173"]
 
 # Vercel sets VERCEL=1; background workers are unreliable in serverless.
 ON_VERCEL = os.getenv("VERCEL") == "1"
@@ -99,7 +111,7 @@ apply_security(app, rate_limit=300, origins=origins)
 async def global_exception_handler(request: Request, exc: Exception):
     origin = request.headers.get("origin", "")
     cors_headers = {}
-    if origin in set(ALLOWED_ORIGINS) | set(settings.cors_origins):
+    if origin in ALLOWED_ORIGINS:
         cors_headers = {
             "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Credentials": "true",
@@ -132,14 +144,12 @@ app.include_router(dashboard_router)
 app.include_router(day_close_router)
 app.include_router(day_money_router)
 app.include_router(linens_router)
-app.include_router(realtime_router)
 app.include_router(monthly_router)
 app.include_router(returns_router)
 app.include_router(reconciliation_router)
 app.include_router(notifications_router)
 app.include_router(operational_reports_router)
 app.include_router(shop_bills_router)
-app.include_router(today_sheet_router)
 app.include_router(client_portal_router)
 app.include_router(client_shop_orders_router)
 app.include_router(admin_database_router)

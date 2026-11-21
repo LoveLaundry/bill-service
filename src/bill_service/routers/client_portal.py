@@ -33,8 +33,6 @@ from ..database.main_db import (
     bills_collection,
     deliveries_collection,
     gatepasses_collection,
-    linens_collection,
-    linen_events_collection,
     shop_bills_collection,
 )
 from ..tenancy import scoped_query
@@ -44,7 +42,6 @@ router = APIRouter(prefix="/client-portal", tags=["client-portal"])
 GP_SENSITIVE = ["client_name", "items", "notes"]
 DELIVERY_SENSITIVE = ["client_name", "items", "notes"]
 BILL_SENSITIVE = ["client_name", "quotation_title", "notes", "items"]
-LINEN_SENSITIVE = ["client_name", "description", "notes", "items"]
 
 # A pass is still "with the laundry" until every piece has come back.
 OPEN_GATEPASS_STATUSES = (
@@ -74,32 +71,24 @@ def resolve_client_scope(current_user: dict = Security(get_current_user)) -> Dic
     if current_user.get("token_kind") != "client":
         raise HTTPException(status_code=403, detail="This endpoint requires a hotel account")
 
-    raw_scope = current_user.get("client_scope")
-    if not isinstance(raw_scope, dict):
+    scope = current_user.get("client_scope")
+    if not isinstance(scope, dict):
         raise HTTPException(status_code=403, detail="Hotel session has no account scope")
 
-    laundry_id = str(raw_scope.get("laundry_id") or "").strip().lower()
-    client_name = str(raw_scope.get("client_name") or "").strip()
+    laundry_id = str(scope.get("laundry_id") or "").strip().lower()
+    client_name = str(scope.get("client_name") or "").strip()
     if not laundry_id or not client_name:
         raise HTTPException(status_code=403, detail="Hotel session has an incomplete scope")
 
-    client_type = str(raw_scope.get("client_type") or "HOTEL").strip().upper()
+    client_type = str(scope.get("client_type") or "HOTEL").strip().upper()
     if client_type not in ("HOTEL", "SHOP"):
         raise HTTPException(status_code=403, detail="Client session has an unknown account type")
 
-    scope = {
+    return {
         "laundry_id": laundry_id,
         "client_name": client_name,
         "client_type": client_type,
     }
-    # Stable entity ids are carried in the signed scope when the account has
-    # been associated. Only the id matching this side is exposed, so a hotel
-    # token can never contribute a shop id (or the reverse).
-    id_key = "hotel_id" if client_type == "HOTEL" else "shop_id"
-    entity_id = str(raw_scope.get(id_key) or "").strip().lower()
-    if entity_id:
-        scope[id_key] = entity_id
-    return scope
 
 
 def resolve_hotel_scope(current_user: dict = Security(get_current_user)) -> Dict[str, str]:
@@ -130,18 +119,11 @@ def require_side(scope: Dict[str, str], side: str) -> None:
 
 
 def _client_query(scope: Dict[str, str]) -> dict:
-    """Tenant + client filter, built in exactly one place.
-
-    A stable entity id is enforced as an equality filter whenever the session
-    carries one. Legacy client accounts have no id yet; for those the encrypted
-    name token and the laundry remain the only available scope.
-    """
-    query = {"client_name_search": get_search_token(scope["client_name"])}
-    if scope.get("client_type") == "HOTEL" and scope.get("hotel_id"):
-        query["hotel_id"] = scope["hotel_id"]
-    if scope.get("client_type") == "SHOP" and scope.get("shop_id"):
-        query["shop_id"] = scope["shop_id"]
-    return scoped_query(query, scope["laundry_id"])
+    """Tenant + hotel filter, built in exactly one place."""
+    return scoped_query(
+        {"client_name_search": get_search_token(scope["client_name"])},
+        scope["laundry_id"],
+    )
 
 
 def _money(value: Any) -> float:
@@ -405,72 +387,6 @@ SHOP_BILL_PROJECTION = {
     "delivery_date": 1,
     "created_at": 1,
 }
-
-
-
-
-@router.get("/linens")
-async def portal_linens(
-    status_filter: Optional[str] = Query(None, alias="status"),
-    limit: int = Query(200, ge=1, le=500),
-    scope: Dict[str, str] = Security(resolve_hotel_scope),
-) -> dict:
-    """The hotel's own linen tags with live status — the client side of the QR lifecycle.
-
-    A scanned tag resolves to this same record, so what the hotel sees here is
-    exactly what a scan of the physical tag reports.
-    """
-    query = _client_query(scope)
-    if status_filter:
-        query["status"] = status_filter
-    total = await linens_collection.count_documents(query)
-    items = []
-    async for doc in linens_collection.find(query).sort("updated_at", -1).limit(limit):
-        try:
-            row = decrypt_dict(doc, LINEN_SENSITIVE)
-        except Exception:
-            row = {k: v for k, v in doc.items() if k != "encryption_metadata"}
-        row["id"] = str(row.pop("_id", doc["_id"]))
-        items.append({
-            "id": row["id"],
-            "linen_id": row.get("linen_id"),
-            "category": row.get("category"),
-            "item_type": row.get("item_type"),
-            "description": row.get("description"),
-            "status": row.get("status"),
-            "condition": row.get("condition"),
-            "wash_count": row.get("wash_count", 0),
-            "last_scanned_date": _stamp(row.get("last_scanned_date")),
-            "updated_at": _stamp(row.get("updated_at") or row.get("created_at")),
-        })
-    return {"items": items, "total": total}
-
-
-@router.get("/linens/{linen_id}/events")
-async def portal_linen_events(
-    linen_id: str,
-    limit: int = Query(50, ge=1, le=200),
-    scope: Dict[str, str] = Security(resolve_hotel_scope),
-) -> dict:
-    """Scan history for one of the hotel's tags (newest first)."""
-    linen = await linens_collection.find_one(
-        {**_client_query(scope), "linen_id": str(linen_id).strip().upper()}
-    )
-    if not linen:
-        raise HTTPException(status_code=404, detail="Linen tag not found")
-    events = []
-    cursor = linen_events_collection.find(
-        {"laundry_id": scope["laundry_id"], "linen_id": linen["linen_id"]}
-    ).sort("timestamp", -1).limit(limit)
-    async for evt in cursor:
-        events.append({
-            "action": evt.get("action"),
-            "from_status": evt.get("from_status"),
-            "to_status": evt.get("to_status"),
-            "user": evt.get("user"),
-            "timestamp": _stamp(evt.get("timestamp")),
-        })
-    return {"linen_id": linen["linen_id"], "events": events}
 
 
 @router.get("/shop/summary")
