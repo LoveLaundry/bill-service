@@ -25,15 +25,20 @@ from ..database.main_db import gatepasses_collection, payments_collection, shop_
 from ..services.gate_pass_records import create_gate_pass_record
 from ..models import GatePassCreate, GatePassItem
 from ..tenancy import scoped_query
-from .client_portal import BILL_SENSITIVE, GP_SENSITIVE, resolve_client_scope
+from .client_portal import BILL_SENSITIVE, GP_SENSITIVE, require_side, resolve_client_scope
 
 router = APIRouter(prefix="/client-portal", tags=["client-portal"])
 
 
 def resolve_shop_scope(session: dict = Depends(resolve_client_scope)) -> Dict[str, str]:
-    """Shop sessions only — a hotel must not raise a laundry order."""
-    if session.get("client_scope", {}).get("client_type") != "SHOP":
-        raise HTTPException(status_code=403, detail="This endpoint is for shop accounts")
+    """Shop sessions only — a hotel must not raise a laundry order.
+
+    ``resolve_client_scope`` returns a flat scope (laundry_id, client_name,
+    client_type), not a nested ``client_scope`` object. Reuse the same side
+    guard as the rest of the portal so a shop is never blocked by its own
+    scope check.
+    """
+    require_side(session, "SHOP")
     return session
 
 
