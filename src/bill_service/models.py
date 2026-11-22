@@ -609,9 +609,20 @@ class LinenTransitionGroup(BaseModel):
     transitions: List[LinenTransition]
 
 
+class LinenTransitionRule(BaseModel):
+    """Admin-defined allowed target statuses from one previous status."""
+
+    from_status: str
+    to_statuses: List[str]
+
+
 class LinenTransitionList(BaseModel):
     groups: List[LinenTransitionGroup]
     statuses: List[str]
+    # Default empty so older cached clients/tests keep working. When the admin
+    # has a matrix saved, these describe legal next states per current status.
+    transition_rules: List[LinenTransitionRule] = Field(default_factory=list)
+    violation_mode: str = "block"
 
 
 class LinenTagGenerate(BaseModel):

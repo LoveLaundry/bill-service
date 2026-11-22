@@ -56,7 +56,9 @@ async def test_custody_is_declared_for_every_action():
 
 async def test_endpoint_shape(mocked_db):
     result = await linens.list_transitions(staff())
-    assert set(result.model_dump()) == {"groups", "statuses"}
+    assert set(result.model_dump()) == {
+        "groups", "statuses", "transition_rules", "violation_mode"
+    }
     assert result.statuses == LINEN_STATUSES
 
     first = result.groups[0].transitions[0]
@@ -69,8 +71,15 @@ async def test_catalogue_and_the_write_path_agree(mocked_db):
     """The contract that matters: tapping a card yields the status it promised.
 
     If `scan_linen` ever maps an action somewhere else, the picker lies to the
-    operator about where the linen went.
+    operator about where the linen went. A permissive policy isolates this test
+    from admin-defined legality — that is covered in test_linen_transition_rules.
     """
+    from bill_service.database.main_db import company_settings_collection
+
+    # No rule rows => every transition is unrestricted.
+    await company_settings_collection.insert_one(
+        {"key": "main", "laundry_id": "acme", "linen_transition_rules": {"violation_mode": "block", "rules": []}}
+    )
     catalogue = {
         t.action: t
         for group in linens._transition_catalogue()

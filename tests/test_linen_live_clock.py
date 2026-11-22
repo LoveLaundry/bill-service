@@ -16,7 +16,17 @@ def ub():
     return tenant_user("clock-b", LAUNDRY_B, "ADMIN")
 
 
+async def _unrestricted():
+    """These tests pin clock behaviour, not admin-defined legality."""
+    from bill_service.database.main_db import company_settings_collection
+
+    await company_settings_collection.insert_one(
+        {"key": "main", "laundry_id": LAUNDRY_A, "linen_transition_rules": {"violation_mode": "block", "rules": []}}
+    )
+
+
 async def test_scan_advances_live_clock_for_that_laundry_only(mocked_db):
+    await _unrestricted()
     made = await linens.create_linen(
         LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X"), ua()
     )
@@ -44,6 +54,7 @@ async def test_parameter_patch_advances_live_clock(mocked_db):
 
 
 async def test_bulk_scan_advances_live_clock_once(mocked_db):
+    await _unrestricted()
     first = await linens.create_linen(
         LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X"), ua()
     )

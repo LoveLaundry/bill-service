@@ -32,6 +32,10 @@ monthly_entries_collection: AsyncIOMotorCollection = _db.get_collection("monthly
 linen_category_mappings_collection: AsyncIOMotorCollection = _db.get_collection("linen_category_mappings")
 manual_references_collection: AsyncIOMotorCollection = _db.get_collection("manual_references")
 hotel_codes_collection: AsyncIOMotorCollection = _db.get_collection("hotel_codes")
+# Owned by laundry-management, but shared through the same MAIN database. The
+# scanner reads the admin-defined linen transition policy from here so the
+# single source of truth stays in Company Settings.
+company_settings_collection: AsyncIOMotorCollection = _db.get_collection("company_settings")
 
 # Sync infrastructure collections live alongside business data in MAIN.
 sync_status_collection: AsyncIOMotorCollection = _db.get_collection("sync_status")

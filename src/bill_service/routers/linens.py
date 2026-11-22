@@ -39,6 +39,11 @@ from ..models import (
     LinenTransitionList,
     LINEN_STATUSES,
 )
+from ..services.linen_transition_policy import (
+    check_transition,
+    load_transition_policy,
+    violation_mode,
+)
 
 router = APIRouter(prefix="/linens", tags=["linens"])
 
@@ -321,14 +326,19 @@ async def get_live_clock(
 async def list_transitions(
     current_user: dict = Depends(require_capability("linen:read")),
 ):
-    """The scan actions the server accepts, grouped by which side performs them.
+    """Scan actions grouped by which side performs them, plus tenant policy.
 
-    Read-only and identical for every laundry — it describes the state machine,
-    not the tenant's data. Clients build their state pickers from this so the
-    status vocabulary has exactly one owner. Transition *legality* is not
-    expressed here because the server does not enforce any yet.
+    The action/status vocabulary has one owner (this router). Legality is the
+    tenant admin's policy from Company Settings, returned here so clients can
+    show which target states are valid from each current state.
     """
-    return LinenTransitionList(groups=_transition_catalogue(), statuses=list(LINEN_STATUSES))
+    policy = await load_transition_policy(current_user)
+    return LinenTransitionList(
+        groups=_transition_catalogue(),
+        statuses=list(LINEN_STATUSES),
+        transition_rules=policy["rules"],
+        violation_mode=policy["violation_mode"],
+    )
 
 
 # ============================================================
@@ -589,6 +599,17 @@ async def scan_linen(
     if not to_status:
         raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
 
+    # Admin-defined legality: e.g. an already-collected linen cannot be
+    # collected again, but may move on to receive/wash. `warn` records the
+    # violation in the event notes instead of blocking the scan.
+    policy = await load_transition_policy(current_user)
+    reason = check_transition(policy, from_status, to_status)
+    policy_warning = None
+    if reason:
+        if violation_mode(policy) == "block":
+            raise HTTPException(status_code=409, detail=reason)
+        policy_warning = reason
+
     update_fields: dict = {
         "status": to_status,
         "last_scanned_date": now,
@@ -620,7 +641,7 @@ async def scan_linen(
         "location": payload.location,
         "user": payload.user or current_user.get("user_id", ""),
         "related_order": payload.related_order,
-        "notes": payload.notes,
+        "notes": f"{payload.notes}: {policy_warning}" if payload.notes and policy_warning else (policy_warning or payload.notes),
         "timestamp": now,
     }
     await linen_events_collection.insert_one(event_doc)
@@ -630,7 +651,10 @@ async def scan_linen(
 
     # Return updated linen
     updated_doc = await linens_collection.find_one({"_id": oid})
-    return _serialize(updated_doc)
+    serialized = _serialize(updated_doc)
+    if policy_warning:
+        serialized["transition_warning"] = policy_warning
+    return serialized
 
 
 # ============================================================
@@ -651,8 +675,11 @@ async def bulk_scan_linens(
 
     now = datetime.now(timezone.utc)
     laundry_id = resolve_laundry_id(current_user)
+    policy = await load_transition_policy(current_user)
+    mode = violation_mode(policy)
     results = []
     errors = []
+    warnings = []
 
     for code in linen_codes:
         code = str(code or "").strip().upper()
@@ -670,6 +697,14 @@ async def bulk_scan_linens(
             continue
 
         from_status = doc.get("status", "IN_STOCK")
+        reason = check_transition(policy, from_status, to_status)
+        if reason and mode == "block":
+            errors.append({"linen_id": code, "error": reason})
+            continue
+        policy_warning = reason if reason else None
+        if policy_warning:
+            warnings.append({"linen_id": code, "warning": policy_warning})
+
         update_fields: dict = {
             "status": to_status,
             "last_scanned_date": now,
@@ -694,17 +729,26 @@ async def bulk_scan_linens(
             "location": location,
             "user": user or current_user.get("user_id", ""),
             "related_order": None,
-            "notes": None,
+            "notes": policy_warning,
             "timestamp": now,
         }
         await linen_events_collection.insert_one(event_doc)
-        results.append({"linen_id": code, "from_status": from_status, "to_status": to_status})
+        result_row = {"linen_id": code, "from_status": from_status, "to_status": to_status}
+        if policy_warning:
+            result_row["warning"] = policy_warning
+        results.append(result_row)
 
     await _log_audit(current_user.get("user_id", ""), f"bulk_scan:{action}", "linen", f"count={len(results)}")
     if results:
         await _note_change(laundry_id, f"bulk_scan:{action}")
 
-    return {"processed": results, "errors": errors, "total_processed": len(results), "total_errors": len(errors)}
+    return {
+        "processed": results,
+        "errors": errors,
+        "total_processed": len(results),
+        "total_errors": len(errors),
+        "warnings": warnings,
+    }
 
 
 # ============================================================

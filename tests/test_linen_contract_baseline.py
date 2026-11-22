@@ -67,6 +67,15 @@ def ub():
     return tenant_user("contract-b", LAUNDRY_B, "ADMIN")
 
 
+async def _unrestricted():
+    """Legacy contract tests exercise the action->status map, not legality."""
+    from bill_service.database.main_db import company_settings_collection
+
+    await company_settings_collection.insert_one(
+        {"key": "main", "laundry_id": LAUNDRY_A, "linen_transition_rules": {"violation_mode": "block", "rules": []}}
+    )
+
+
 async def _make(client_name="Hotel Contract"):
     return await linens.create_linen(
         LinenCreate(category="Bed", item_type="Sheet", client_name=client_name), ua()
@@ -171,7 +180,8 @@ async def test_scan_writes_state_and_one_journal_row(mocked_db):
 
 
 async def test_every_action_lands_on_its_contracted_status(mocked_db):
-    """No legality check today: each action succeeds from the initial status."""
+    """Each action maps to its contracted status (legality tested separately)."""
+    await _unrestricted()
     for action, expected in ACTION_CONTRACT.items():
         made = await _make(client_name=f"Hotel {action}")
         scanned = await linens.scan_linen(made["id"], LinenScanAction(action=action), ua())
@@ -179,6 +189,7 @@ async def test_every_action_lands_on_its_contracted_status(mocked_db):
 
 
 async def test_complete_wash_increments_and_retire_stamps(mocked_db):
+    await _unrestricted()
     made = await _make()
     washed = await linens.scan_linen(made["id"], LinenScanAction(action="complete_wash"), ua())
     assert washed["wash_count"] == made["wash_count"] + 1
@@ -203,13 +214,14 @@ async def test_unknown_action_is_rejected_on_both_paths(mocked_db):
 
 
 async def test_bulk_scan_response_shape(mocked_db):
+    await _unrestricted()
     first = await _make(client_name="Hotel One")
     second = await _make(client_name="Hotel Two")
 
     result = await linens.bulk_scan_linens(
         [first["linen_id"], second["linen_id"]], "receive", "Intake", None, ua()
     )
-    assert set(result) == {"processed", "errors", "total_processed", "total_errors"}
+    assert set(result) == {"processed", "errors", "total_processed", "total_errors", "warnings"}
     assert result["total_processed"] == 2
     assert result["total_errors"] == 0
     assert set(result["processed"][0]) == {"linen_id", "from_status", "to_status"}
@@ -226,6 +238,7 @@ async def test_bulk_scan_reports_unknown_codes_per_line(mocked_db):
     a per-line "Not found". Distinguishing them would confirm that an identifier
     exists in another laundry, which is the oracle the isolation rule forbids.
     """
+    await _unrestricted()
     made = await _make()
 
     result = await linens.bulk_scan_linens(
