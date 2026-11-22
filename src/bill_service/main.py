@@ -27,6 +27,7 @@ from .routers.notifications import router as notifications_router
 from .routers.operational_reports import router as operational_reports_router
 from .routers.returns import router as returns_router
 from .routers.shop_bills import router as shop_bills_router
+from .routers.today_sheet import router as today_sheet_router
 from .services import synchronization_service
 
 
@@ -150,6 +151,7 @@ app.include_router(reconciliation_router)
 app.include_router(notifications_router)
 app.include_router(operational_reports_router)
 app.include_router(shop_bills_router)
+app.include_router(today_sheet_router)
 app.include_router(client_portal_router)
 app.include_router(client_shop_orders_router)
 app.include_router(admin_database_router)

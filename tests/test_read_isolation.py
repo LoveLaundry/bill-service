@@ -5,6 +5,7 @@ Seeds one record per laundry, then asserts each side sees exactly its own.
 """
 from datetime import datetime, timezone
 
+from bill_service.app_time import LKT
 from bill_service.crypto_helper import encrypt_dict
 from bill_service.routers.bills import SENSITIVE_FIELDS as BILL_SENSITIVE
 from bill_service.models import DispatchCreate, LinenCreate, LinenScanAction, LoyaltyAdjust
@@ -90,7 +91,10 @@ async def test_billing_report_is_tenant_scoped(mocked_db):
 
 
 async def test_day_money_is_tenant_scoped(mocked_db):
-    today = _now().date().isoformat()
+    # The endpoint reports Sri Lankan business days. Between 18:30 and midnight
+    # UTC the calendar date there is already tomorrow, so using the UTC date
+    # would make this test time-dependent and fail for the wrong reason.
+    today = datetime.now(LKT).date().isoformat()
     for laundry_id in (LAUNDRY_A, LAUNDRY_B):
         await mocked_db["bills_collection"].insert_one(encrypt_dict({
             "laundry_id": laundry_id,

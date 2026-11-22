@@ -80,6 +80,7 @@ DEPENDENT_MODULES = [
     "bill_service.routers.client_shop_orders",
     "bill_service.routers.gatepasses",
     "bill_service.routers.shop_bills",
+    "bill_service.routers.today_sheet",
     "bill_service.routers.deliveries",
     "bill_service.routers.returns",
     "bill_service.routers.adjustments",

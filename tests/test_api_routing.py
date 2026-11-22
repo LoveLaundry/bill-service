@@ -5,7 +5,7 @@ from fastapi.routing import APIRoute
 from starlette.routing import Match
 
 from bill_service.main import app
-from bill_service.routers import monthly, notifications, returns
+from bill_service.routers import monthly, notifications, returns, today_sheet
 
 
 def _resolve_endpoint(routes, path: str, method: str):
@@ -39,8 +39,16 @@ def test_expected_production_paths_resolve_to_their_handlers():
         )
         is monthly.confirm_monthly_day
     )
+    assert _resolve_endpoint(
+        today_sheet.router.routes, "/today-sheet", "GET"
+    ) is today_sheet.get_today_sheet
+    assert _resolve_endpoint(
+        today_sheet.router.routes, "/today-sheet/commit", "POST"
+    ) is today_sheet.commit_today_sheet
     assert "/returns/pending-resent" in app.openapi()["paths"]
     assert "/notifications/gatepass-pending" in app.openapi()["paths"]
+    assert "/today-sheet" in app.openapi()["paths"]
+    assert "/today-sheet/commit" in app.openapi()["paths"]
     assert (
         "/monthly/{kind}/{client_name}/{year}/{month}/day/{day}/confirm"
         in app.openapi()["paths"]
