@@ -428,6 +428,85 @@ async def get_linen_by_code(
 
 
 # ============================================================
+#  VERIFY a QR code without recording a scan
+# ============================================================
+@router.get("/verify/{linen_code}")
+async def verify_linen_code(
+    linen_code: str,
+    current_user: dict = Depends(require_capability("linen:read")),
+):
+    """Prove a tag belongs to this laundry without moving its cycle clock.
+
+    ``GET /linens/by-code`` deliberately updates ``last_scanned_date`` because a
+    normal tag read *is* a scan. A verification badge only asks whether the code
+    is registered, so using that endpoint would silently refresh stale linen and
+    hide exactly the pieces the "missing in cycle" screen needs to surface.
+    """
+    laundry_id = resolve_laundry_id(current_user)
+    code = str(linen_code or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="A tag code is required")
+
+    doc = await linens_collection.find_one(scoped_query({"linen_id": code}, laundry_id))
+    if not doc:
+        raise HTTPException(status_code=404, detail="Linen not found")
+    assert_same_laundry(doc, laundry_id, "Linen")
+    return _serialize(doc)
+
+
+# ============================================================
+#  MISSING IN CYCLE — not seen inside the admin-defined window
+# ============================================================
+@router.get("/missing-in-cycle")
+async def missing_in_cycle(
+    days: int = Query(7, ge=1, le=365),
+    limit: int = Query(200, ge=1, le=5000),
+    current_user: dict = Depends(require_capability("linen:read")),
+):
+    """Linens that need a scan: overdue, never scanned, or already flagged missing.
+
+    The threshold is passed by the client because the admin owns it in company
+    settings (a different service). Server-side validation keeps it bounded; the
+    query is scoped so one laundry can never see another's linen.
+    """
+    # Query() validates HTTP calls; direct calls from tests/other routers get
+    # the default object rather than an int, so normalise before using it.
+    day_value = days if isinstance(days, int) else 7
+    limit_value = limit if isinstance(limit, int) else 200
+    if day_value < 1 or day_value > 365:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="days must be between 1 and 365",
+        )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=day_value)
+    query = scoped_query(
+        {
+            "$and": [
+                {"status": {"$ne": "RETIRED"}},
+                {
+                    "$or": [
+                        {"status": "MISSING"},
+                        {"last_scanned_date": {"$exists": False}},
+                        {"last_scanned_date": None},
+                        {"last_scanned_date": {"$lt": cutoff}},
+                    ]
+                },
+            ]
+        },
+        resolve_laundry_id(current_user),
+    )
+    total = await linens_collection.count_documents(query)
+    cursor = linens_collection.find(query).sort("last_scanned_date", 1).limit(limit_value)
+    items = [_serialize(doc) async for doc in cursor]
+    return {
+        "items": items,
+        "total": total,
+        "days": day_value,
+        "cutoff": cutoff.isoformat(),
+    }
+
+
+# ============================================================
 #  UPDATE linen
 # ============================================================
 @router.patch("/{doc_id}")
