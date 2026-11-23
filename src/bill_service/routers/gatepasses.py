@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Dict, List, Optional
@@ -48,6 +49,9 @@ from .adjustments import create_adjustment_request
 router = APIRouter(prefix="/gatepasses", tags=["gatepasses"])
 
 SENSITIVE_FIELDS = ["client_name", "items", "notes"]
+
+logger = logging.getLogger(__name__)
+UPDATE_GATE_PASS_ERROR_DETAIL = "Failed to update gate pass. Please try again later."
 
 
 def _serialize(doc: dict) -> dict:
@@ -1001,12 +1005,11 @@ async def update_gate_pass(
         return serialized
     except HTTPException:
         raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.exception("Unexpected error while updating gate pass %s", gate_pass_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to update gate pass: {str(e)}",
+            detail=UPDATE_GATE_PASS_ERROR_DETAIL,
         )
 
 
