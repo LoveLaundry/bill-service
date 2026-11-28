@@ -10,6 +10,7 @@ from .database.main_db import ensure_indexes
 from .routers.admin_database import router as admin_database_router
 from .routers.adjustments import router as adjustments_router
 from .routers.bills import router as bills_router
+from .linen_live import router as linen_live_router
 from .routers.client_portal import router as client_portal_router
 from .routers.client_shop_orders import router as client_shop_orders_router
 from .routers.deliveries import router as deliveries_router
@@ -20,6 +21,7 @@ from .routers.dashboard import router as dashboard_router
 from .routers.day_close import router as day_close_router
 from .routers.day_money import router as day_money_router
 from .routers.gatepasses import router as gatepasses_router
+from .routers.linens import compat_router as linens_compat_router
 from .routers.linens import router as linens_router
 from .routers.monthly import router as monthly_router
 from .routers.reconciliation import router as reconciliation_router
@@ -145,6 +147,8 @@ app.include_router(dashboard_router)
 app.include_router(day_close_router)
 app.include_router(day_money_router)
 app.include_router(linens_router)
+app.include_router(linens_compat_router)
+app.include_router(linen_live_router)
 app.include_router(monthly_router)
 app.include_router(returns_router)
 app.include_router(reconciliation_router)

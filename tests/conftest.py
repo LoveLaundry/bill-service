@@ -92,6 +92,7 @@ DEPENDENT_MODULES = [
     "bill_service.routers.dispatch",
     "bill_service.routers.events",
     "bill_service.live_clock",
+    "bill_service.linen_live",
     "bill_service.services.linen_transition_policy",
     "bill_service.routers.linens",
     "bill_service.routers.loyalty",

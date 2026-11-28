@@ -52,6 +52,10 @@ from ..services.linen_transition_policy import (
 
 router = APIRouter(prefix="/linens", tags=["linens"])
 
+# Scanner clients still call the older `/linen/items/...` vocabulary. This
+# alias reuses the canonical handlers below; it defines no second lifecycle.
+compat_router = APIRouter(prefix="/linen", tags=["linen-compat"])
+
 # User-supplied search terms are substring lookups, never expressions. Interpolating
 # them into `$regex` directly allowed callers to inject their own pattern (`.*`
 # returned the whole collection) and to trigger catastrophic backtracking, which
@@ -471,7 +475,30 @@ async def get_linen(
 ):
     oid = _parse_object_id(doc_id)
     _, doc = await _owned_linen(oid, current_user)
-    return _serialize(doc)
+    profile = _serialize(dict(doc))
+
+    # Keep the flat projection older clients read, and add the named envelope
+    # the scanner uses. `history` is the same event collection already published
+    # by /linens/{id}/events — never a second copy of the state.
+    history: list[dict] = []
+    cursor = (
+        linen_events_collection.find({"linen_id": profile.get("linen_id")})
+        .sort("timestamp", -1)
+        .limit(50)
+    )
+    async for event in cursor:
+        history.append(_serialize(dict(event)))
+    return {**profile, "profile": profile, "history": history}
+
+
+@compat_router.get("/items/{doc_id}")
+async def get_linen_profile(
+    doc_id: str,
+    current_user: dict = Depends(require_capability("linen:read")),
+):
+    """Scanner alias for the single-linen projection."""
+
+    return await get_linen(doc_id, current_user)
 
 
 # ============================================================

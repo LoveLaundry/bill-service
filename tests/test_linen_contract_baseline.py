@@ -14,6 +14,8 @@ a visible, deliberate edit rather than an undocumented side effect.
   every other screen into refetching (D28, clock half fixed).
 * `POST`/`GET`/`PATCH`/`scan` return raw documents, so they expose internal
   fields that the two response-modelled endpoints filter out (D30). Still open.
+  `GET` additionally carries the scanner's named `profile`/`history` envelope,
+  while keeping every flat key intact.
 * Bulk scan now reports an unknown code per line instead of aborting the batch
   (D31, fixed).
 
@@ -53,6 +55,8 @@ LINEN_KEYS = {
 # internal fields still attached. Pinning both sets is what catches a future
 # accidental rename of either.
 RAW_LINEN_KEYS = LINEN_KEYS | {"laundry_id", "client_name_search"}
+# The single-item endpoint also publishes the scanner's named projection.
+DETAIL_KEYS = RAW_LINEN_KEYS | {"profile", "history"}
 
 EVENT_KEYS = {
     "id", "linen_id", "action", "from_status", "to_status", "location",
@@ -116,7 +120,7 @@ async def test_write_paths_return_the_raw_document(mocked_db):
     assert isinstance(made["id"], str), "document id must serialise as a string"
     assert isinstance(made["wash_count"], int)
 
-    assert set(await linens.get_linen(made["id"], ua())) == RAW_LINEN_KEYS
+    assert set(await linens.get_linen(made["id"], ua())) == DETAIL_KEYS
     assert set(await linens.get_linen_by_code(made["linen_id"], ua())) == RAW_LINEN_KEYS
     assert set(await linens.scan_linen(made["id"], LinenScanAction(action="collect"), ua())) == RAW_LINEN_KEYS
 
