@@ -1,9 +1,7 @@
 """
 Linen Tracking — CRUD, scanning, events, stats, tag generation.
 """
-import random
 import re
-import string
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -18,8 +16,15 @@ from ..crypto_helper import get_search_token
 from ..database.main_db import (
     linens_collection,
     linen_events_collection,
+    linen_tag_sequences_collection,
     audit_collection,
     bills_collection,
+)
+from ..services.tag_identity import (
+    is_valid_structured_id,
+    item_code,
+    owner_code,
+    structured_linen_id,
 )
 from ..live_clock import bump_live_clock, read_live_clock
 from ..repositories.main_repository import bump_version, enqueue_delete, enqueue_sync
@@ -60,15 +65,58 @@ def _search_pattern(term: Optional[str]) -> str:
         return ""
     return re.escape(str(term)[:MAX_SEARCH_LENGTH])
 
-# --- Linen ID generator ---
-# Safe charset: avoids O/0/I/1/l to prevent confusion
-SAFE_CHARS = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+async def _next_structured_sequence(scope_key: str, start_number: int) -> int:
+    """Advance one tenant/item/hotel counter, seeding it with ``start_number``."""
+
+    requested = max(1, int(start_number or 1))
+    existing = await linen_tag_sequences_collection.find_one({"scope_key": scope_key})
+    if existing is None:
+        # Seed explicitly, then increment. Combining `$inc` with `$setOnInsert`
+        # is order-dependent across Mongo implementations and issued one number
+        # too early in mongomock.
+        await linen_tag_sequences_collection.insert_one(
+            {"scope_key": scope_key, "value": requested - 1}
+        )
+        result = await linen_tag_sequences_collection.find_one_and_update(
+            {"scope_key": scope_key},
+            {"$inc": {"value": 1}},
+            return_document=True,
+        )
+    else:
+        current = int(existing.get("value") or 0)
+        if requested > current + 1:
+            await linen_tag_sequences_collection.update_one(
+                {"scope_key": scope_key}, {"$set": {"value": requested - 1}}
+            )
+        result = await linen_tag_sequences_collection.find_one_and_update(
+            {"scope_key": scope_key},
+            {"$inc": {"value": 1}, "$set": {"scope_key": scope_key}},
+            return_document=True,
+        )
+    return int((result or {}).get("value") or requested)
 
 
-def generate_linen_id() -> str:
-    """Generate a unique linen ID like LL-7K4P92."""
-    suffix = "".join(random.choices(SAFE_CHARS, k=6))
-    return f"LL-{suffix}"
+def _structured_scope(
+    *, laundry_id: str, category: str, item_type: str, hotel_code: str, hotel_id: str = ""
+) -> tuple[str, str, str]:
+    """Return (scope_key, normalized owner code, item code)."""
+
+    try:
+        code = owner_code(hotel_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    item = item_code(category, item_type)
+    # Include the registry id when present: two hotels sharing a short code must
+    # never share a sequence. Laundry scoping keeps tenants isolated as well.
+    owner_key = str(hotel_id or code).strip() or code
+    return f"{laundry_id}|{item}|{owner_key}", code, item
+
+
+def _structured_id(category: str, item_type: str, code: str, sequence: int) -> str:
+    try:
+        return structured_linen_id(category, item_type, code, sequence)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _serialize(doc: dict) -> dict:
@@ -211,14 +259,23 @@ async def create_linen(
 ):
     now = datetime.now(timezone.utc)
     laundry_id = resolve_laundry_id(current_user)
-    linen_id = generate_linen_id()
+    scope_key, code, item = _structured_scope(
+        laundry_id=laundry_id,
+        category=payload.category,
+        item_type=payload.item_type,
+        hotel_code=payload.hotel_code,
+        hotel_id=payload.hotel_id,
+    )
+    sequence = await _next_structured_sequence(scope_key, payload.start_number)
+    linen_id = _structured_id(payload.category, payload.item_type, code, sequence)
 
     # Ensure uniqueness (retry on collision, max 5 attempts)
     for _ in range(5):
         existing = await linens_collection.find_one({"linen_id": linen_id})
         if not existing:
             break
-        linen_id = generate_linen_id()
+        sequence = await _next_structured_sequence(scope_key, payload.start_number)
+        linen_id = _structured_id(payload.category, payload.item_type, code, sequence)
 
     doc = {
         "laundry_id": laundry_id,
@@ -231,6 +288,9 @@ async def create_linen(
         "client_name": payload.client_name,
         "client_name_search": get_search_token(payload.client_name),
         "department": payload.department,
+        "hotel_id": payload.hotel_id,
+        "hotel_code": code,
+        "item_code": item,
         "status": "IN_STOCK",
         "condition": "NEW",
         "location": None,
@@ -265,10 +325,19 @@ async def create_linen_bulk(
     created = []
     linen_ids = set()
 
+    scope_key, code, item = _structured_scope(
+        laundry_id=laundry_id,
+        category=payload.category,
+        item_type=payload.item_type,
+        hotel_code=payload.hotel_code,
+        hotel_id=payload.hotel_id,
+    )
+
     for _ in range(payload.quantity):
         # Generate unique ID
         for _attempt in range(10):
-            lid = generate_linen_id()
+            sequence = await _next_structured_sequence(scope_key, payload.start_number)
+            lid = _structured_id(payload.category, payload.item_type, code, sequence)
             if lid not in linen_ids:
                 existing = await linens_collection.find_one({"linen_id": lid})
                 if not existing:
@@ -287,6 +356,9 @@ async def create_linen_bulk(
             "color": payload.color,
             "client_name": payload.client_name,
             "department": payload.department,
+            "hotel_id": payload.hotel_id,
+            "hotel_code": code,
+            "item_code": item,
             "status": "IN_STOCK",
             "condition": "NEW",
             "location": None,
@@ -403,7 +475,7 @@ async def get_linen(
 
 
 # ============================================================
-#  GET linen by linen_id (the LL-XXXXXX code)
+#  GET linen by its structured tag ID (ITEM+HOTEL-SERIES NUMBER CHECK)
 # ============================================================
 @router.get("/by-code/{linen_code}")
 async def get_linen_by_code(
@@ -412,8 +484,8 @@ async def get_linen_by_code(
 ):
     laundry_id = resolve_laundry_id(current_user)
     code = str(linen_code or "").strip().upper()
-    if not code:
-        raise HTTPException(status_code=400, detail="A tag code is required")
+    if not is_valid_structured_id(code):
+        raise HTTPException(status_code=400, detail="Unsupported tag code format")
 
     # Scoped in the query, not filtered afterwards. An unscoped lookup reads
     # whichever document Mongo returns first, so a code that also exists in
@@ -454,8 +526,8 @@ async def verify_linen_code(
     """
     laundry_id = resolve_laundry_id(current_user)
     code = str(linen_code or "").strip().upper()
-    if not code:
-        raise HTTPException(status_code=400, detail="A tag code is required")
+    if not is_valid_structured_id(code):
+        raise HTTPException(status_code=400, detail="Unsupported tag code format")
 
     doc = await linens_collection.find_one(scoped_query({"linen_id": code}, laundry_id))
     if not doc:
@@ -685,6 +757,9 @@ async def bulk_scan_linens(
         code = str(code or "").strip().upper()
         if not code:
             continue
+        if not is_valid_structured_id(code):
+            errors.append({"linen_id": code, "error": "Invalid tag code"})
+            continue
         # Scoped query, same reasoning as the single-tag lookup above. A foreign
         # or missing code resolves to None and is reported per item; calling
         # assert_same_laundry before the existence check raised 404 for the whole
@@ -840,9 +915,18 @@ async def generate_linen_tags(
     created = []
     linen_ids = set()
 
+    scope_key, code, item = _structured_scope(
+        laundry_id=laundry_id,
+        category=payload.category,
+        item_type=payload.item_type,
+        hotel_code=payload.hotel_code,
+        hotel_id=payload.hotel_id,
+    )
+
     for _ in range(payload.quantity):
         for _attempt in range(10):
-            lid = generate_linen_id()
+            sequence = await _next_structured_sequence(scope_key, payload.start_number)
+            lid = _structured_id(payload.category, payload.item_type, code, sequence)
             if lid not in linen_ids:
                 existing = await linens_collection.find_one({"linen_id": lid})
                 if not existing:
@@ -861,6 +945,9 @@ async def generate_linen_tags(
             "color": payload.color,
             "client_name": payload.client_name,
             "department": payload.department,
+            "hotel_id": payload.hotel_id,
+            "hotel_code": code,
+            "item_code": item,
             "status": "IN_STOCK",
             "condition": "NEW",
             "location": None,

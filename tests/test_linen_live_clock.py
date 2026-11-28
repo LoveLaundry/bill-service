@@ -28,7 +28,7 @@ async def _unrestricted():
 async def test_scan_advances_live_clock_for_that_laundry_only(mocked_db):
     await _unrestricted()
     made = await linens.create_linen(
-        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X"), ua()
+        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X", hotel_id="clock-hotel", hotel_code="G"), ua()
     )
     before_a = await linens.get_live_clock(ua())
     before_b = await linens.get_live_clock(ub())
@@ -43,7 +43,7 @@ async def test_scan_advances_live_clock_for_that_laundry_only(mocked_db):
 
 async def test_parameter_patch_advances_live_clock(mocked_db):
     made = await linens.create_linen(
-        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X"), ua()
+        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X", hotel_id="clock-hotel", hotel_code="G"), ua()
     )
     before = await linens.get_live_clock(ua())
     await linens.update_linen(
@@ -56,10 +56,10 @@ async def test_parameter_patch_advances_live_clock(mocked_db):
 async def test_bulk_scan_advances_live_clock_once(mocked_db):
     await _unrestricted()
     first = await linens.create_linen(
-        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X"), ua()
+        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X", hotel_id="clock-hotel", hotel_code="G"), ua()
     )
     second = await linens.create_linen(
-        LinenCreate(category="Bed", item_type="Duvet", client_name="Hotel X"), ua()
+        LinenCreate(category="Bed", item_type="Duvet", client_name="Hotel X", hotel_id="clock-hotel", hotel_code="G"), ua()
     )
     before = await linens.get_live_clock(ua())
     await linens.bulk_scan_linens(

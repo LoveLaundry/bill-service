@@ -43,7 +43,8 @@ ACTION_CONTRACT = {
 # What `LinenModel` promises — the shape of `GET /linens` items.
 LINEN_KEYS = {
     "id", "linen_id", "category", "item_type", "description", "size", "color",
-    "client_name", "department", "status", "condition", "location",
+    "client_name", "department", "hotel_id", "hotel_code", "item_code",
+    "status", "condition", "location",
     "wash_count", "last_washed_date", "last_scanned_date", "retirement_date",
     "notes", "created_at", "updated_at",
 }
@@ -78,7 +79,14 @@ async def _unrestricted():
 
 async def _make(client_name="Hotel Contract"):
     return await linens.create_linen(
-        LinenCreate(category="Bed", item_type="Sheet", client_name=client_name), ua()
+        LinenCreate(
+            category="BEDSHEET",
+            item_type="Sheet",
+            client_name=client_name,
+            hotel_id="contract-hotel",
+            hotel_code="G",
+        ),
+        ua(),
     )
 
 
@@ -104,7 +112,7 @@ async def test_write_paths_return_the_raw_document(mocked_db):
     made = await _make()
     assert set(made) == RAW_LINEN_KEYS
     assert made["laundry_id"] == LAUNDRY_A
-    assert made["linen_id"].startswith("LL-")
+    assert made["linen_id"].startswith("BSG-A")
     assert isinstance(made["id"], str), "document id must serialise as a string"
     assert isinstance(made["wash_count"], int)
 
@@ -241,13 +249,14 @@ async def test_bulk_scan_reports_unknown_codes_per_line(mocked_db):
     await _unrestricted()
     made = await _make()
 
+    unknown = "BSG-A9000YW"  # well-formed and checksummed, but never issued
     result = await linens.bulk_scan_linens(
-        [made["linen_id"], "LL-NOPE12"], "receive", None, None, ua()
+        [made["linen_id"], unknown], "receive", None, None, ua()
     )
 
     assert result["total_processed"] == 1
     assert result["total_errors"] == 1
-    assert result["errors"][0]["linen_id"] == "LL-NOPE12"
+    assert result["errors"][0]["linen_id"] == unknown
 
     after = await linens.get_linen(made["id"], ua())
     assert after["status"] == "AT_LAUNDRY"

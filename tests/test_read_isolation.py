@@ -177,10 +177,16 @@ async def test_linen_crud_is_tenant_scoped(mocked_db):
     import pytest
 
     made_a = await linens.create_linen(
-        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X"), ua()
+        LinenCreate(
+            category="BEDSHEET", item_type="Sheet", client_name="Hotel X",
+            hotel_id="isolation-hotel", hotel_code="G",
+        ), ua()
     )
     made_b = await linens.create_linen(
-        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel Y"), ub()
+        LinenCreate(
+            category="BEDSHEET", item_type="Sheet", client_name="Hotel Y",
+            hotel_id="isolation-hotel-b", hotel_code="H",
+        ), ub()
     )
     listed_a = await linens.list_linens(
         search=None, category=None, status_filter=None, client_name=None,
@@ -201,7 +207,10 @@ async def test_linen_crud_is_tenant_scoped(mocked_db):
 async def test_linen_event_history_is_returned(mocked_db):
     """The profile's Movement History must load the scans for that linen."""
     made = await linens.create_linen(
-        LinenCreate(category="Bed", item_type="Sheet", client_name="Hotel X"), ua()
+        LinenCreate(
+            category="BEDSHEET", item_type="Sheet", client_name="Hotel X",
+            hotel_id="isolation-hotel", hotel_code="G",
+        ), ua()
     )
     await linens.scan_linen(made["id"], LinenScanAction(action="collect"), ua())
 

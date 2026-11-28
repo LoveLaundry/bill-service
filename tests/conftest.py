@@ -49,6 +49,7 @@ COLLECTION_NAMES = [
     "live_clocks_collection",
     "loyalty_collection",
     "linen_category_mappings_collection",
+    "linen_tag_sequences_collection",
     "monthly_entries_collection",
     "payments_collection",
     "returns_collection",

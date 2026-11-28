@@ -87,7 +87,11 @@ async def test_catalogue_and_the_write_path_agree(mocked_db):
     }
     for action, transition in catalogue.items():
         made = await linens.create_linen(
-            LinenCreate(category="Bed", item_type="Sheet", client_name=f"Hotel {action}"), ua()
+            LinenCreate(
+                category="BEDSHEET", item_type="Sheet", client_name=f"Hotel {action}",
+                hotel_id="transitions-hotel", hotel_code="G",
+            ),
+            ua(),
         )
         scanned = await linens.scan_linen(made["id"], LinenScanAction(action=action), ua())
         assert scanned["status"] == transition.to_status, (

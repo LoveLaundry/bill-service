@@ -479,6 +479,10 @@ class LinenCreate(BaseModel):
     client_name: str
     department: Optional[str] = None
     notes: Optional[str] = None
+    # Every created linen needs the owning registry record for its tag ID.
+    hotel_id: str = Field(..., min_length=1)
+    hotel_code: str = Field(..., min_length=1)
+    start_number: int = Field(default=1, ge=1, le=259974)
 
 
 class LinenBulkCreate(BaseModel):
@@ -491,6 +495,10 @@ class LinenBulkCreate(BaseModel):
     department: Optional[str] = None
     quantity: int = Field(gt=0, le=10000)
     notes: Optional[str] = None
+    # Every created linen needs the owning registry record for its tag ID.
+    hotel_id: str = Field(..., min_length=1)
+    hotel_code: str = Field(..., min_length=1)
+    start_number: int = Field(default=1, ge=1, le=259974)
 
 
 class LinenUpdate(BaseModel):
@@ -546,6 +554,9 @@ class LinenModel(BaseModel):
     color: Optional[str] = None
     client_name: str
     department: Optional[str] = None
+    hotel_id: Optional[str] = None
+    hotel_code: Optional[str] = None
+    item_code: Optional[str] = None
     status: str  # IN_STOCK, AT_CLIENT, COLLECTED, AT_LAUNDRY, WASHING, DRYING, PRESSING, READY, DELIVERED, MISSING, DAMAGED, RETIRED
     condition: str  # NEW, GOOD, FAIR, WORN, DAMAGED
     location: Optional[str] = None
@@ -633,6 +644,11 @@ class LinenTagGenerate(BaseModel):
     size: Optional[str] = None
     color: Optional[str] = None
     department: Optional[str] = None
+    # The admin picks a hotel registry record; the UI copies these from that
+    # record. Only checksummed tags are issued now, so a hotel is mandatory.
+    hotel_id: str = Field(..., min_length=1)
+    hotel_code: str = Field(..., min_length=1)
+    start_number: int = Field(default=1, ge=1, le=259974)
 
 
 class LinenListParams(BaseModel):

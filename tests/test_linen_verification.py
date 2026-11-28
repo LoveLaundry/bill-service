@@ -40,43 +40,43 @@ async def _insert(mocked_db, doc):
 async def test_verification_does_not_change_last_scanned_date(mocked_db):
     # mongomock stores whole seconds and strips tz info; use a stable value.
     old = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=30)
-    doc = await _insert(mocked_db, _linen(LAUNDRY_A, "LL-VERIFY1", last_scanned=old))
+    doc = await _insert(mocked_db, _linen(LAUNDRY_A, "BSG-A0109AD", last_scanned=old))
 
-    result = await lin.verify_linen_code("ll-verify1", current_user=tenant_user())
+    result = await lin.verify_linen_code("bsg-a0109ad", current_user=tenant_user())
 
-    assert result["linen_id"] == "LL-VERIFY1"
+    assert result["linen_id"] == "BSG-A0109AD"
     assert result["id"] == str(doc["_id"])
     returned = result["last_scanned_date"]
     if returned.tzinfo is None:
         returned = returned.replace(tzinfo=timezone.utc)
     assert returned == old
-    stored = await mocked_db["linens_collection"].find_one({"linen_id": "LL-VERIFY1"})
+    stored = await mocked_db["linens_collection"].find_one({"linen_id": "BSG-A0109AD"})
     assert stored["last_scanned_date"].replace(tzinfo=timezone.utc) == old
 
 
 async def test_verification_cannot_read_another_laundrys_tag(mocked_db):
-    await _insert(mocked_db, _linen(LAUNDRY_B, "LL-FOREIGN"))
+    await _insert(mocked_db, _linen(LAUNDRY_B, "BSG-A0110XQ"))
 
     with pytest.raises(Exception) as err:
-        await lin.verify_linen_code("LL-FOREIGN", current_user=tenant_user())
+        await lin.verify_linen_code("BSG-A0110XQ", current_user=tenant_user())
     assert getattr(err.value, "status_code", None) == 404
 
 
 async def test_missing_in_cycle_uses_the_window_and_stays_in_tenant(mocked_db):
     now = datetime.now(timezone.utc)
-    await _insert(mocked_db, _linen(LAUNDRY_A, "LL-OLD0001", last_scanned=now - timedelta(days=12)))
-    await _insert(mocked_db, _linen(LAUNDRY_A, "LL-FRESH01", last_scanned=now - timedelta(days=1)))
-    await _insert(mocked_db, _linen(LAUNDRY_A, "LL-NEVER01", last_scanned=None))
-    await _insert(mocked_db, _linen(LAUNDRY_A, "LL-GONE0001", status="MISSING", last_scanned=now))
-    await _insert(mocked_db, _linen(LAUNDRY_A, "LL-RETIRE1", status="RETIRED", last_scanned=now - timedelta(days=99)))
-    await _insert(mocked_db, _linen(LAUNDRY_B, "LL-THEIRS1", last_scanned=now - timedelta(days=99)))
+    await _insert(mocked_db, _linen(LAUNDRY_A, "BSG-A0111XY", last_scanned=now - timedelta(days=12)))
+    await _insert(mocked_db, _linen(LAUNDRY_A, "BSG-A0112YG", last_scanned=now - timedelta(days=1)))
+    await _insert(mocked_db, _linen(LAUNDRY_A, "BSG-A0113YO", last_scanned=None))
+    await _insert(mocked_db, _linen(LAUNDRY_A, "BSG-A0114YW", status="MISSING", last_scanned=now))
+    await _insert(mocked_db, _linen(LAUNDRY_A, "BSG-A0115ZE", status="RETIRED", last_scanned=now - timedelta(days=99)))
+    await _insert(mocked_db, _linen(LAUNDRY_B, "BSG-A0116ZM", last_scanned=now - timedelta(days=99)))
 
     result = await lin.missing_in_cycle(days=7, current_user=tenant_user())
 
     codes = {item["linen_id"] for item in result["items"]}
     assert result["days"] == 7
     assert result["total"] == 3
-    assert codes == {"LL-OLD0001", "LL-NEVER01", "LL-GONE0001"}
+    assert codes == {"BSG-A0111XY", "BSG-A0113YO", "BSG-A0114YW"}
 
 
 async def test_missing_in_cycle_rejects_an_absurd_window(mocked_db):

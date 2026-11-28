@@ -20,7 +20,14 @@ def ua():
 
 async def _linen(status="IN_STOCK"):
     made = await linens.create_linen(
-        LinenCreate(category="Towel", item_type="Bath Towel", client_name="Hotel A"), ua()
+        LinenCreate(
+            category="Towel",
+            item_type="Bath Towel",
+            client_name="Hotel A",
+            hotel_id="rules-hotel",
+            hotel_code="G",
+        ),
+        ua(),
     )
     if status != "IN_STOCK":
         await linens.linens_collection.update_one(

@@ -30,6 +30,7 @@ legacy_invoices_collection: AsyncIOMotorCollection = _db.get_collection("legacy_
 rewashes_collection: AsyncIOMotorCollection = _db.get_collection("rewashes")
 monthly_entries_collection: AsyncIOMotorCollection = _db.get_collection("monthly_entries")
 linen_category_mappings_collection: AsyncIOMotorCollection = _db.get_collection("linen_category_mappings")
+linen_tag_sequences_collection: AsyncIOMotorCollection = _db.get_collection("linen_tag_sequences")
 manual_references_collection: AsyncIOMotorCollection = _db.get_collection("manual_references")
 hotel_codes_collection: AsyncIOMotorCollection = _db.get_collection("hotel_codes")
 # Owned by laundry-management, but shared through the same MAIN database. The
@@ -130,6 +131,10 @@ async def ensure_indexes():
     await linens_collection.create_index("condition")
     await linens_collection.create_index("created_at")
     await linens_collection.create_index("last_scanned_date")
+    # One counter per (laundry, item code, owning hotel). The scope key is built
+    # in the tag generator so a start number cannot collide with another hotel's
+    # or another linen category's sequence.
+    await linen_tag_sequences_collection.create_index("scope_key", unique=True)
 
     await live_clocks_collection.create_index("laundry_id", unique=True)
 
